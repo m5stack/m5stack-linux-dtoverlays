@@ -1,0 +1,9 @@
+.*
+!.gitignore
+*.dtb
+*.dtbo
+*.o
+*.a
+*.ko
+*.mod
+*.mod.c
