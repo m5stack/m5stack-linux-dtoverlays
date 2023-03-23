@@ -2,6 +2,8 @@
 
 Lvgl Demo for CM4STACK
 
+![](https://github.com/m5stack/m5stack-linux-dtoverlays/blob/main/examples/Lvgl/Basic/pic.png?raw=true)
+
 #### Update submodules
 
 ```
