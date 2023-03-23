@@ -4,3 +4,4 @@
 [submodule "examples/Lvgl/Basic/lvgl"]
 	path = examples/Lvgl/Basic/lvgl
 	url = https://github.com/lvgl/lvgl.git
+	branch = release/v8.3
