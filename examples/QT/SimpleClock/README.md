@@ -1,7 +1,7 @@
 # CM4Stack_QtDemo
 Qt demo for CM4STACK
 
-![](https://github.com/m5stack/m5stack-linux-dtoverlays/blob/main/examples/QT/pic.png?raw=true)
+![](https://github.com/m5stack/m5stack-linux-dtoverlays/blob/main/examples/QT/SimpleClock/pic.png?raw=true)
 
 ### Dependency
 
