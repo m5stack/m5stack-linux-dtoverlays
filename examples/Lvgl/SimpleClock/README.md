@@ -29,7 +29,7 @@ git submodule init
 git submodule update
 ```
 
-#### Copy Lvgl related library from example/Basic
+#### Copy the Lvgl related library from example/Basic
 
 ```shell
 # Run copy script
