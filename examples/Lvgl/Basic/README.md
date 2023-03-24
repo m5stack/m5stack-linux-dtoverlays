@@ -4,6 +4,22 @@ Lvgl Demo for CM4STACK
 
 ![](https://github.com/m5stack/m5stack-linux-dtoverlays/blob/main/examples/Lvgl/Basic/pic.png?raw=true)
 
+#### File tree
+
+```
+.
+├── CMakeLists.txt
+├── README.md
+├── lv_conf.h
+├── lv_drv_conf.h
+├── lv_porting
+├── lvgl
+├── main.cpp
+├── pic.png
+├── tick.c
+└── tick.h
+```
+
 #### Update submodules
 
 ```
