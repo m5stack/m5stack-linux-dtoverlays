@@ -29,6 +29,13 @@ git submodule init
 git submodule update
 ```
 
+#### Install SDL2
+
+```
+sudo apt update
+sudo apt install libsdl2-dev
+```
+
 #### Copy the Lvgl related library from example/Basic
 
 ```shell

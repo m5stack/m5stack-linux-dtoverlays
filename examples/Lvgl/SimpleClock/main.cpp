@@ -124,7 +124,7 @@ void data_update(lv_timer_t * timer)
 
     /* update sys infos */
     char data_buff[100];
-    snprintf(data_buff, sizeof(data_buff), "> Host: %.10s\n> IP: %s\n> Load: %.2f\n> Mem: %.2f%%",
+    snprintf(data_buff, sizeof(data_buff), "> Host: %.12s\n> IP: %s\n> Load: %.2f\n> Mem: %.2f%%",
                 get_host_name(),
                 get_IP_address(),
                 get_cpu_load(),

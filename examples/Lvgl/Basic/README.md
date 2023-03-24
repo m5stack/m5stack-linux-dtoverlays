@@ -22,9 +22,16 @@ Lvgl Demo for CM4STACK
 
 #### Update submodules
 
-```
+```shell
 git submodule init
 git submodule update
+```
+
+#### Install SDL2
+
+```
+sudo apt update
+sudo apt install libsdl2-dev
 ```
 
 #### Build
