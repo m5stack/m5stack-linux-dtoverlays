@@ -1,0 +1,9 @@
+[submodule "examples/Lvgl/Basic"]
+	path = examples/Lvgl/Basic
+	url = https://github.com/m5stack/CM4Stack_lvgl_fbdev.git
+[submodule "examples/Lvgl/SimpleClock"]
+	path = examples/Lvgl/SimpleClock
+	url = https://github.com/m5stack/CM4Stack_lvgl_fbdev.git
+[submodule "examples/Lvgl/CM4Stack_lv_fbdev"]
+	path = examples/Lvgl/CM4Stack_lv_fbdev
+	url = https://github.com/m5stack/CM4Stack_lvgl_fbdev.git
