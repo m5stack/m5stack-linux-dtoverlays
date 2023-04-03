@@ -7,3 +7,6 @@
 [submodule "examples/Lvgl/CM4Stack_lv_fbdev"]
 	path = examples/Lvgl/CM4Stack_lv_fbdev
 	url = https://github.com/m5stack/CM4Stack_lvgl_fbdev.git
+[submodule "examples/M5GFX/LGFX/LovyanGFX"]
+	path = examples/M5GFX/LGFX/LovyanGFX
+	url = https://github.com/lovyan03/LovyanGFX.git
