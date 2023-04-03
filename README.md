@@ -47,4 +47,3 @@ The kernel modules will have the corresponding documentation and detailed instru
 
 ## examples:  
 -----------
-目前仓库提供了 lvgl 和 QT 的使用示例，后面将继续添加，敬请等待。
