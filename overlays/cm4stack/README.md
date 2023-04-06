@@ -1,0 +1,1 @@
+Note that the device tree file can be used to fit board level device support for the CM4STACK platform.
