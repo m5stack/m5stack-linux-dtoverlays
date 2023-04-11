@@ -7,7 +7,7 @@ Qt demo for CM4STACK
 
 ```bash
 sudo apt update
-sudo apt install qtbase5-dev qt5-qmake qtbase5-dev-tools qml
+sudo apt install qtbase5-dev qt5-qmake qtbase5-dev-tools qml qtdeclarative5-dev
 sudo apt install build-essential cmake 
 ```
 
