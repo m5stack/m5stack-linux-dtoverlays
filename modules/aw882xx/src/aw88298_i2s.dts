@@ -1,0 +1,53 @@
+//Device tree overlay for generic I2S audio codec. ex) Asahi kasei AK4558
+//Raspi: I2S master
+//Codec: I2S slave
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2711";
+
+    fragment@0 {
+		target = <&i2s>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+    fragment@1 {
+		target = <&i2c0>;
+		__overlay__ {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "okay";
+
+		aw882xx_smartpa_0: aw882xx_smartpa@34 {
+                compatible = "awinic,aw882xx_smartpa";
+                #sound-dai-cells = <0>;
+                #address-cells = <1>;
+		#size-cells = <0>;
+                reg = <0x34>;
+                aw-re-min = <4000>; /*Re 校准范围最小值（mOhms）*/
+                aw-re-max = <10000>; /*Re 校准范围最大值（mOhms）*/
+                /*aw-cali-mode = "none";*/
+                status = "okay";
+            };
+		};
+	};
+
+    fragment@2 {
+		target = <&sound>;
+		__overlay__ {
+			compatible = "simple-audio-card";
+			simple-audio-card,format = "i2s";
+			simple-audio-card,name = "aw882xx";
+			status = "okay";
+			simple-audio-card,cpu {
+				sound-dai = <&i2s>;
+			};
+			simple-audio-card,codec {
+				sound-dai = <&aw882xx_smartpa_0>;
+			};
+		};
+	};
+};

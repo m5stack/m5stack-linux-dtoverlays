@@ -1,0 +1,6 @@
+config AW882XX_DRV
+       tristate "AW882XX_DRV sound support"
+       default m
+       help
+
+			AW882xx xiang guan xing hao zhi chi!
