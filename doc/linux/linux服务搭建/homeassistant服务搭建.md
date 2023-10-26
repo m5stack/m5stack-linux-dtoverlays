@@ -4,6 +4,8 @@ HomeAssistant是构建智慧空间的神器。是一个成熟完整的基于 Pyt
 
 HomeAssistant 最初只是以 python 包的形式发布的，用户只需要执行 "pip install homeassistant" 就能完成安装，随着 HomeAssistant 的发展， HomeAssistant 变的越来越复杂，同时也包含了其他的服务，所以 HomeAssistant 的安装也变得复杂起来了。 
 
+官方安装参考: [https://www.home-assistant.io/installation/](https://www.home-assistant.io/installation/)
+
 ## docker 安装
 
 安装 docker ，可参考[docker安装](docker安装.md)
@@ -94,3 +96,28 @@ docker rm hassio_cli hassio_multicast hassio_audio hassio_dns hassio_observer ha
 # 配置目录/etc/localtime
 docker run -d --name emqx -v /etc/localtime:/etc/localtime -p 1883:1883 -p 18083:18083 emqx/emqx
 ```
+
+
+## Home Assistant Core 安装
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-dev python3-venv python3-pip bluez libffi-dev libssl-dev libjpeg-dev zlib1g-dev autoconf build-essential libopenjp2-7 libtiff6 libturbojpeg0-dev tzdata ffmpeg liblapack3 liblapack-dev libatlas-base-dev
+
+sudo useradd -rm homeassistant
+
+sudo mkdir /srv/homeassistant
+sudo chown homeassistant:homeassistant /srv/homeassistant
+
+sudo -u homeassistant -H -s
+cd /srv/homeassistant
+python3 -m venv .
+source bin/activate
+
+python3 -m pip install wheel
+
+pip3 install homeassistant==2023.10.5
+
+hass
+```
+安装完成后访问 http://homeassistant.local:8123 。
