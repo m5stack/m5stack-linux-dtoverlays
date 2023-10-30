@@ -202,6 +202,6 @@ https://nanomq.io/docs/zh/latest/
 
 
 # 参考
-[1] Mosquitto 官网, https://mosquitto.org/
-[2] EMQX 官网, https://www.emqx.io/zh
-[3] NanoMQ 官网 ，https://nanomq.io/docs/zh/latest/
+[1] Mosquitto 官网, https://mosquitto.org/  
+[2] EMQX 官网, https://www.emqx.io/zh  
+[3] NanoMQ 官网 ，https://nanomq.io/docs/zh/  latest/

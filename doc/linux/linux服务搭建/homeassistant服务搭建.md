@@ -1,6 +1,6 @@
 # Home-Assistant 服务安装
 
-HomeAssistant是构建智慧空间的神器。是一个成熟完整的基于 Python 的智能家居系统，设备支持度高，支持自动化（Automation)、群组化（Group）、UI 客制化（Theme) 等等高度定制化设置。同样实现设备的 Siri 控制。基于HomeAssistant，可以方便地连接各种外部设备（智能设备、摄像头、邮件、短消息、云服务等，成熟的可连接组件有近千种），手动或按照自己的需求自动化地联动这些外部设备，构建随心所欲的智慧空间。HomeAssistant是开源的，它不属于任何商业公司，用户可以无偿使用。  
+HomeAssistant 是构建智慧空间的神器。是一个成熟完整的基于 Python 的智能家居系统，设备支持度高，支持自动化（Automation)、群组化（Group）、UI 客制化（Theme) 等等高度定制化设置。同样实现设备的 Siri 控制。基于 HomeAssistant ，可以方便地连接各种外部设备（智能设备、摄像头、邮件、短消息、云服务等，成熟的可连接组件有近千种），手动或按照自己的需求自动化地联动这些外部设备，构建随心所欲的智慧空间。HomeAssistant 是开源的，它不属于任何商业公司，用户可以无偿使用。  
 
 HomeAssistant 最初只是以 python 包的形式发布的，用户只需要执行 "pip install homeassistant" 就能完成安装，随着 HomeAssistant 的发展， HomeAssistant 变的越来越复杂，同时也包含了其他的服务，所以 HomeAssistant 的安装也变得复杂起来了。 
 
