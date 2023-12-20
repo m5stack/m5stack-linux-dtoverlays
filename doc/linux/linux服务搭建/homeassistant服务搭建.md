@@ -121,3 +121,5 @@ pip3 install homeassistant==2023.10.5
 hass
 ```
 安装完成后访问 http://homeassistant.local:8123 。
+
+官网安装参考：https://www.home-assistant.io/installation/
