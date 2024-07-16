@@ -1,0 +1,5 @@
+{
+    "version": "v0.01",
+    "version_id": 1,
+    "exec_script": "https://raw.githubusercontent.com/m5stack/m5stack-linux-dtoverlays/main/update/update.sh"
+}
