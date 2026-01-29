@@ -1,0 +1,148 @@
+// Device tree overlay for M5STACK CM4
+// 
+// https://github.com/raspberrypi/linux/blob/rpi-4.19.y/arch/arm/boot/dts/overlays/pwm-overlay.dts
+/dts-v1/;
+/plugin/;
+
+/ {
+        compatible = "brcm,bcm2835", "brcm,bcm2836", "brcm,bcm2708", "brcm,bcm2709";
+
+        fragment@0 {
+                target = <&gpio>;                           // Overlay for GPIO pins, using standard 'gpio' node
+                __overlay__ {
+                        goodix_pins: goodix_pins {          // create overlay labeled "goodix_pins"
+                                brcm,pins = <22 24>;        // use GPIO_24(IRQ), GPIO_22(RESET)
+                                brcm,function = <0 0>;      // INPUT
+                                brcm,pull = <2 2>;          // enable internal pull-up resistors
+                        };
+
+                        st7789_pins: st7789_pins {          // create overlay labeled "st7789_pins"
+                                brcm,pins = <23 25>;        // use GPIO_23(DC), GPIO_25(RESET)
+                                brcm,function = <1>;        // OUT
+				brcm,pull = <0>;
+                        };
+
+                        st7789_bl_pins: st7789_bl_pins {    // create overlay labeled "st7789_bl_pins"
+                                brcm,pins = <12>;           // use GPIO_12(BL)
+                                brcm,function = <4>;        // Alt0 PWM
+                        };
+                };
+        };
+
+        fragment@1 {
+                target = <&spi0>;
+                __overlay__ {
+                        status = "okay";
+
+                        spidev@0{
+                                status = "disabled";
+                        };
+
+                        spidev@1{
+                                status = "disabled";
+                        };
+                };
+        };
+
+        fragment@2 {
+                target = <&pwm>;
+                frag0: __overlay__ {
+                        pinctrl-names = "default";
+                        pinctrl-0 = <&st7789_bl_pins>;
+                        assigned-clock-rates = <1000000>;
+                        status = "okay";
+                };
+        };
+
+        fragment@3 {
+                target = <&i2c0>;                             // Overlay for I2C pins, using the 'i2c0' node
+                __overlay__ {
+                        #address-cells = <1>;
+                        #size-cells = <0>;
+                        status = "okay";                      // device is enabled
+
+                        gt911: gt911@5d {                     // set GT911 with i2c address 0x5d
+                                compatible = "goodix,gt911";  // using 'goodix' kernel device driver
+                                reg = <0x5d>;                 // I2C address (needs to match above)
+                                pinctrl-names = "default";    // default pin configuration
+                                pinctrl-0 = <&goodix_pins>;   // assign overlay to pin control
+                                interrupt-parent = <&gpio>;   // assign interrupt rutines
+                                interrupts = <22 2>;          // high-to-low edge triggered
+                                irq-gpios = <&gpio 22 0>;     // set Interupt pin on GPIO 22
+                                reset-gpios = <&gpio 24 0>;   // set Reset pin on GPIO 24
+                        };
+                };
+        };
+
+        fragment@4 {
+                target = <&spi0>;                                 // Overlay for I2C pins, using the 'i2c0' node
+                __overlay__ {
+                        #address-cells = <1>;
+                        #size-cells = <0>;
+                        status = "okay";                          // device is enabled
+
+                        st7789: st7789@0 {
+                                compatible = "sitronix,st7789v";  // using 'sitronix' kernel device driver
+                                reg = <0>;
+                                pinctrl-names = "default";        // default pin configuration
+                                pinctrl-0 = <&st7789_pins>;       // assign overlay to pin control
+                                
+								spi-max-frequency = <80000000>;
+								rotate = <0>;
+								fps = <60>;
+								buswidth = <8>;
+								reset-gpios = <&gpio 25 1>;
+								dc-gpios = <&gpio 23 0>;
+								te-gpios = <&gpio 9 1>;
+								debug = <5>;
+								width = <240>;
+								height = <320>;
+								init = <
+										0x100003A 0x05
+										0x10000B2 0x05 0x05 0x00 0x33 0x33
+										0x10000B7 0x75
+										0x10000BB 0x22
+										0x10000C0 0x2C
+										0x10000C2 0x01 0xff
+										0x10000C3 0x13
+										0x10000C4 0x20
+										0x10000C6 0x0F
+										0x10000D0 0xA4 0xA1
+										0x1000021
+										0x1000011
+										0x2000032
+										0x1000029
+										0x20000c8>;
+								gamma = "D0,05,0A,09,08,05,2E,44,45,0F,17,16,2B,33;D0,05,0A,09,08,05,2E,43,45,0F,16,16,2B,33";
+								};
+									
+							};
+        };
+
+
+        fragment@5 {
+                target-path = "/";
+                __overlay__ {
+                        pwm_backlight: pwm_backlight {
+                                compatible = "pwm-backlight";
+                                // brightness-levels = <0 6 8 12 16 24 32 40 48 64 96 128 160 192 224 255>;
+                                brightness-levels = <255 224 192 160 128 96 64 48 40 32 24 16 12 8 6 0>;
+                                default-brightness-level = <6>;                                
+                                pwms = <&pwm 0 2500000>;
+                                #enable-gpios = <&gpio 12 0>;
+                                power-supply = <&vdd_3v3_reg>;
+                                status = "okay";                // device is enabled
+                        };
+                };
+        };
+};
+
+
+
+// dtoverlay=disable-bt
+// enable_uart=1
+// dtoverlay=pcie-32bit-dma
+// dtoverlay=i2c0,pins_44_45
+// dtoverlay=i2c-rtc,i2c0,pcf8563
+// dtoverlay=m5stack-cm4
+// dtoverlay=max98357a,no-sdmode
