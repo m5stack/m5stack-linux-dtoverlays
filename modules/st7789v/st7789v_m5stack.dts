@@ -1,0 +1,93 @@
+/dts-v1/;
+/plugin/;
+
+/{
+    compatible = "brcm,bcm2835";
+
+fragment@0 {
+    target = <&gpio>;
+    __overlay__ {
+        st7789v_pins: st7789v_pins {
+                brcm,pins = <25>;
+                brcm,function = <1>;
+                brcm,pull = <0>;
+        };
+    };
+};
+
+fragment@1 {
+        target-path = "/";
+        __overlay__ {
+
+            backlight_power: backlight-regulator {
+                compatible = "regulator-fixed";
+                regulator-name = "backlight-vcc";
+                regulator-min-microvolt = <3300000>;
+                regulator-max-microvolt = <3300000>;
+                regulator-boot-on;  /* 启动时就开启 */
+            };
+
+            backlight_pwm: backlight {
+                compatible = "m5stack,pwm-backlight";
+                pwms = <&py32io16 3 2000000 0>;
+                
+                /* 不指定brightness-levels将使用默认的CIE1931算法 */
+                default-brightness-level = <3071>;
+                
+                power-supply = <&backlight_power>;
+                /* 强制初始化时开启背光 */
+                force-enable-on-init;
+            };
+
+        };
+};
+
+fragment@2 {
+    target = <&spi0>;
+    __overlay__ {
+        status = "okay";
+
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        st7789v@0 {
+            compatible = "sitronix,st7789v_m5stack";
+            reg = <0>;
+            pinctrl-names = "default";
+            pinctrl-0 = <&st7789v_pins>;
+
+            spi-max-frequency = <40000000>;
+            txbuflen = <32768>;
+            
+            dc-gpios = <&gpio 25 0>;
+            // reset-gpios = <&py32io16 4 1>;
+
+            // PWM背光
+            backlight = <&backlight_pwm>;
+
+            ram-x-offset = <0>;
+            ram-y-offset = <32>;
+
+            buswidth = <8>;
+            width = <170>;
+            height = <320>;
+            rotate = <90>;
+            fps = <30>;
+            // bgr;
+            
+            debug = <0>;
+        };
+    };
+};
+
+fragment@3 {
+    target = <&spidev0>;
+    __overlay__ {
+        status = "disabled";
+    };
+};
+
+
+
+
+};

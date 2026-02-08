@@ -1,0 +1,42 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835";
+    
+
+
+
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            gpio5_regulator: gpio5-regulator {
+                compatible = "regulator-fixed";
+                regulator-name = "ext_3v3_out";
+                regulator-min-microvolt = <3300000>;
+                regulator-max-microvolt = <3300000>;
+                // enable-active-high;
+                regulator-boot-on;
+                regulator-always-on;
+            };
+
+        };
+        
+    };
+
+    fragment@1 {
+        target = <&i2c1>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+            
+			hpamp: hpamp@60 {
+				compatible = "ti,tpa6130a2";
+				reg = <0x60>;
+                power-supply = <&gpio5_regulator>;
+				status = "okay";
+			};
+        };
+    };
+};

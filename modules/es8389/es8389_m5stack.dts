@@ -1,0 +1,82 @@
+// Definitions for ES8389 Audio HAT
+/dts-v1/;
+/plugin/;
+// dtc -@ -I dts -O dtb -o es8389_m5stack.dtbo  es8389_m5stack.dts
+/ {
+    compatible = "brcm,bcm2835";
+    
+	fragment@0 {
+		target = <&i2s_clk_producer>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+    fragment@1 {
+            target-path = "/";
+            __overlay__ {
+                    es8390_mclk: es8390_mclk {
+                            compatible = "fixed-clock";
+                            #clock-cells = <0>;
+                            clock-frequency = <12288000>;
+                    };
+            };
+    };
+    fragment@2 {
+        target = <&gpio>;
+        __overlay__ {
+            spk_en_pins: spk_en_pins {
+                    brcm,pins = <24>;
+                    brcm,function = <1>;
+                    brcm,pull = <0>;
+            };
+        };
+    };
+
+    fragment@3 {
+        target = <&i2c1>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+
+            es8390: es8390@10 {
+                compatible = "everest,es8390";
+                reg = <0x10>;
+                #sound-dai-cells = <0>;
+                pinctrl-names = "default";
+                pinctrl-0 = <&spk_en_pins>;
+                clock-names = "mclk";
+                clocks = <&es8390_mclk>;
+                spk-enable-gpios = <&gpio 24 1>;
+                status = "okay";
+            };
+        };
+    };
+
+    fragment@4 {
+        target-path = "/";
+        __overlay__ {
+            sound {
+                compatible = "simple-audio-card"; 
+                simple-audio-card,name = "ES8388-Audio";
+                status = "okay";
+                
+                simple-audio-card,dai-link {
+                    format = "i2s";
+                    bitclock-master = <&dailink0_master>;
+                    frame-master = <&dailink0_master>;
+                    
+                    dailink0_master: cpu {
+                        sound-dai = <&i2s_clk_producer>;
+                    };
+                    
+                    dailink0_slave: codec {
+                        sound-dai = <&es8390>;
+                    };
+                };
+            };
+        };
+    };
+};
+
+

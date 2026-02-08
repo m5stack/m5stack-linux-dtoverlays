@@ -1,0 +1,304 @@
+// Definitions for ES8389 Audio HAT
+/dts-v1/;
+/plugin/;
+// dtc -@ -I dts -O dtb -o es8389_m5stack.dtbo  es8389_m5stack.dts
+/ {
+    compatible = "brcm,bcm2835";
+    
+    fragment@0 {
+        target = <&i2s_clk_producer>;
+        __overlay__ {
+            status = "okay";
+        };
+    };
+
+    fragment@1 {
+        target = <&gpio>;
+        __overlay__ {
+            st7789v_pins: st7789v_pins {
+                    brcm,pins = <25>;
+                    brcm,function = <1>;
+                    brcm,pull = <0>;
+            };
+            tca8418_pins: tca8418_pins {
+                    brcm,pins = <27 17 16>;
+                    brcm,function = <0 1 1>;
+                    brcm,pull = <2 0 0>;
+            };
+            spk_en_pins: spk_en_pins {
+                    brcm,pins = <24>;
+                    brcm,function = <1>;
+                    brcm,pull = <0>;
+            };
+            always_high_pin: always-high {
+                gpio-hog;
+                gpios = <24 0>;
+                output-high;
+                line-name = "always-high-pin";
+            };
+        };
+    };
+
+    fragment@2 {
+        target = <&i2c1>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+
+            py32io16: gpio@6f {
+                    compatible = "m5stack,py32io16";
+                    reg = <0x6f>;
+                    gpio-controller;
+                    #gpio-cells = <2>;
+                    ngpios = <16>;
+                    #pwm-cells = <3>;
+                    status = "okay";
+            };
+            es8390: es8390@10 {
+                compatible = "everest,es8390";
+                reg = <0x10>;
+                #sound-dai-cells = <0>;
+                pinctrl-names = "default";
+                pinctrl-0 = <&spk_en_pins>;
+                clock-names = "mclk";
+                clocks = <&es8390_mclk>;
+                // spk-enable-gpios = <&gpio 24 1>;
+                status = "okay";
+            };
+			hpamp: hpamp@60 {
+				compatible = "ti,tpa6130a2";
+				reg = <0x60>;
+                power-supply = <&hpamp_regulator>;
+				status = "okay";
+			};
+            rx8130: rx8130@32 {
+                compatible = "epson,rx8130";
+                reg = <0x32>;
+                status = "okay";
+            };
+
+            imu@68 {
+                compatible = "bosch,bmi270";
+                reg = <0x68>;
+                status = "okay";
+            };
+
+            tca8418@34 {
+                compatible = "m5stack,tca8418_m5stack"; 
+                reg = <0x34>;
+                pinctrl-names = "default";
+                pinctrl-0 = <&tca8418_pins>;
+                interrupt-parent = <&gpio>;
+                interrupts = <27 2>; /* 中断io 下沿触发  */
+                irq-gpios = <&gpio 27 0x00>; /* 中断io 下沿触发 */
+                    
+                keypad,num-rows = <5>;
+                keypad,num-columns = <10>;
+
+                tables-sel-gpio = <&gpio 17 1>;
+                capslock-gpio = <&gpio 16 1>;
+                switch-button-code = <73>; /* 切换按键 keycode */
+                // interrupt-controller;
+                /* row | column | key-code  例如: 04,08,0010 q 键 */
+                linux,keymap = < 0x04000001 0x04040010 0x00000011 0x00010012 0x00020013 0x00030014 0x00040015 0x00050016 0x00060017 0x00070018 0x00080019 0x0009000e 0x0403000f 0x0100001e 0x0101001f 0x01020020 0x01030021 0x01040022 0x01050023 0x01060024 0x01070025 0x01080026 0x0109001c 0x0401002a 0x0200003a 0x0201002c 0x0202002d 0x0203002e 0x0204002f 0x02050030 0x02060031 0x02070032 0x02080067 0x02090029 0x0402001d 0x03000038 0x03010027 0x03020028 0x03030039 0x03040033 0x03050034 0x03060035 0x03070069 0x0308006c 0x0309006a>;
+                linux,keymap1 = < 0x04000001 0x04040002 0x00000003 0x00010004 0x00020005 0x00030006 0x00040007 0x00050008 0x00060009 0x0007000a 0x0008000b 0x0009000e 0x0403000f 0x0100003b 0x0101003c 0x0102003d 0x0103003e 0x0104003f 0x01050040 0x01060041 0x01070042 0x01080043 0x0109001c 0x04010036 0x0200003a 0x02010044 0x02020057 0x02030058 0x02040066 0x0205006b 0x02060068 0x0207006d 0x02080067 0x02090029 0x04020061 0x03000064 0x0301000c 0x0302000d 0x03030039 0x0304001a 0x0305001b 0x0306002b 0x03070069 0x0308006c 0x0309006a>;
+            };
+        };
+    };
+
+
+    fragment@3 {
+        target-path = "/";
+        __overlay__ {
+            es8390_mclk: es8390_mclk {
+                compatible = "fixed-clock";
+                #clock-cells = <0>;
+                clock-frequency = <12288000>;
+            };
+
+            backlight_power: backlight-regulator {
+                compatible = "regulator-fixed";
+                regulator-name = "backlight-vcc";
+                regulator-min-microvolt = <3300000>;
+                regulator-max-microvolt = <3300000>;
+                regulator-boot-on;  /* 启动时就开启 */
+            };
+            hpamp_regulator: hpamp-regulator {
+                compatible = "regulator-fixed";
+                regulator-name = "ext_3v3_out";
+                regulator-min-microvolt = <3300000>;
+                regulator-max-microvolt = <3300000>;
+                regulator-boot-on;
+            };
+            backlight_pwm: backlight {
+                compatible = "m5stack,pwm-backlight";
+                pwms = <&py32io16 3 2000000 0>;
+                
+                brightness-levels = <
+                    0  20000  40000  60000  80000 100000 120000 140000 160000 180000
+                200000 220000 240000 260000 280000 300000 320000 340000 360000 380000
+                400000 420000 440000 460000 480000 500000 520000 540000 560000 580000
+                600000 620000 640000 660000 680000 700000 720000 740000 760000 780000
+                800000 820000 840000 860000 880000 900000 920000 940000 960000 980000
+                1000000 1020000 1040000 1060000 1080000 1100000 1120000 1140000 1160000 1180000
+                1200000 1220000 1240000 1260000 1280000 1300000 1320000 1340000 1360000 1380000
+                1400000 1420000 1440000 1460000 1480000 1500000 1520000 1540000 1560000 1580000
+                1600000 1620000 1640000 1660000 1680000 1700000 1720000 1740000 1760000 1780000
+                1800000 1820000 1840000 1860000 1880000 1900000 1920000 1940000 1960000 1980000
+                2000000
+                >;
+                default-brightness-level = <75>;
+                
+                power-supply = <&backlight_power>;
+                /* 强制初始化时开启背光 */
+                force-enable-on-init;
+            };
+
+            sound {
+                compatible = "simple-audio-card"; 
+                simple-audio-card,name = "ES8388-Audio";
+                status = "okay";
+                
+                simple-audio-card,dai-link {
+                    format = "i2s";
+                    bitclock-master = <&dailink0_master>;
+                    frame-master = <&dailink0_master>;
+                    
+                    dailink0_master: cpu {
+                        sound-dai = <&i2s_clk_producer>;
+                    };
+                    
+                    dailink0_slave: codec {
+                        sound-dai = <&es8390>;
+                    };
+                };
+            };
+
+            // sound {
+            //     compatible = "simple-audio-card";
+            //     simple-audio-card,name = "ES8390-HPAMP";
+            //     status = "okay";
+                
+            //     /* 将hpamp作为辅助设备添加 */
+            //     simple-audio-card,aux-devs = <&hpamp>;
+                
+            //     /* 音频路由配置 */
+            //     simple-audio-card,widgets =
+            //         "Headphone", "Headphones",
+            //         "Headphone", "HP Amp";
+                
+            //     simple-audio-card,routing =
+            //         "HP Amp", "HPOUTL",
+            //         "HP Amp", "HPOUTR",
+            //         "Headphones", "HP Amp";
+                
+            //     simple-audio-card,dai-link {
+            //         format = "i2s";
+            //         bitclock-master = <&dailink0_master>;
+            //         frame-master = <&dailink0_master>;
+                    
+            //         dailink0_master: cpu {
+            //             sound-dai = <&i2s_clk_producer>;
+            //         };
+                    
+            //         dailink0_slave: codec {
+            //             sound-dai = <&es8390>;
+            //         };
+            //     };
+            // };
+
+
+
+
+
+
+
+
+
+
+        };
+        
+    };
+
+    fragment@4 {
+        target = <&spi0>;
+        __overlay__ {
+            status = "okay";
+
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            st7789v@0 {
+                compatible = "sitronix,st7789v_m5stack";
+                reg = <0>;
+                pinctrl-names = "default";
+                pinctrl-0 = <&st7789v_pins>;
+                backlight = <&backlight_pwm>;
+
+
+                spi-max-frequency = <40000000>;
+                txbuflen = <32768>;
+                
+                dc-gpios = <&gpio 25 0>;
+                // reset-gpios = <&py32io16 4 1>;
+
+                ram-x-offset = <0>;
+                ram-y-offset = <35>;
+
+                buswidth = <8>;
+                width = <170>;
+                height = <320>;
+                rotate = <90>;
+                fps = <30>;
+                // bgr;
+                
+                debug = <0>;
+            };
+        };
+    };
+
+    fragment@5 {
+        target = <&spidev0>;
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+};
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,11 @@
+#!/bin/bash
+i2cset -y -f 1 0x60 0x01 0xc0
+i2cset -y -f 1 0x60 0x02 0x20
+i2cset -y -f 1 0x60 0x03 0x00
+
+bash -c '
+sleep 5;
+if [ "$(cat /sys/class/drm/card0-HDMI-A-1/edid | wc -c)" == "0" ]; then	
+	chvt 1
+fi
+' &
