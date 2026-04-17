@@ -21,7 +21,7 @@ install: all
 	mkdir -p /lib/modules/$(shell uname -r)/extra
 	cp $(Target_ko).ko /lib/modules/$(shell uname -r)/extra
 	depmod -a
-	echo "dtoverlay=$(Target_dts)" | tee -a /boot/firmware/config.txt
+# 	echo "dtoverlay=$(Target_dts)" | tee -a /boot/firmware/config.txt
 
 
 .PHONY: all clean install

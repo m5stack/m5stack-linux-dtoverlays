@@ -20,11 +20,11 @@ clean:
 install: all
 	cp $(Target_dts).dtbo /boot/firmware/overlays/
 	echo "dtoverlay=$(Target_dts)" | tee -a /boot/firmware/config.txt
+	if [ -d '../py32ioexp-1.0' ] ; then $(MAKE) -C ../py32ioexp-1.0 install ; fi
+	if [ -d '../st7789v-1.0' ] ; then $(MAKE) -C ../st7789v-1.0 install ; fi
+	if [ -d '../tca8418-1.0' ] ; then $(MAKE) -C ../tca8418-1.0 install ; fi
+	if [ -d '../es8389-1.0' ] ; then $(MAKE) -C ../es8389-1.0 install ; fi
 	echo "ok"
-# 	mkdir -p /lib/modules/$(shell uname -r)/extra
-# 	cp $(Target_ko).ko /lib/modules/$(shell uname -r)/extra
-# 	depmod -a
-# 	echo "dtoverlay=$(Target_dts)" | tee -a /boot/firmware/config.txt
 
 
 .PHONY: all clean install
