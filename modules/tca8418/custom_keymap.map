@@ -1,0 +1,40 @@
+# ── Row 0 ──────────────────────────────
+keycode 184 = at               # 0xb8 → @
+keycode 185 = numbersign       # 0xb9 → #
+keycode 186 = dollar           # 0xba → $
+keycode 187 = percent          # 0xbb → %
+keycode 188 = asciicircum      # 0xbc → ^
+keycode 189 = ampersand        # 0xbd → &
+keycode 190 = asterisk         # 0xbe → *
+keycode 191 = parenleft        # 0xbf → (
+keycode 192 = parenright       # 0xc0 → )
+
+# ── Row 1 ──────────────────────────────
+keycode 193 = asciitilde       # 0xc1 → ~
+keycode 194 = grave            # 0xc2 → `
+keycode 195 = plus             # 0xc3 → +
+keycode 196 = minus            # 0xc4 → -
+keycode 197 = slash            # 0xc5 → /
+keycode 198 = backslash        # 0xc6 → \
+keycode 199 = braceleft        # 0xc7 → {
+keycode 200 = braceright       # 0xc8 → }
+keycode 201 = bracketleft      # 0xc9 → [
+keycode 202 = bracketright     # 0xca → ]
+
+# ── Row 2 ──────────────────────────────
+keycode 203 = bar              # 0xcb → |
+keycode 204 = equal            # 0xcc → =
+keycode 205 = colon            # 0xcd → :
+keycode 206 = semicolon        # 0xce → ;
+keycode 207 = underscore       # 0xcf → _
+keycode 208 = question         # 0xd0 → ?
+
+# ── Row 3 ──────────────────────────────
+keycode 209 = less             # 0xd1 → <
+keycode 210 = greater          # 0xd2 → >
+keycode 211 = apostrophe       # 0xd3 → '
+keycode 212 = quotedbl         # 0xd4 → "
+keycode 213 = period           # 0xd5 → .
+
+# ── Row 4 ──────────────────────────────
+keycode 183 = exclam           # 0xb7 → !

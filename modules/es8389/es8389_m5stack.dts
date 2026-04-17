@@ -61,7 +61,7 @@
                 simple-audio-card,name = "ES8388-Audio";
                 status = "okay";
                 
-                simple-audio-card,dai-link {
+                simple-audio-card,dai-link@0 {
                     format = "i2s";
                     bitclock-master = <&dailink0_master>;
                     frame-master = <&dailink0_master>;
@@ -80,3 +80,357 @@
 };
 
 
+
+
+
+// /dts-v1/;
+// /plugin/;
+// /{
+//     compatible = "brcm,bcm2835";
+
+// //     fragment@0 {
+// //         target-path = "/";
+// //         __overlay__ {
+// //             gpio4_switch: gpio4_switch {
+// //                 compatible = "gpio-leds";
+// //                 status = "okay";
+
+// //                 switch4 {
+// //                     label = "gpio4_output";
+// //                     gpios = <&gpio 4 0>; /* GPIO4, active high */
+// //                     default-state = "off";
+// //                     retain-state-shutdown;
+// //                 };
+// //             };
+// //         };
+// //     };
+
+
+// //     fragment@0 {
+// //         target = <&gpio>;
+// //         __overlay__ {
+// //             gpio5_output: gpio5_output {
+// //                 brcm,pins = <5>;
+// //                 brcm,function = <1>; /* 输出模式 */
+// //                 brcm,pull = <0>;     /* 无上下拉 */
+// //             };
+// //         };
+// //     };
+
+// //     fragment@1 {
+// //         target-path = "/";
+// //         __overlay__ {
+// //             gpio5_regulator: gpio5-regulator {
+// //                 compatible = "regulator-fixed";
+// //                 regulator-name = "ext_5v_out";
+// //                 pinctrl-names = "default";
+// //                 pinctrl-0 = <&gpio5_output>;
+// //                 regulator-min-microvolt = <5000000>;
+// //                 regulator-max-microvolt = <5000000>;
+// //                 gpio = <&gpio 5 0>;
+// //                 enable-active-high;
+// //                 // regulator-boot-on;
+// //                 // regulator-always-on;
+// //             };
+// //         };
+// //     };
+
+
+
+
+
+
+
+
+// // };
+
+
+
+
+// fragment@0 {
+//     target-path = "/";
+//     __overlay__ {
+//         es8390_mclk: es8390_mclk {
+//                 compatible = "fixed-clock";
+//                 #clock-cells = <0>;
+//                 clock-frequency = <12288000>;
+//         };
+
+// //         sound {
+// //             compatible = "simple-audio-card"; 
+// //             simple-audio-card,name = "ES8388-Audio";
+// //             status = "okay";
+            
+// //             simple-audio-card,dai-link@0 {
+// //                 format = "i2s";
+// //                 bitclock-master = <&dailink0_master>;
+// //                 frame-master = <&dailink0_master>;
+                
+// //                 dailink0_master: cpu {
+// //                     sound-dai = <&i2s_clk_producer>;
+// //                 };
+                
+// //                 dailink0_slave: codec {
+// //                     sound-dai = <&es8390>;
+// //                 };
+// //             };
+// //         };
+
+// //         backlight_pwm: backlight {
+// //             compatible = "pwm-backlight";
+// //             // 使用py32io的PWM1通道（hwpwm=0）
+// //             // #pwm-cells = <3>: <通道号 周期(ns) 极性>
+// //             pwms = <&py32io16 3 2000000 0>;  // PWM4, 500Hz(2ms), 正极性
+            
+// //             // 亮度级别映射
+// //             brightness-levels = <
+// //                 0   4   8   12  16  20  24  28
+// //                 32  36  40  44  48  52  56  60
+// //                 64  68  72  76  80  84  88  92
+// //                 96  100 104 108 112 116 120 124
+// //                 128 132 136 140 144 148 152 156
+// //                 160 164 168 172 176 180 184 188
+// //                 192 196 200 204 208 212 216 220
+// //                 224 228 232 236 240 244 248 252
+// //                 255
+// //             >;
+// //             default-brightness-level = <32>;  // 默认50%亮度
+            
+// //             // power-supply = <&vcc_3v3>;  // 根据实际修改
+// //             status = "okay";
+// //         };
+// //     };
+// };
+
+
+
+// // fragment@1 {
+// //     target = <&gpio>;
+// //     __overlay__ {
+// //         st7789v_pins: st7789v_pins {
+// //                 brcm,pins = <25>;
+// //                 brcm,function = <1>;
+// //                 brcm,pull = <0>;
+// //         };
+// //         tca8418_pins: tca8418_pins {
+// //                 brcm,pins = <27 17 16>;
+// //                 brcm,function = <0 1 1>;
+// //                 brcm,pull = <2 0 0>;
+// //         };
+// //         spk_en_pins: spk_en_pins {
+// //                 brcm,pins = <24>;
+// //                 brcm,function = <1>;
+// //                 brcm,pull = <0>;
+// //         };
+// //     };
+// // };
+
+// // fragment@2 {
+// //     target = <&i2c1>;
+// //     __overlay__ {
+// //         #address-cells = <1>;
+// //         #size-cells = <0>;
+// //         status = "okay";
+
+// //         py32io16: gpio@6f {
+// //                 compatible = "m5stack,py32io16";
+// //                 reg = <0x6f>;  // I2C地址，根据实际硬件修改
+                
+// //                 // GPIO控制器配置
+// //                 gpio-controller;
+// //                 #gpio-cells = <2>;
+// //                 ngpios = <16>;
+                
+// //                 // PWM控制器配置
+// //                 #pwm-cells = <3>;
+                
+// //                 status = "okay";
+// //         };
+
+// //         es8390: es8390@10 {
+// //             compatible = "everest,es8390";
+// //             reg = <0x10>;
+// //             #sound-dai-cells = <0>;
+// //             pinctrl-names = "default";
+// //             pinctrl-0 = <&spk_en_pins>;
+// //             clock-names = "mclk";
+// //             clocks = <&es8390_mclk>;
+// //             spk-enable-gpios = <&gpio 24 GPIO_ACTIVE_HIGH>;
+// //             status = "okay";
+// //         };
+
+// //         rx8130: rx8130@68 {
+// //             compatible = "epson,rx8130";
+// //             reg = <0x68>;
+// //             status = "okay";
+// //         };
+
+// //         tca8418@34 {
+// //             compatible = "m5stack,tca8418_m5stack"; 
+// //             reg = <0x34>;
+// //             pinctrl-names = "default";
+// //             pinctrl-0 = <&tca8418_pins>;
+// //             interrupt-parent = <&gpio>;
+// //             interrupts = <27 2>; /* 中断io 下沿触发  */
+// //             irq-gpios = <&gpio 27 0x00>; /* 中断io 下沿触发 */
+                
+// //             keypad,num-rows = <5>;
+// //             keypad,num-columns = <10>;
+
+// //             tables-sel-gpio = <&gpio 17 1>;
+// //             capslock-gpio = <&gpio 16 1>;
+// //             switch-button-code = <73>; /* 切换按键 keycode */
+// //             // interrupt-controller;
+// //             /* row | column | key-code  例如: 04,08,0010 q 键 */
+// //             linux,keymap = <
+// //                 0x04000001
+// //                 0x04040010
+// //                 0x00000011
+// //                 0x00010012
+// //                 0x00020013
+// //                 0x00030014
+// //                 0x00040015
+// //                 0x00050016
+// //                 0x00060017
+// //                 0x00070018
+// //                 0x00080019
+// //                 0x0009000e
+// //                 0x0403000f
+// //                 0x0100001e
+// //                 0x0101001f
+// //                 0x01020020
+// //                 0x01030021
+// //                 0x01040022
+// //                 0x01050023
+// //                 0x01060024
+// //                 0x01070025
+// //                 0x01080026
+// //                 0x0109001c
+// //                 0x0401002a
+// //                 0x0200003a
+// //                 0x0201002c
+// //                 0x0202002d
+// //                 0x0203002e
+// //                 0x0204002f
+// //                 0x02050030
+// //                 0x02060031
+// //                 0x02070032
+// //                 0x02080067
+// //                 0x02090029
+// //                 0x0402001d
+// //                 0x03000038
+// //                 0x03010027
+// //                 0x03020028
+// //                 0x03030039
+// //                 0x03040033
+// //                 0x03050034
+// //                 0x03060035
+// //                 0x03070069
+// //                 0x0308006c
+// //                 0x0309006a
+// //                 >;
+// //             linux,keymap1 = <
+// //                 0x04000001
+// //                 0x04040002
+// //                 0x00000003
+// //                 0x00010004
+// //                 0x00020005
+// //                 0x00030006
+// //                 0x00040007
+// //                 0x00050008
+// //                 0x00060009
+// //                 0x0007000a
+// //                 0x0008000b
+// //                 0x0009000e
+// //                 0x0403000f
+// //                 0x0100003b
+// //                 0x0101003c
+// //                 0x0102003d
+// //                 0x0103003e
+// //                 0x0104003f
+// //                 0x01050040
+// //                 0x01060041
+// //                 0x01070042
+// //                 0x01080043
+// //                 0x0109001c
+// //                 0x04010036
+// //                 0x0200003a
+// //                 0x02010044
+// //                 0x02020057
+// //                 0x02030058
+// //                 0x02040066
+// //                 0x0205006b
+// //                 0x02060068
+// //                 0x0207006d
+// //                 0x02080067
+// //                 0x02090029
+// //                 0x04020061
+// //                 0x03000064
+// //                 0x0301000c
+// //                 0x0302000d
+// //                 0x03030039
+// //                 0x0304001a
+// //                 0x0305001b
+// //                 0x0306002b
+// //                 0x03070069
+// //                 0x0308006c
+// //                 0x0309006a
+// //                 >;
+// //         };
+// //     };
+// // };
+
+// // fragment@3 {
+// //     target = <&spi0>;
+// //     __overlay__ {
+// //         status = "okay";
+
+// //         #address-cells = <1>;
+// //         #size-cells = <0>;
+
+// //         st7789v@0 {
+// //             compatible = "sitronix,st7789v_m5stack";
+// //             reg = <0>;
+// //             pinctrl-names = "default";
+// //             pinctrl-0 = <&st7789v_pins>;
+
+// //             spi-max-frequency = <40000000>;
+// //             txbuflen = <32768>;
+            
+// //             dc-gpios = <&gpio 25 0>;
+// //             // reset-gpios = <&py32io16 4 1>;
+
+// //             // PWM背光
+// //             backlight = <&backlight_pwm>;
+
+// //             ram-x-offset = <0>;
+// //             ram-y-offset = <32>;
+
+// //             buswidth = <8>;
+// //             width = <170>;
+// //             height = <320>;
+// //             rotate = <90>;
+// //             fps = <30>;
+// //             // bgr;
+            
+// //             debug = <0>;
+// //         };
+// //     };
+// // };
+
+// // fragment@4 {
+// //     target = <&spidev0>;
+// //     __overlay__ {
+// //         status = "disabled";
+// //     };
+// // };
+
+// // fragment@5 {
+// //     target = <&i2s_clk_producer>;
+// //     __overlay__ {
+// //         status = "okay";
+// //     };
+// // };
+
+
+// };

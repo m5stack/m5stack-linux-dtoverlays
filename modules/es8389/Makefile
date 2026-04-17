@@ -6,7 +6,7 @@ Target_dts := es8389_m5stack
 # Module name
 obj-m += $(Target_ko).o
 
-all: $(Target_ko).ko $(Target_dts).dtbo
+all: $(Target_ko).ko # $(Target_dts).dtbo
 
 $(Target_ko).ko: $(Target_ko).c
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) ARCH=$(ARCH) modules

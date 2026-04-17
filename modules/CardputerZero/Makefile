@@ -18,6 +18,8 @@ clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
 	rm -f $(Target_dts).dtbo
 install: all
+	cp $(Target_dts).dtbo /boot/firmware/overlays/
+	echo "dtoverlay=$(Target_dts)" | tee -a /boot/firmware/config.txt
 	echo "ok"
 # 	mkdir -p /lib/modules/$(shell uname -r)/extra
 # 	cp $(Target_ko).ko /lib/modules/$(shell uname -r)/extra

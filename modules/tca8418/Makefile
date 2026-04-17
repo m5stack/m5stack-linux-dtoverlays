@@ -2,7 +2,7 @@ KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 ARCH := $(shell uname -m)
 Target_ko := tca8418_keypad_m5stack
-Target_dts := tca8418_m5stac
+Target_dts := tca8418_m5stack
 # Module name
 obj-m += $(Target_ko).o
 
