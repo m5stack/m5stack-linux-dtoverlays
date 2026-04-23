@@ -116,10 +116,23 @@ struct tca8418_keypad {
 	struct gpio_desc *tables_sel_gpio;
 	struct gpio_desc *capslock_gpio;
 	int map_base_index;
+	
 	int switch_button_code;
+	int sym_button_code;
+	int fn_button_code;
+	int asmux_button_code;
+
+
+	int sym_button_flage;
+	int fn_button_flage;
+	int asmux_button_flage;
+
+	ktime_t asmux_timer;
+
 	int capslock_state;
 	unsigned int row_shift;
-	unsigned short *keycode;
+	unsigned short *keycode1;
+	unsigned short *keycode2;
 };
 
 /*
@@ -191,34 +204,101 @@ static void tca8418_read_keypad(struct tca8418_keypad *keypad_data)
 		col = (col) ? col - 1 : TCA8418_MAX_COLS - 1;
 		
 		code = MATRIX_SCAN_CODE(row, col, keypad_data->row_shift);
-		if((keypad_data->switch_button_code != -1) && (code == keypad_data->switch_button_code) && (state == 0))
-		{
-			if(keypad_data->map_base_index == 1)
-			{
-				keypad_data->map_base_index = 0;
-				gpiod_set_value_cansleep(keypad_data->tables_sel_gpio, 0);
-			}	
-			else
-			{
-				keypad_data->map_base_index = 1;
-				gpiod_set_value_cansleep(keypad_data->tables_sel_gpio, 1);
-			}
-			continue;
-		}
 
-		/* Toggle capslock LED on key press */
-		if (keypad_data->capslock_gpio && state != 0) {
-			unsigned short keycode = keypad_data->map_base_index == 0 ?
-						keymap[code] : keypad_data->keycode[code];
-			if (keycode == KEY_CAPSLOCK) {
-				keypad_data->capslock_state = !keypad_data->capslock_state;
-				gpiod_set_value_cansleep(keypad_data->capslock_gpio, keypad_data->capslock_state);
+
+		unsigned int report_code = keymap[code];
+		{
+			if(state==0)
+			{//按键松开
+				if(code == keypad_data->sym_button_code)
+				{
+					//上锁
+					keypad_data->sym_button_flage = !keypad_data->sym_button_flage;
+					gpiod_set_value_cansleep(keypad_data->tables_sel_gpio, keypad_data->sym_button_flage);
+				}
+				if(code == keypad_data->fn_button_code)
+				{
+					keypad_data->fn_button_flage = 0;
+				}
+			}
+			else
+			{//按键按下
+				// if(code == keypad_data->sym_button_code)
+				// {
+				// 	keypad_data->sym_button_flage = 1;
+				// }
+				if(code == keypad_data->fn_button_code)
+				{
+					keypad_data->fn_button_flage = 1;
+				}
+			}
+		
+			if(keypad_data->sym_button_flage)
+			{
+				report_code = keypad_data->keycode1[code];
+			}
+			if(keypad_data->fn_button_flage)
+			{
+				report_code = keypad_data->keycode2[code];
+			}
+
+			if(code == keypad_data->asmux_button_code)
+			{
+				printk("asmux_button_code  0\n");
+				report_code = KEY_LEFTSHIFT;
+				if(keypad_data->asmux_button_flage)
+				{
+					printk("asmux_button_code  1\n");
+					report_code = KEY_CAPSLOCK;
+					keypad_data->asmux_button_flage = 0;
+				}
+				if(state==0)
+				{//按键松开
+					printk("asmux_button_code  2\n");
+					keypad_data->asmux_timer = ktime_get();
+				}
+				else
+				{//按键按下
+					printk("asmux_button_code  3\n");
+					s64 elapsed_us = ktime_to_us(ktime_sub(ktime_get(), keypad_data->asmux_timer));
+					if(elapsed_us < 300000)
+					{
+						printk("asmux_button_code  4\n");
+						report_code = KEY_CAPSLOCK;
+						keypad_data->asmux_button_flage = 1;
+					}
+				}
+			}
+			if(report_code == KEY_CAPSLOCK)
+			{
+				if(state==0)
+				{
+					keypad_data->capslock_state = keypad_data->capslock_state ? 0 : 1;
+					gpiod_set_value_cansleep(keypad_data->capslock_gpio, keypad_data->capslock_state);
+					printk("report_code KEY_CAPSLOCK 0\n");
+				}
+				else
+				{
+					// gpiod_set_value_cansleep(keypad_data->capslock_gpio, keypad_data->capslock_state);
+					printk("report_code KEY_CAPSLOCK 1\n");
+				}
+			}
+			if(report_code == KEY_LEFTSHIFT)
+			{
+				if(state==0)
+				{
+					printk("report_code KEY_LEFTSHIFT 0\n");
+				}
+				else
+				{
+					printk("report_code KEY_LEFTSHIFT 1\n");
+				}
 			}
 		}
 
 		printk("code:%d\n", code);
 		input_event(input, EV_MSC, MSC_SCAN, code);
-		input_report_key(input, keypad_data->map_base_index == 0 ? keymap[code] : keypad_data->keycode[code], state);
+		input_report_key(input, report_code, state);
 
 	} while (1);
 
@@ -332,20 +412,20 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 	keypad_data->row_shift = row_shift;
 
 	{
-		keypad_data->map_base_index = 0;
-		keypad_data->switch_button_code = -1;
-		device_property_read_u32(dev, "switch-button-code", &keypad_data->switch_button_code);
-		if(keypad_data->switch_button_code != -1)
-		{
-			keypad_data->tables_sel_gpio = devm_gpiod_get_optional(dev, "tables-sel", GPIOD_OUT_HIGH);
-			if (IS_ERR(keypad_data->tables_sel_gpio))
-				return PTR_ERR(keypad_data->tables_sel_gpio);
-		}
-
 		keypad_data->capslock_state = 0;
-		keypad_data->capslock_gpio = devm_gpiod_get_optional(dev, "capslock", GPIOD_OUT_LOW);
-		if (IS_ERR(keypad_data->capslock_gpio))
-			return PTR_ERR(keypad_data->capslock_gpio);
+		keypad_data->map_base_index = 0;
+		// keypad_data->switch_button_code = -1;
+		keypad_data->sym_button_code = -1;
+		keypad_data->fn_button_code = -1;
+		keypad_data->asmux_button_code = -1;
+
+		device_property_read_u32(dev, "sym-button-code", &keypad_data->sym_button_code);
+		device_property_read_u32(dev, "fn-button-code", &keypad_data->fn_button_code);
+		device_property_read_u32(dev, "asmux-button-code", &keypad_data->asmux_button_code);
+
+		keypad_data->capslock_gpio = devm_gpiod_get_optional(dev, "capslock", GPIOD_OUT_HIGH);
+		keypad_data->tables_sel_gpio = devm_gpiod_get_optional(dev, "tables-sel", GPIOD_OUT_HIGH);
+
 	}
 
 	/* Read key lock register, if this fails assume device not present */
@@ -371,17 +451,24 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 		dev_err(dev, "Failed to build keymap\n");
 		return error;
 	}
-	if(keypad_data->switch_button_code != -1)
-	{
-		keypad_data->keycode = input->keycode;
-		error = matrix_keypad_build_keymap(NULL, "linux,keymap1", rows, cols, NULL, input);
-		unsigned short *tmp_keycode = input->keycode;
-		input->keycode = keypad_data->keycode;
-		keypad_data->keycode = tmp_keycode;
-		if (error) {
-			dev_err(dev, "Failed to build keymap\n");
-			return error;
-		}
+
+	keypad_data->keycode1 = input->keycode;
+	error = matrix_keypad_build_keymap(NULL, "linux,keymap1", rows, cols, NULL, input);
+	unsigned short *tmp_keycode1 = input->keycode;
+	input->keycode = keypad_data->keycode1;
+	keypad_data->keycode1 = tmp_keycode1;
+	if (error) {
+		dev_err(dev, "Failed to build keymap1\n");
+		return error;
+	}
+	keypad_data->keycode2 = input->keycode;
+	error = matrix_keypad_build_keymap(NULL, "linux,keymap2", rows, cols, NULL, input);
+	unsigned short *tmp_keycode2 = input->keycode;
+	input->keycode = keypad_data->keycode2;
+	keypad_data->keycode2 = tmp_keycode2;
+	if (error) {
+		dev_err(dev, "Failed to build keymap2\n");
+		return error;
 	}
 
 	if (device_property_read_bool(dev, "keypad,autorepeat"))
