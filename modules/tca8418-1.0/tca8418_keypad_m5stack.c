@@ -36,6 +36,7 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/gpio/consumer.h>
+#include <linux/leds.h>
 
 /* TCA8418 hardware limits */
 #define TCA8418_MAX_ROWS	8
@@ -113,23 +114,24 @@
 struct tca8418_keypad {
 	struct i2c_client *client;
 	struct input_dev *input;
+	struct led_classdev capslock_led;
+
 	struct gpio_desc *tables_sel_gpio;
 	struct gpio_desc *capslock_gpio;
 	int map_base_index;
 	
-	int switch_button_code;
 	int sym_button_code;
 	int fn_button_code;
 	int asmux_button_code;
 
 
-	int sym_button_flage;
-	int fn_button_flage;
-	int asmux_button_flage;
+	int sym_button_flag;
+	int fn_button_flag;
+	int asmux_button_flag;
 
 	ktime_t asmux_timer;
+	ktime_t sym_timer;
 
-	int capslock_state;
 	unsigned int row_shift;
 	unsigned short *keycode1;
 	unsigned short *keycode2;
@@ -208,95 +210,72 @@ static void tca8418_read_keypad(struct tca8418_keypad *keypad_data)
 
 		unsigned int report_code = keymap[code];
 		{
-			if(state==0)
-			{//按键松开
-				if(code == keypad_data->sym_button_code)
+
+			if(code == keypad_data->fn_button_code)
+			{
+				keypad_data->fn_button_flag = state ? 1 : 0;
+			}
+
+			if(code == keypad_data->sym_button_code)
+			{
+				if(state==0)
 				{
-					//上锁
-					keypad_data->sym_button_flage = !keypad_data->sym_button_flage;
-					gpiod_set_value_cansleep(keypad_data->tables_sel_gpio, keypad_data->sym_button_flage);
+					if(keypad_data->sym_button_flag)
+					{
+						keypad_data->sym_button_flag --;
+					}
+					keypad_data->sym_timer = ktime_get();
 				}
-				if(code == keypad_data->fn_button_code)
+				else
 				{
-					keypad_data->fn_button_flage = 0;
+					keypad_data->sym_button_flag = 1;
+					s64 elapsed_us = ktime_to_us(ktime_sub(ktime_get(), keypad_data->sym_timer));
+					if(elapsed_us < 300000)
+					{
+						keypad_data->sym_button_flag = 2;
+					}
 				}
 			}
-			else
-			{//按键按下
-				// if(code == keypad_data->sym_button_code)
-				// {
-				// 	keypad_data->sym_button_flage = 1;
-				// }
-				if(code == keypad_data->fn_button_code)
-				{
-					keypad_data->fn_button_flage = 1;
-				}
-			}
-		
-			if(keypad_data->sym_button_flage)
+
+			if(keypad_data->sym_button_flag)
 			{
 				report_code = keypad_data->keycode1[code];
+				gpiod_set_value_cansleep(keypad_data->tables_sel_gpio, 1);
 			}
-			if(keypad_data->fn_button_flage)
+			else{
+				gpiod_set_value_cansleep(keypad_data->tables_sel_gpio, 0);
+			}
+			if(keypad_data->fn_button_flag)
 			{
 				report_code = keypad_data->keycode2[code];
 			}
 
 			if(code == keypad_data->asmux_button_code)
 			{
-				printk("asmux_button_code  0\n");
 				report_code = KEY_LEFTSHIFT;
-				if(keypad_data->asmux_button_flage)
+				if(keypad_data->asmux_button_flag)
 				{
-					printk("asmux_button_code  1\n");
 					report_code = KEY_CAPSLOCK;
-					keypad_data->asmux_button_flage = 0;
+					keypad_data->asmux_button_flag = 0;
 				}
 				if(state==0)
-				{//按键松开
-					printk("asmux_button_code  2\n");
+				{
 					keypad_data->asmux_timer = ktime_get();
 				}
 				else
-				{//按键按下
-					printk("asmux_button_code  3\n");
+				{
 					s64 elapsed_us = ktime_to_us(ktime_sub(ktime_get(), keypad_data->asmux_timer));
 					if(elapsed_us < 300000)
 					{
-						printk("asmux_button_code  4\n");
 						report_code = KEY_CAPSLOCK;
-						keypad_data->asmux_button_flage = 1;
+						keypad_data->asmux_button_flag = 1;
 					}
 				}
 			}
-			if(report_code == KEY_CAPSLOCK)
-			{
-				if(state==0)
-				{
-					keypad_data->capslock_state = keypad_data->capslock_state ? 0 : 1;
-					gpiod_set_value_cansleep(keypad_data->capslock_gpio, keypad_data->capslock_state);
-					printk("report_code KEY_CAPSLOCK 0\n");
-				}
-				else
-				{
-					// gpiod_set_value_cansleep(keypad_data->capslock_gpio, keypad_data->capslock_state);
-					printk("report_code KEY_CAPSLOCK 1\n");
-				}
-			}
-			if(report_code == KEY_LEFTSHIFT)
-			{
-				if(state==0)
-				{
-					printk("report_code KEY_LEFTSHIFT 0\n");
-				}
-				else
-				{
-					printk("report_code KEY_LEFTSHIFT 1\n");
-				}
-			}
+
 		}
 
-		printk("code:%d\n", code);
+		// printk("code:%d\n", code);
 		input_event(input, EV_MSC, MSC_SCAN, code);
 		input_report_key(input, report_code, state);
 
@@ -371,6 +350,21 @@ static int tca8418_configure(struct tca8418_keypad *keypad_data,
 	return error;
 }
 
+static int tca8418_capslock_led_set(struct led_classdev *led_cdev,
+				     enum led_brightness brightness)
+{
+	// 通过 container_of 宏，从 led_cdev 找到你的主结构体
+	struct tca8418_keypad *keypad_data = 
+		container_of(led_cdev, struct tca8418_keypad, capslock_led);
+
+	// 直接根据 brightness (LED_ON=1, LED_OFF=0) 操作 GPIO
+	if(keypad_data->capslock_gpio)
+		gpiod_set_value_cansleep(keypad_data->capslock_gpio, brightness);
+	return 0;
+}
+
+
+
 static int tca8418_keypad_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -412,9 +406,7 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 	keypad_data->row_shift = row_shift;
 
 	{
-		keypad_data->capslock_state = 0;
 		keypad_data->map_base_index = 0;
-		// keypad_data->switch_button_code = -1;
 		keypad_data->sym_button_code = -1;
 		keypad_data->fn_button_code = -1;
 		keypad_data->asmux_button_code = -1;
@@ -423,8 +415,20 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 		device_property_read_u32(dev, "fn-button-code", &keypad_data->fn_button_code);
 		device_property_read_u32(dev, "asmux-button-code", &keypad_data->asmux_button_code);
 
-		keypad_data->capslock_gpio = devm_gpiod_get_optional(dev, "capslock", GPIOD_OUT_HIGH);
-		keypad_data->tables_sel_gpio = devm_gpiod_get_optional(dev, "tables-sel", GPIOD_OUT_HIGH);
+		keypad_data->capslock_gpio = devm_gpiod_get_optional(dev, "capslock", GPIOD_OUT_LOW);
+		keypad_data->tables_sel_gpio = devm_gpiod_get_optional(dev, "tables-sel", GPIOD_OUT_LOW);
+
+		// 如果设备树里配了 capslock gpio，就把它注册为标准的 LED 设备
+		if (keypad_data->capslock_gpio) {
+			keypad_data->capslock_led.name = "tca8418::capslock"; // 将出现在 /sys/class/leds/ 下
+			keypad_data->capslock_led.brightness_set_blocking = tca8418_capslock_led_set;
+			keypad_data->capslock_led.default_trigger = "kbd-capslock"; // 可选：允许被触发器控制
+			
+			// 注册 LED 设备，注意父设备是 dev，这很关键，input-leds 靠这个匹配
+			devm_led_classdev_register(dev, &keypad_data->capslock_led);
+		}
+
+
 
 	}
 
@@ -474,7 +478,10 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 	if (device_property_read_bool(dev, "keypad,autorepeat"))
 		__set_bit(EV_REP, input->evbit);
 
+
 	input_set_capability(input, EV_MSC, MSC_SCAN);
+	// __set_bit(EV_MSC, input->evbit);
+	// __set_bit(MSC_SCAN, input->mscbit);
 
 	error = devm_request_threaded_irq(dev, client->irq,
 					  NULL, tca8418_irq_handler,
