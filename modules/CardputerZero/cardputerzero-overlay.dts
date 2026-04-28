@@ -99,7 +99,7 @@
                 // tables-sel-gpio = <&gpio 17 1>;
                 // capslock-gpio = <&gpio 16 1>;
                 tables-sel-gpio = <&py32io16 8 1>;
-                capslock-gpio = <&py32io16 9 1>;
+                capslock-gpio = <&py32io16 7 1>;
 
                 sym-button-code = <0x43>; 
                 fn-button-code = <0x42>;  

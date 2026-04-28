@@ -135,6 +135,9 @@ struct tca8418_keypad {
 	unsigned int row_shift;
 	unsigned short *keycode1;
 	unsigned short *keycode2;
+
+    struct work_struct capslock_work;
+    bool capslock_state;
 };
 
 /*
@@ -350,19 +353,31 @@ static int tca8418_configure(struct tca8418_keypad *keypad_data,
 	return error;
 }
 
-static int tca8418_capslock_led_set(struct led_classdev *led_cdev,
-				     enum led_brightness brightness)
+static void tca8418_capslock_work(struct work_struct *work)
 {
-	// 通过 container_of 宏，从 led_cdev 找到你的主结构体
-	struct tca8418_keypad *keypad_data = 
-		container_of(led_cdev, struct tca8418_keypad, capslock_led);
+    struct tca8418_keypad *keypad =
+        container_of(work, struct tca8418_keypad, capslock_work);
 
-	// 直接根据 brightness (LED_ON=1, LED_OFF=0) 操作 GPIO
-	if(keypad_data->capslock_gpio)
-		gpiod_set_value_cansleep(keypad_data->capslock_gpio, brightness);
-	return 0;
+    if (keypad->capslock_gpio)
+        gpiod_set_value_cansleep(keypad->capslock_gpio,
+                      keypad->capslock_state);
 }
 
+static int tca8418_input_event(struct input_dev *dev,
+                   unsigned int type,
+                   unsigned int code,
+                   int value)
+{
+    struct tca8418_keypad *keypad = input_get_drvdata(dev);
+
+    if (type == EV_LED && code == LED_CAPSL) {
+        keypad->capslock_state = !!value;
+        schedule_work(&keypad->capslock_work);
+        return 0;
+    }
+
+    return -EINVAL;
+}
 
 
 static int tca8418_keypad_probe(struct i2c_client *client)
@@ -418,18 +433,10 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 		keypad_data->capslock_gpio = devm_gpiod_get_optional(dev, "capslock", GPIOD_OUT_LOW);
 		keypad_data->tables_sel_gpio = devm_gpiod_get_optional(dev, "tables-sel", GPIOD_OUT_LOW);
 
-		// 如果设备树里配了 capslock gpio，就把它注册为标准的 LED 设备
-		if (keypad_data->capslock_gpio) {
-			keypad_data->capslock_led.name = "tca8418::capslock"; // 将出现在 /sys/class/leds/ 下
-			keypad_data->capslock_led.brightness_set_blocking = tca8418_capslock_led_set;
-			keypad_data->capslock_led.default_trigger = "kbd-capslock"; // 可选：允许被触发器控制
-			
-			// 注册 LED 设备，注意父设备是 dev，这很关键，input-leds 靠这个匹配
-			devm_led_classdev_register(dev, &keypad_data->capslock_led);
-		}
-
-
-
+		if (IS_ERR(keypad_data->capslock_gpio))
+			keypad_data->capslock_gpio = NULL;
+		if (IS_ERR(keypad_data->tables_sel_gpio))
+			keypad_data->tables_sel_gpio = NULL;
 	}
 
 	/* Read key lock register, if this fails assume device not present */
@@ -478,6 +485,15 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 	if (device_property_read_bool(dev, "keypad,autorepeat"))
 		__set_bit(EV_REP, input->evbit);
 
+	input_set_drvdata(input, keypad_data);
+
+	if(keypad_data->capslock_gpio)
+	{
+		INIT_WORK(&keypad_data->capslock_work, tca8418_capslock_work);
+		__set_bit(EV_LED, input->evbit);
+		__set_bit(LED_CAPSL, input->ledbit);
+		input->event = tca8418_input_event;
+	}
 
 	input_set_capability(input, EV_MSC, MSC_SCAN);
 	// __set_bit(EV_MSC, input->evbit);
