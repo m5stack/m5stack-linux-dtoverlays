@@ -30,12 +30,23 @@
                     brcm,function = <1>;
                     brcm,pull = <0>;
             };
+            cam_en_pins: cam_en_pins {
+                    brcm,pins = <16>;
+                    brcm,function = <1>;
+                    brcm,pull = <0>;
+            };
             always_high_pin: always-high {
                 gpio-hog;
                 gpios = <24 0>;
                 output-high;
                 line-name = "always-high-pin";
             };
+            // cam_high_pin: cam-high {
+            //     gpio-hog;
+            //     gpios = <16 0>;
+            //     output-high;
+            //     line-name = "cam-high-pin";
+            // };
         };
     };
 
@@ -224,15 +235,15 @@
 
 
 0x0404003b /* row=0x04 col=0x04 keycode=0x003b  KEY_F1           F1 */
-0x000000b8 /* row=0x00 col=0x00 keycode=0x003c  KEY_F2           F2 */
-0x000100b9 /* row=0x00 col=0x01 keycode=0x003d  KEY_F3           F15 */
-0x000200ba /* row=0x00 col=0x02 keycode=0x003e  KEY_F4           F16 */
-0x000300bb /* row=0x00 col=0x03 keycode=0x003f  KEY_F5           F17 */
-0x000400bc /* row=0x00 col=0x04 keycode=0x0040  KEY_F6           F18 */
-0x000500bd /* row=0x00 col=0x05 keycode=0x0041  KEY_F7           F19 */
-0x000600be /* row=0x00 col=0x06 keycode=0x0042  KEY_F8           F20 */
-0x000700bf /* row=0x00 col=0x07 keycode=0x0043  KEY_F9           F21 */
-0x000800c0 /* row=0x00 col=0x08 keycode=0x0044  KEY_F10          F22 */
+0x0000003c /* row=0x00 col=0x00 keycode=0x003c  KEY_F2           F2 */
+0x0001003d /* row=0x00 col=0x01 keycode=0x003d  KEY_F3           F15 */
+0x0002003e /* row=0x00 col=0x02 keycode=0x003e  KEY_F4           F16 */
+0x0003003f /* row=0x00 col=0x03 keycode=0x003f  KEY_F5           F17 */
+0x00040040 /* row=0x00 col=0x04 keycode=0x0040  KEY_F6           F18 */
+0x00050041 /* row=0x00 col=0x05 keycode=0x0041  KEY_F7           F19 */
+0x00060042 /* row=0x00 col=0x06 keycode=0x0042  KEY_F8           F20 */
+0x00070043 /* row=0x00 col=0x07 keycode=0x0043  KEY_F9           F21 */
+0x00080044 /* row=0x00 col=0x08 keycode=0x0044  KEY_F10          F22 */
 0x0009006f /* row=0x00 col=0x09 keycode=0x006f  KEY_DELETE       del */
 
 /* 0x0403000f  sym功能键 */ 
