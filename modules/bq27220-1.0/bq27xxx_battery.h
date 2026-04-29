@@ -61,6 +61,7 @@ struct bq27xxx_device_info {
 	struct bq27xxx_access_methods bus;
 	struct bq27xxx_reg_cache cache;
 	int charge_design_full;
+	int rs_mohm;
 	bool removed;
 	unsigned long last_update;
 	union power_supply_propval last_status;

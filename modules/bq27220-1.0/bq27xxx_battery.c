@@ -87,7 +87,6 @@
 #define BQ27XXX_SOFT_RESET		0x42
 #define BQ27XXX_RESET			0x41
 
-#define BQ27XXX_RS			(20) /* Resistor sense mOhm */
 #define BQ27XXX_POWER_CONSTANT		(29200) /* 29.2 µV^2 * 1000 */
 #define BQ27XXX_CURRENT_CONSTANT	(3570) /* 3.57 µV * 1000 */
 
@@ -1591,7 +1590,7 @@ static int bq27xxx_battery_read_charge(struct bq27xxx_device_info *di, u8 reg,
 	}
 
 	if (di->opts & BQ27XXX_O_ZERO)
-		charge *= BQ27XXX_CURRENT_CONSTANT / BQ27XXX_RS;
+		charge *= BQ27XXX_CURRENT_CONSTANT / di->rs_mohm;
 	else
 		charge *= 1000;
 
@@ -1656,7 +1655,7 @@ static int bq27xxx_battery_read_dcap(struct bq27xxx_device_info *di,
 	}
 
 	if (di->opts & BQ27XXX_O_ZERO)
-		dcap = (dcap << 8) * BQ27XXX_CURRENT_CONSTANT / BQ27XXX_RS;
+		dcap = (dcap << 8) * BQ27XXX_CURRENT_CONSTANT / di->rs_mohm;
 	else
 		dcap *= 1000;
 
@@ -1684,7 +1683,7 @@ static int bq27xxx_battery_read_energy(struct bq27xxx_device_info *di,
 	}
 
 	if (di->opts & BQ27XXX_O_ZERO)
-		ae *= BQ27XXX_POWER_CONSTANT / BQ27XXX_RS;
+		ae *= BQ27XXX_POWER_CONSTANT / di->rs_mohm;
 	else
 		ae *= 1000;
 
@@ -1879,7 +1878,7 @@ static int bq27xxx_battery_current_and_status(
 			curr = -curr;
 		}
 
-		curr = curr * BQ27XXX_CURRENT_CONSTANT / BQ27XXX_RS;
+		curr = curr * BQ27XXX_CURRENT_CONSTANT / di->rs_mohm;
 	} else {
 		/* Other gauges return signed value */
 		curr = (int)((s16)curr) * 1000;
@@ -1973,7 +1972,7 @@ static int bq27xxx_battery_pwr_avg(struct bq27xxx_device_info *di,
 	}
 
 	if (di->opts & BQ27XXX_O_ZERO)
-		val->intval = (power * BQ27XXX_POWER_CONSTANT) / BQ27XXX_RS;
+		val->intval = (power * BQ27XXX_POWER_CONSTANT) / di->rs_mohm;
 	else
 		/* Other gauges return a signed value in units of 10mW */
 		val->intval = (int)((s16)power) * 10000;

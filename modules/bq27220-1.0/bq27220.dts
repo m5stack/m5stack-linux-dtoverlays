@@ -14,6 +14,7 @@ fragment@0 {
                 bq27200: bq27200@55 {
                         compatible = "ti,bq27200";
                         reg = <0x55>;
+                        ti,resistor-sense-mohm = <10>;
                 };
         };
 };

@@ -10,6 +10,7 @@
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/property.h>
 #include <linux/unaligned.h>
 
 #include "bq27xxx_battery.h"
@@ -182,6 +183,11 @@ static int bq27xxx_battery_i2c_probe(struct i2c_client *client)
 	di->dev = &client->dev;
 	di->chip = id->driver_data;
 	di->name = name;
+
+	/* Default sense resistor, can be overridden by DT property */
+	di->rs_mohm = 20;
+	device_property_read_u32(di->dev, "ti,resistor-sense-mohm",
+				 &di->rs_mohm);
 
 	di->bus.read = bq27xxx_battery_i2c_read;
 	di->bus.write = bq27xxx_battery_i2c_write;
