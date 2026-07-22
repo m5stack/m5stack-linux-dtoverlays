@@ -291,7 +291,6 @@
                 interrupt-parent = <&gpio>;
                 interrupts = <6 2>; /* Interrupt IO, falling-edge trigger  */
                 irq-gpios = <&gpio 6 0>; /* Interrupt IO, falling-edge trigger */
-                backlight = <&backlight_pwm>;
                 disabled-gpios = <&m5ioe1 11 1>;
             };
 
