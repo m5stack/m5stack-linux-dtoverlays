@@ -89,7 +89,7 @@ config_setup: install_led_permissions
 ifeq ($(CONFIG_CARDPUTERO_V0_5),y)
 	python3 /opt/rpi-config.py --no-backup section-add all dtoverlay cardputerzero-v5-overlay
 	python3 /opt/rpi-config.py --no-backup section-add all dtoverlay bq27220_v5
-	python3 /opt/rpi-config.py --no-backup section-add all dtoverlay bmi270_bmm150_overlay
+# 	python3 /opt/rpi-config.py --no-backup section-add all dtoverlay bmi270_bmm150_overlay
 else
 	python3 /opt/rpi-config.py --no-backup section-add all dtoverlay cardputerzero-v3-overlay
 	python3 /opt/rpi-config.py --no-backup section-add all dtoverlay bq27220_v3
@@ -97,8 +97,8 @@ else
 	python3 /opt/rpi-config.py --no-backup section-add all dtoverlay bmi270_overlay
 	python3 /opt/rpi-config.py --no-backup section-add all dtoverlay camera-gpio16-high-overlay
 endif
-	python3 /opt/rpi-config.py --no-backup section-add all dtoverlay gpio-ir,gpio_pin=13,gpio_pull=up
-	python3 /opt/rpi-config.py --no-backup section-add all dtoverlay gpio-ir-tx,gpio_pin=12
+# 	python3 /opt/rpi-config.py --no-backup section-add all dtoverlay gpio-ir,gpio_pin=13,gpio_pull=up
+# 	python3 /opt/rpi-config.py --no-backup section-add all dtoverlay gpio-ir-tx,gpio_pin=12
 
 
 .PHONY: all clean install install_dts install_ko install_led_permissions config_setup
