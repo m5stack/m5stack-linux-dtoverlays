@@ -10,7 +10,7 @@ keycode 43 = asciicircum       # 0xbc -> ^
 keycode 51 = ampersand         # 0xbd -> &
 keycode 52 = asterisk          # 0xbe -> *
 keycode 53 = parenleft         # 0xbf -> (
-keycode 54 = parenright        # 0xc0 -> )
+keycode 94 = parenright        # 0xc0 -> )
 
 # -- Row 1 ------------------------------
 keycode 55 = asciitilde        # 0xc1 -> ~

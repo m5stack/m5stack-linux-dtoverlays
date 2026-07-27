@@ -182,7 +182,7 @@
                     0x00050033 /* row=0x00 col=0x05 keycode=0x0033  KEY_COMMA              Comma */
                     0x00060034 /* row=0x00 col=0x06 keycode=0x0034  KEY_DOT                Dot */
                     0x00070035 /* row=0x00 col=0x07 keycode=0x0035  KEY_SLASH              Slash */
-                    0x00080036 /* row=0x00 col=0x08 keycode=0x0036  KEY_RIGHTSHIFT         Right Shift */
+                    0x0008005e /* row=0x00 col=0x08 keycode=0x005e  KEY_MUHENKAN           Muhenkan */
                     0x0009000e /* row=0x00 col=0x09 keycode=0x000e  KEY_BACKSPACE    Backspace */
 
                     /* 0x0403000f                                                    Sym function key */
