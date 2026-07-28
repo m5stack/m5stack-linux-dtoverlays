@@ -208,6 +208,7 @@ struct tca8418_keypad {
 	unsigned short *keycode1;
 	unsigned short *keycode2;
 	unsigned short *last_keycode;
+	bool *key_suppressed;
 
     struct work_struct capslock_work;
     bool capslock_state;
@@ -373,9 +374,9 @@ static bool tca8418_is_layer_active(struct tca8418_layer_key *layer)
 static void tca8418_layer_update_led(struct tca8418_layer_key *layer)
 {
 	if (layer->longpress)
-		tca8418_led_set(layer->led, TCA8418_LED_FAST);
-	else if (layer->locked)
 		tca8418_led_set(layer->led, TCA8418_LED_ON);
+	else if (layer->locked)
+		tca8418_led_set(layer->led, TCA8418_LED_FAST);
 	else if (layer->oneshot)
 		tca8418_led_set(layer->led, TCA8418_LED_BLINK);
 	else
@@ -507,10 +508,10 @@ static void tca8418_asmux_update_led(struct tca8418_keypad *keypad_data)
 {
 	if (keypad_data->asmux_longpress)
 		tca8418_led_set(&keypad_data->capslock_led_ctl,
-				TCA8418_LED_FAST);
+				TCA8418_LED_ON);
 	else if (keypad_data->asmux_locked)
 		tca8418_led_set(&keypad_data->capslock_led_ctl,
-				TCA8418_LED_ON);
+				TCA8418_LED_FAST);
 	else if (keypad_data->asmux_oneshot)
 		tca8418_led_set(&keypad_data->capslock_led_ctl,
 				TCA8418_LED_BLINK);
@@ -685,6 +686,8 @@ static void tca8418_handle_key_new(struct tca8418_keypad *keypad_data,
 	if (state) {
 		unsigned int report_code = keymap[code];
 
+		keypad_data->key_suppressed[code] = false;
+
 		if (tca8418_is_layer_active(&keypad_data->fn_key)) {
 			report_code = keypad_data->keycode2[code];
 			tca8418_consume_layer_oneshot(&keypad_data->fn_key);
@@ -693,12 +696,25 @@ static void tca8418_handle_key_new(struct tca8418_keypad *keypad_data,
 			tca8418_consume_layer_oneshot(&keypad_data->sym_key);
 		}
 
+		if (report_code == KEY_RESERVED) {
+			keypad_data->key_suppressed[code] = true;
+			keypad_data->last_keycode[code] = KEY_RESERVED;
+			return;
+		}
+
 		tca8418_activate_asmux_hold(keypad_data);
 		tca8418_consume_asmux_oneshot(keypad_data, code);
 		keypad_data->last_keycode[code] = report_code;
 		tca8418_report_key(keypad_data, code, report_code, true);
 	} else {
 		unsigned int report_code = keypad_data->last_keycode[code];
+
+		if (keypad_data->key_suppressed[code]) {
+			keypad_data->key_suppressed[code] = false;
+			keypad_data->last_keycode[code] = KEY_RESERVED;
+			tca8418_release_asmux_oneshot(keypad_data, code);
+			return;
+		}
 
 		if (!report_code)
 			report_code = keymap[code];
@@ -1057,6 +1073,11 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 						  sizeof(*keypad_data->last_keycode),
 						  GFP_KERNEL);
 	if (!keypad_data->last_keycode)
+		return -ENOMEM;
+	keypad_data->key_suppressed = devm_kcalloc(dev, keymap_size,
+						   sizeof(*keypad_data->key_suppressed),
+						   GFP_KERNEL);
+	if (!keypad_data->key_suppressed)
 		return -ENOMEM;
 
 	device_property_read_u32(dev, "sym-button-code", &sym_button_code);
