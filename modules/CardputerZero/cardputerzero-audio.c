@@ -542,6 +542,8 @@ static int cardputerzero_probe(struct platform_device *pdev)
 	card->dev = dev;
 	card->probe = cardputerzero_soc_probe;
 	card->driver_name = "cardputerzero-audio";
+	card->fully_routed = of_property_read_bool(dev->of_node,
+						   PREFIX "fully-routed");
 
 	ret = cardputerzero_parse_hp_mute_pins(cz, dev);
 	if (ret)

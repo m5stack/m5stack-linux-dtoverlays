@@ -6,6 +6,7 @@
 
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
+#include <linux/property.h>
 #include <linux/regulator/consumer.h>
 #include <sound/soc.h>
 
@@ -65,9 +66,28 @@ static const struct snd_soc_component_driver simple_amp_component_driver = {
 	.num_dapm_routes	= ARRAY_SIZE(simple_amp_dapm_routes),
 };
 
+/* Model the mono amplifier as a stream-gated stage, not as DAPM endpoints. */
+static const struct snd_soc_dapm_widget simple_amp_mono_dapm_widgets[] = {
+	SND_SOC_DAPM_OUT_DRV_E("DRV", SND_SOC_NOPM, 0, 0, NULL, 0, drv_event,
+			       (SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD)),
+	SND_SOC_DAPM_REGULATOR_SUPPLY("VCC", 20, 0),
+};
+
+static const struct snd_soc_dapm_route simple_amp_mono_dapm_routes[] = {
+	{ "DRV", NULL, "VCC" },
+};
+
+static const struct snd_soc_component_driver simple_amp_mono_component_driver = {
+	.dapm_widgets		= simple_amp_mono_dapm_widgets,
+	.num_dapm_widgets	= ARRAY_SIZE(simple_amp_mono_dapm_widgets),
+	.dapm_routes		= simple_amp_mono_dapm_routes,
+	.num_dapm_routes	= ARRAY_SIZE(simple_amp_mono_dapm_routes),
+};
+
 static int simple_amp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	const struct snd_soc_component_driver *component_driver;
 	struct simple_amp *priv;
 
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
@@ -81,8 +101,11 @@ static int simple_amp_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(priv->gpiod_enable),
 				     "Failed to get 'enable' gpio");
 
+	component_driver = device_property_read_bool(dev, "m5stack,mono") ?
+		&simple_amp_mono_component_driver : &simple_amp_component_driver;
+
 	return devm_snd_soc_register_component(dev,
-					       &simple_amp_component_driver,
+					       component_driver,
 					       NULL, 0);
 }
 
