@@ -334,6 +334,7 @@
 
             spk_mute_switch: spk-mute-switch {
                 compatible = "simple-audio-amplifier";
+                m5stack,mono;
 
                 enable-gpios = <&gpio 24 0>;
 
@@ -379,6 +380,7 @@
                 pinctrl-0 = <&sound_phones_pins>;
                 compatible = "m5stack,cardputerzero-audio";
                 simple-audio-card,name = "ES8389-Audio";
+                simple-audio-card,fully-routed;
                 status = "okay";
 
                 simple-audio-card,hp-det-gpios = <&gpio 17 0>;
@@ -409,8 +411,8 @@
                     "INPUT1", "Mic Jack",
                     "INPUT2", "Mic Jack",
 
-                    "Speaker Switch INL", "HPOL",
-                    "Speaker", "Speaker Switch OUTL";
+                    "Speaker Switch DRV", "HPOL",
+                    "Speaker", "Speaker Switch DRV";
                 simple-audio-card,dai-link {
                     format = "i2s";
                     bitclock-master = <&dailink0_master>;
