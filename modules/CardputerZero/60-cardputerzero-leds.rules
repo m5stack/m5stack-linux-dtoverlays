@@ -1,0 +1,5 @@
+# LED class attributes are created after tmpfiles runs; apply permissions on add.
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="grove_fun", RUN+="/bin/chgrp gpio $sys$devpath/brightness", RUN+="/bin/chmod g+w $sys$devpath/brightness"
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="ext_usb_gpio_fun", RUN+="/bin/chgrp gpio $sys$devpath/brightness", RUN+="/bin/chmod g+w $sys$devpath/brightness"
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="ext_5v_out", RUN+="/bin/chgrp gpio $sys$devpath/brightness", RUN+="/bin/chmod g+w $sys$devpath/brightness"
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="grove_5v_out", RUN+="/bin/chgrp gpio $sys$devpath/brightness", RUN+="/bin/chmod g+w $sys$devpath/brightness"
