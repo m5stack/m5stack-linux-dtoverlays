@@ -43,7 +43,9 @@ install_ko: $(Target_dtbo)
 
 install_led_permissions:
 	mkdir -p $(ROOTFSPATH)/usr/lib/tmpfiles.d/
+	mkdir -p $(ROOTFSPATH)/usr/lib/udev/rules.d/
 	install -m 0644 cardputerzero-leds.conf $(ROOTFSPATH)/usr/lib/tmpfiles.d/cardputerzero-leds.conf
+	install -m 0644 60-cardputerzero-leds.rules $(ROOTFSPATH)/usr/lib/udev/rules.d/60-cardputerzero-leds.rules
 
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
