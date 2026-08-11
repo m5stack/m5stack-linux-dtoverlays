@@ -39,7 +39,11 @@
 #include <linux/types.h>
 #include <linux/gpio/consumer.h>
 #include <linux/leds.h>
+#include <linux/mutex.h>
+#include <linux/pm.h>
 #include <linux/workqueue.h>
+
+#include "cardputerzero_keyboard_state.h"
 
 #define TCA8418_LOG_ENABLE	0
 
@@ -151,6 +155,7 @@ struct tca8418_mode_led {
 };
 
 struct tca8418_layer_key {
+	struct tca8418_keypad *keypad;
 	struct tca8418_mode_led *led;
 	struct delayed_work longpress_work;
 	ktime_t last_release;
@@ -162,12 +167,15 @@ struct tca8418_layer_key {
 	bool unlock_release;
 };
 
-
-enum tca8418_active_mode {
-	TCA8418_MODE_NONE,
-	TCA8418_MODE_SYM,
-	TCA8418_MODE_FN,
-	TCA8418_MODE_ASMUX,
+struct tca8418_state_snapshot {
+	u64 sequence;
+	u32 changed_mask;
+	u8 reason;
+	u8 sym;
+	u8 shift;
+	u8 fn;
+	u8 ctrl;
+	u8 alt;
 };
 
 struct tca8418_keypad {
@@ -208,7 +216,15 @@ struct tca8418_keypad {
 	unsigned short *keycode1;
 	unsigned short *keycode2;
 	unsigned short *last_keycode;
+	u8 *last_layer;
 	bool *key_suppressed;
+	unsigned int keymap_size;
+	bool ctrl_pressed;
+	bool alt_pressed;
+	bool irq_suspended;
+	struct mutex state_publish_lock;
+	struct tca8418_state_snapshot state_snapshot;
+	bool state_sysfs_ready;
 
     struct work_struct capslock_work;
     bool capslock_state;
@@ -258,6 +274,109 @@ static bool tca8418_time_before_ms(ktime_t then, unsigned int ms)
 {
 	return ktime_to_ms(ktime_sub(ktime_get(), then)) <= ms;
 }
+
+static u8 tca8418_layer_state(const struct tca8418_layer_key *layer)
+{
+	if (READ_ONCE(layer->longpress))
+		return CPZ_KBD_MOD_HELD;
+	if (READ_ONCE(layer->locked))
+		return CPZ_KBD_MOD_LOCKED;
+	if (READ_ONCE(layer->oneshot))
+		return CPZ_KBD_MOD_ONESHOT;
+	if (READ_ONCE(layer->pressed))
+		return CPZ_KBD_MOD_PRESSED;
+	return CPZ_KBD_MOD_OFF;
+}
+
+static u8 tca8418_shift_state(const struct tca8418_keypad *keypad_data)
+{
+	if (READ_ONCE(keypad_data->asmux_longpress))
+		return CPZ_KBD_MOD_HELD;
+	if (READ_ONCE(keypad_data->asmux_locked))
+		return CPZ_KBD_MOD_LOCKED;
+	if (READ_ONCE(keypad_data->asmux_oneshot))
+		return CPZ_KBD_MOD_ONESHOT;
+	if (READ_ONCE(keypad_data->asmux_pressed))
+		return CPZ_KBD_MOD_PRESSED;
+	return CPZ_KBD_MOD_OFF;
+}
+
+static u32 tca8418_state_changed_mask(
+	const struct tca8418_state_snapshot *old,
+	const struct tca8418_state_snapshot *new)
+{
+	u32 mask = 0;
+
+	if (old->sym != new->sym)
+		mask |= CPZ_KBD_CHANGED_SYM;
+	if (old->shift != new->shift)
+		mask |= CPZ_KBD_CHANGED_SHIFT;
+	if (old->fn != new->fn)
+		mask |= CPZ_KBD_CHANGED_FN;
+	if (old->ctrl != new->ctrl)
+		mask |= CPZ_KBD_CHANGED_CTRL;
+	if (old->alt != new->alt)
+		mask |= CPZ_KBD_CHANGED_ALT;
+	return mask;
+}
+
+static void tca8418_publish_state(struct tca8418_keypad *keypad_data,
+				   u8 reason)
+{
+	struct tca8418_state_snapshot next = {
+		.reason = reason,
+		.sym = tca8418_layer_state(&keypad_data->sym_key),
+		.shift = tca8418_shift_state(keypad_data),
+		.fn = tca8418_layer_state(&keypad_data->fn_key),
+		.ctrl = READ_ONCE(keypad_data->ctrl_pressed),
+		.alt = READ_ONCE(keypad_data->alt_pressed),
+	};
+	bool notify;
+
+	mutex_lock(&keypad_data->state_publish_lock);
+	next.sequence = keypad_data->state_snapshot.sequence + 1;
+	next.changed_mask = tca8418_state_changed_mask(
+		&keypad_data->state_snapshot, &next);
+	keypad_data->state_snapshot = next;
+	notify = keypad_data->state_sysfs_ready;
+	mutex_unlock(&keypad_data->state_publish_lock);
+
+	if (notify)
+		sysfs_notify(&keypad_data->client->dev.kobj, NULL,
+			     "modifier_state");
+}
+
+static ssize_t modifier_state_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct tca8418_keypad *keypad_data = dev_get_drvdata(dev);
+	struct tca8418_state_snapshot snapshot;
+
+	if (!keypad_data)
+		return -ENODEV;
+
+	mutex_lock(&keypad_data->state_publish_lock);
+	snapshot = keypad_data->state_snapshot;
+	mutex_unlock(&keypad_data->state_publish_lock);
+
+	return sysfs_emit(buf,
+		"version=%u sequence=%llu changed_mask=0x%02x reason=%u "
+		"sym=%u shift=%u fn=%u ctrl=%u alt=%u\n",
+		CPZ_KBD_STATE_ABI_VERSION,
+		(unsigned long long)snapshot.sequence,
+		snapshot.changed_mask, snapshot.reason, snapshot.sym,
+		snapshot.shift, snapshot.fn, snapshot.ctrl, snapshot.alt);
+}
+static DEVICE_ATTR_RO(modifier_state);
+
+static struct attribute *tca8418_state_attrs[] = {
+	&dev_attr_modifier_state.attr,
+	NULL,
+};
+
+static const struct attribute_group tca8418_state_group = {
+	.attrs = tca8418_state_attrs,
+};
 
 static void tca8418_led_apply_gpio(struct tca8418_mode_led *led)
 {
@@ -337,9 +456,6 @@ static void tca8418_led_set(struct tca8418_mode_led *led, u8 mode)
 
 	cancel_delayed_work_sync(&led->blink_work);
 
-	if (!led->has_mode && mode != TCA8418_LED_OFF)
-		mode = TCA8418_LED_ON;
-
 	switch (mode) {
 	case TCA8418_LED_ON:
 		led->gpio_on = true;
@@ -362,8 +478,31 @@ static void tca8418_report_key(struct tca8418_keypad *keypad_data,
 			       unsigned int scan_code, unsigned int keycode,
 			       bool pressed)
 {
+	bool modifier_changed = false;
+
 	input_event(keypad_data->input, EV_MSC, MSC_SCAN, scan_code);
 	input_report_key(keypad_data->input, keycode, pressed);
+
+	if (keycode == KEY_LEFTCTRL || keycode == KEY_RIGHTCTRL) {
+		modifier_changed = keypad_data->ctrl_pressed != pressed;
+		keypad_data->ctrl_pressed = pressed;
+	} else if (keycode == KEY_LEFTALT || keycode == KEY_RIGHTALT) {
+		modifier_changed = keypad_data->alt_pressed != pressed;
+		keypad_data->alt_pressed = pressed;
+	}
+	if (modifier_changed)
+		tca8418_publish_state(keypad_data,
+			pressed ? CPZ_KBD_REASON_PRESS : CPZ_KBD_REASON_RELEASE);
+}
+
+static void tca8418_report_mapped_key(struct tca8418_keypad *keypad_data,
+				      unsigned int scan_code,
+				      unsigned int keycode, bool pressed,
+				      u8 effective_layer)
+{
+	input_event(keypad_data->input, EV_MSC, MSC_RAW,
+		    CPZ_KBD_MSC_RAW_VALUE(effective_layer));
+	tca8418_report_key(keypad_data, scan_code, keycode, pressed);
 }
 
 static bool tca8418_is_layer_active(struct tca8418_layer_key *layer)
@@ -395,62 +534,16 @@ static void tca8418_layer_longpress_work(struct work_struct *work)
 	layer->longpress = true;
 	layer->oneshot = false;
 	tca8418_layer_update_led(layer);
-}
-
-static void tca8418_layer_deactivate(struct tca8418_layer_key *layer)
-{
-	cancel_delayed_work_sync(&layer->longpress_work);
-
-	layer->pressed = false;
-	layer->oneshot = false;
-	layer->locked = false;
-	layer->longpress = false;
-	layer->unlock_release = false;
-	tca8418_layer_update_led(layer);
+	tca8418_publish_state(layer->keypad, CPZ_KBD_REASON_LONGPRESS);
 }
 
 static void tca8418_asmux_update_led(struct tca8418_keypad *keypad_data);
 
-static void tca8418_asmux_deactivate(struct tca8418_keypad *keypad_data)
-{
-	cancel_delayed_work_sync(&keypad_data->asmux_longpress_work);
-	cancel_delayed_work_sync(&keypad_data->asmux_blink_off_work);
-
-	if (keypad_data->asmux_locked || keypad_data->asmux_shift_active ||
-	    keypad_data->asmux_longpress)
-		tca8418_report_key(keypad_data, keypad_data->asmux_button_code,
-				    KEY_LEFTSHIFT, false);
-
-	keypad_data->asmux_pressed = false;
-	keypad_data->asmux_second_click = false;
-	keypad_data->asmux_oneshot = false;
-	keypad_data->asmux_shift_active = false;
-	keypad_data->asmux_locked = false;
-	keypad_data->asmux_unlock_pending = false;
-	keypad_data->asmux_longpress = false;
-	tca8418_asmux_update_led(keypad_data);
-}
-
-static void tca8418_deactivate_other_modes(struct tca8418_keypad *keypad_data,
-					   enum tca8418_active_mode active)
-{
-	if (active != TCA8418_MODE_SYM)
-		tca8418_layer_deactivate(&keypad_data->sym_key);
-
-	/* Fn is a layer selector and may be combined with Shift/ASMUX. */
-	if (active != TCA8418_MODE_FN && active != TCA8418_MODE_ASMUX)
-		tca8418_layer_deactivate(&keypad_data->fn_key);
-	if (active != TCA8418_MODE_ASMUX && active != TCA8418_MODE_FN)
-		tca8418_asmux_deactivate(keypad_data);
-}
-
-static void tca8418_handle_layer_key(struct tca8418_keypad *keypad_data,
-				     struct tca8418_layer_key *layer,
-				     enum tca8418_active_mode active,
+static void tca8418_handle_layer_key(struct tca8418_layer_key *layer,
 				     bool pressed)
 {
 	if (pressed) {
-		tca8418_deactivate_other_modes(keypad_data, active);
+		u8 reason = CPZ_KBD_REASON_PRESS;
 
 		layer->pressed = true;
 		layer->longpress = false;
@@ -459,13 +552,17 @@ static void tca8418_handle_layer_key(struct tca8418_keypad *keypad_data,
 			layer->locked = false;
 			layer->oneshot = false;
 			layer->unlock_release = true;
+			reason = CPZ_KBD_REASON_UNLOCK;
 		} else if (layer->oneshot) {
 			layer->oneshot = false;
 			if (tca8418_time_before_ms(layer->last_release,
-						   TCA8418_DBLCLICK_MS))
+						   TCA8418_DBLCLICK_MS)) {
 				layer->locked = true;
-			else
+				reason = CPZ_KBD_REASON_LOCK;
+			} else {
 				layer->unlock_release = true;
+				reason = CPZ_KBD_REASON_UNLOCK;
+			}
 		} else {
 			layer->oneshot = false;
 			schedule_delayed_work(&layer->longpress_work,
@@ -473,6 +570,7 @@ static void tca8418_handle_layer_key(struct tca8418_keypad *keypad_data,
 		}
 
 		tca8418_layer_update_led(layer);
+		tca8418_publish_state(layer->keypad, reason);
 		return;
 	}
 
@@ -493,6 +591,7 @@ static void tca8418_handle_layer_key(struct tca8418_keypad *keypad_data,
 	}
 
 	tca8418_layer_update_led(layer);
+	tca8418_publish_state(layer->keypad, CPZ_KBD_REASON_RELEASE);
 }
 
 static void tca8418_consume_layer_oneshot(struct tca8418_layer_key *layer)
@@ -502,6 +601,7 @@ static void tca8418_consume_layer_oneshot(struct tca8418_layer_key *layer)
 
 	layer->oneshot = false;
 	tca8418_layer_update_led(layer);
+	tca8418_publish_state(layer->keypad, CPZ_KBD_REASON_CONSUMED);
 }
 
 static void tca8418_asmux_update_led(struct tca8418_keypad *keypad_data)
@@ -545,14 +645,13 @@ static void tca8418_asmux_longpress_work(struct work_struct *work)
 	tca8418_report_key(keypad_data, keypad_data->asmux_button_code,
 			    KEY_LEFTSHIFT, true);
 	tca8418_asmux_update_led(keypad_data);
+	tca8418_publish_state(keypad_data, CPZ_KBD_REASON_LONGPRESS);
 }
 
 static void tca8418_handle_asmux_key(struct tca8418_keypad *keypad_data,
 				     unsigned int scan_code, bool pressed)
 {
 	if (pressed) {
-		tca8418_deactivate_other_modes(keypad_data, TCA8418_MODE_ASMUX);
-
 		cancel_delayed_work_sync(&keypad_data->asmux_blink_off_work);
 		keypad_data->asmux_pressed = true;
 		keypad_data->asmux_longpress = false;
@@ -560,6 +659,7 @@ static void tca8418_handle_asmux_key(struct tca8418_keypad *keypad_data,
 		if (keypad_data->asmux_locked) {
 			keypad_data->asmux_unlock_pending = true;
 			keypad_data->asmux_second_click = false;
+			tca8418_publish_state(keypad_data, CPZ_KBD_REASON_PRESS);
 			return;
 		}
 
@@ -570,10 +670,15 @@ static void tca8418_handle_asmux_key(struct tca8418_keypad *keypad_data,
 				keypad_data->asmux_locked = true;
 				tca8418_report_key(keypad_data, scan_code,
 						    KEY_LEFTSHIFT, true);
+				tca8418_asmux_update_led(keypad_data);
+				tca8418_publish_state(keypad_data,
+						      CPZ_KBD_REASON_LOCK);
 			} else {
 				keypad_data->asmux_second_click = true;
+				tca8418_asmux_update_led(keypad_data);
+				tca8418_publish_state(keypad_data,
+						      CPZ_KBD_REASON_UNLOCK);
 			}
-			tca8418_asmux_update_led(keypad_data);
 			return;
 		}
 
@@ -581,6 +686,7 @@ static void tca8418_handle_asmux_key(struct tca8418_keypad *keypad_data,
 
 		schedule_delayed_work(&keypad_data->asmux_longpress_work,
 			msecs_to_jiffies(TCA8418_LONGPRESS_MS));
+		tca8418_publish_state(keypad_data, CPZ_KBD_REASON_PRESS);
 		return;
 	}
 
@@ -596,12 +702,14 @@ static void tca8418_handle_asmux_key(struct tca8418_keypad *keypad_data,
 		keypad_data->asmux_locked = false;
 		tca8418_report_key(keypad_data, scan_code, KEY_LEFTSHIFT, false);
 		tca8418_asmux_update_led(keypad_data);
+		tca8418_publish_state(keypad_data, CPZ_KBD_REASON_UNLOCK);
 		return;
 	}
 
 	if (keypad_data->asmux_second_click) {
 		keypad_data->asmux_second_click = false;
 		tca8418_asmux_update_led(keypad_data);
+		tca8418_publish_state(keypad_data, CPZ_KBD_REASON_RELEASE);
 		return;
 	}
 
@@ -611,10 +719,14 @@ static void tca8418_handle_asmux_key(struct tca8418_keypad *keypad_data,
 		tca8418_report_key(keypad_data, scan_code, KEY_LEFTSHIFT, false);
 		keypad_data->asmux_longpress = false;
 		tca8418_asmux_update_led(keypad_data);
+		tca8418_publish_state(keypad_data, CPZ_KBD_REASON_RELEASE);
 	} else if (!keypad_data->asmux_locked) {
 		keypad_data->asmux_oneshot = true;
 		keypad_data->asmux_last_release = ktime_get();
 		tca8418_asmux_update_led(keypad_data);
+		tca8418_publish_state(keypad_data, CPZ_KBD_REASON_RELEASE);
+	} else {
+		tca8418_publish_state(keypad_data, CPZ_KBD_REASON_RELEASE);
 	}
 }
 
@@ -630,6 +742,7 @@ static void tca8418_consume_asmux_oneshot(struct tca8418_keypad *keypad_data,
 	cancel_delayed_work_sync(&keypad_data->asmux_blink_off_work);
 	tca8418_report_key(keypad_data, scan_code, KEY_LEFTSHIFT, true);
 	tca8418_asmux_update_led(keypad_data);
+	tca8418_publish_state(keypad_data, CPZ_KBD_REASON_CONSUMED);
 }
 
 static void tca8418_activate_asmux_hold(struct tca8418_keypad *keypad_data)
@@ -646,6 +759,7 @@ static void tca8418_activate_asmux_hold(struct tca8418_keypad *keypad_data)
 	tca8418_report_key(keypad_data, keypad_data->asmux_button_code,
 			    KEY_LEFTSHIFT, true);
 	tca8418_asmux_update_led(keypad_data);
+	tca8418_publish_state(keypad_data, CPZ_KBD_REASON_LONGPRESS);
 }
 
 static void tca8418_release_asmux_oneshot(struct tca8418_keypad *keypad_data,
@@ -667,14 +781,12 @@ static void tca8418_handle_key_new(struct tca8418_keypad *keypad_data,
 	unsigned short *keymap = input->keycode;
 
 	if (code == keypad_data->fn_key.scan_code) {
-		tca8418_handle_layer_key(keypad_data, &keypad_data->fn_key,
-					 TCA8418_MODE_FN, state);
+		tca8418_handle_layer_key(&keypad_data->fn_key, state);
 		return;
 	}
 
 	if (code == keypad_data->sym_key.scan_code) {
-		tca8418_handle_layer_key(keypad_data, &keypad_data->sym_key,
-					 TCA8418_MODE_SYM, state);
+		tca8418_handle_layer_key(&keypad_data->sym_key, state);
 		return;
 	}
 
@@ -685,33 +797,41 @@ static void tca8418_handle_key_new(struct tca8418_keypad *keypad_data,
 
 	if (state) {
 		unsigned int report_code = keymap[code];
+		u8 effective_layer = CPZ_KBD_LAYER_NORMAL;
 
 		keypad_data->key_suppressed[code] = false;
 
 		if (tca8418_is_layer_active(&keypad_data->fn_key)) {
 			report_code = keypad_data->keycode2[code];
-			tca8418_consume_layer_oneshot(&keypad_data->fn_key);
+			effective_layer = CPZ_KBD_LAYER_FN;
 		} else if (tca8418_is_layer_active(&keypad_data->sym_key)) {
 			report_code = keypad_data->keycode1[code];
-			tca8418_consume_layer_oneshot(&keypad_data->sym_key);
+			effective_layer = CPZ_KBD_LAYER_SYM;
 		}
+		tca8418_consume_layer_oneshot(&keypad_data->fn_key);
+		tca8418_consume_layer_oneshot(&keypad_data->sym_key);
 
 		if (report_code == KEY_RESERVED) {
 			keypad_data->key_suppressed[code] = true;
 			keypad_data->last_keycode[code] = KEY_RESERVED;
+			keypad_data->last_layer[code] = CPZ_KBD_LAYER_NORMAL;
 			return;
 		}
 
 		tca8418_activate_asmux_hold(keypad_data);
 		tca8418_consume_asmux_oneshot(keypad_data, code);
 		keypad_data->last_keycode[code] = report_code;
-		tca8418_report_key(keypad_data, code, report_code, true);
+		keypad_data->last_layer[code] = effective_layer;
+		tca8418_report_mapped_key(keypad_data, code, report_code, true,
+					   effective_layer);
 	} else {
 		unsigned int report_code = keypad_data->last_keycode[code];
+		u8 effective_layer = keypad_data->last_layer[code];
 
 		if (keypad_data->key_suppressed[code]) {
 			keypad_data->key_suppressed[code] = false;
 			keypad_data->last_keycode[code] = KEY_RESERVED;
+			keypad_data->last_layer[code] = CPZ_KBD_LAYER_NORMAL;
 			tca8418_release_asmux_oneshot(keypad_data, code);
 			return;
 		}
@@ -720,7 +840,9 @@ static void tca8418_handle_key_new(struct tca8418_keypad *keypad_data,
 			report_code = keymap[code];
 
 		keypad_data->last_keycode[code] = 0;
-		tca8418_report_key(keypad_data, code, report_code, false);
+		keypad_data->last_layer[code] = CPZ_KBD_LAYER_NORMAL;
+		tca8418_report_mapped_key(keypad_data, code, report_code, false,
+					   effective_layer);
 		tca8418_release_asmux_oneshot(keypad_data, code);
 	}
 }
@@ -904,6 +1026,80 @@ static void tca8418_cleanup(void *data)
 	cancel_work_sync(&keypad_data->capslock_work);
 }
 
+static void tca8418_clear_modifier_state(struct tca8418_keypad *keypad_data,
+					 u8 reason)
+{
+	bool release_shift = keypad_data->asmux_locked ||
+		keypad_data->asmux_shift_active ||
+		keypad_data->asmux_longpress;
+	bool sync_input = release_shift;
+	unsigned int code;
+
+	/* Release mapped keys before clearing their press-time layer metadata. */
+	if (keypad_data->input) {
+		for (code = 0; code < keypad_data->keymap_size; code++) {
+			unsigned int keycode = keypad_data->last_keycode[code];
+
+			if (!keycode || keycode == KEY_RESERVED)
+				continue;
+			input_event(keypad_data->input, EV_MSC, MSC_RAW,
+				    CPZ_KBD_MSC_RAW_VALUE(
+					    keypad_data->last_layer[code]));
+			input_event(keypad_data->input, EV_MSC, MSC_SCAN, code);
+			input_report_key(keypad_data->input, keycode, false);
+			sync_input = true;
+		}
+	}
+
+	keypad_data->sym_key.pressed = false;
+	keypad_data->sym_key.oneshot = false;
+	keypad_data->sym_key.locked = false;
+	keypad_data->sym_key.longpress = false;
+	keypad_data->sym_key.unlock_release = false;
+	keypad_data->fn_key.pressed = false;
+	keypad_data->fn_key.oneshot = false;
+	keypad_data->fn_key.locked = false;
+	keypad_data->fn_key.longpress = false;
+	keypad_data->fn_key.unlock_release = false;
+	keypad_data->asmux_pressed = false;
+	keypad_data->asmux_second_click = false;
+	keypad_data->asmux_oneshot = false;
+	keypad_data->asmux_shift_active = false;
+	keypad_data->asmux_locked = false;
+	keypad_data->asmux_unlock_pending = false;
+	keypad_data->asmux_longpress = false;
+	keypad_data->ctrl_pressed = false;
+	keypad_data->alt_pressed = false;
+	memset(keypad_data->last_keycode, 0,
+	       keypad_data->keymap_size * sizeof(*keypad_data->last_keycode));
+	memset(keypad_data->last_layer, 0,
+	       keypad_data->keymap_size * sizeof(*keypad_data->last_layer));
+	memset(keypad_data->key_suppressed, 0,
+	       keypad_data->keymap_size * sizeof(*keypad_data->key_suppressed));
+
+	if (release_shift && keypad_data->input)
+		input_report_key(keypad_data->input, KEY_LEFTSHIFT, false);
+	if (sync_input && keypad_data->input)
+		input_sync(keypad_data->input);
+	tca8418_layer_update_led(&keypad_data->sym_key);
+	tca8418_layer_update_led(&keypad_data->fn_key);
+	tca8418_asmux_update_led(keypad_data);
+	tca8418_publish_state(keypad_data, reason);
+}
+
+static void tca8418_state_remove(void *data)
+{
+	struct tca8418_keypad *keypad_data = data;
+
+	if (!keypad_data->irq_suspended)
+		disable_irq(keypad_data->client->irq);
+	tca8418_cleanup(keypad_data);
+	tca8418_clear_modifier_state(keypad_data, CPZ_KBD_REASON_REMOVE);
+	mutex_lock(&keypad_data->state_publish_lock);
+	keypad_data->state_sysfs_ready = false;
+	mutex_unlock(&keypad_data->state_publish_lock);
+}
+
 static int tca8418_parse_led_mode(struct device *dev,
 				  struct tca8418_mode_led *led,
 				  const char *property)
@@ -1035,6 +1231,7 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 	u32 asmux_button_code = -1;
 	unsigned int keymap_size;
 	unsigned int m5ioe1_version;
+	bool use_led_mode;
 	int error, row_shift;
 	u8 reg;
 
@@ -1069,10 +1266,18 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 	keypad_data->client = client;
 	keypad_data->row_shift = row_shift;
 	keymap_size = rows << row_shift;
+	keypad_data->keymap_size = keymap_size;
+	mutex_init(&keypad_data->state_publish_lock);
+	i2c_set_clientdata(client, keypad_data);
 	keypad_data->last_keycode = devm_kcalloc(dev, keymap_size,
 						  sizeof(*keypad_data->last_keycode),
 						  GFP_KERNEL);
 	if (!keypad_data->last_keycode)
+		return -ENOMEM;
+	keypad_data->last_layer = devm_kcalloc(dev, keymap_size,
+					       sizeof(*keypad_data->last_layer),
+					       GFP_KERNEL);
+	if (!keypad_data->last_layer)
 		return -ENOMEM;
 	keypad_data->key_suppressed = devm_kcalloc(dev, keymap_size,
 						   sizeof(*keypad_data->key_suppressed),
@@ -1090,16 +1295,23 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 		return dev_err_probe(dev, error,
 				     "failed to read M5IOE1 version\n");
 
+	/* The V5 DT selects the new key state machine. M5IOE1 firmware
+	 * version only decides whether LED blinking is handled by a mode
+	 * register or by the driver's GPIO timer fallback.
+	 */
 	keypad_data->new_keyboard_mode =
+		device_property_present(dev, "fn-led-mode");
+	use_led_mode = keypad_data->new_keyboard_mode &&
 		m5ioe1_version >= M5IOE1_NEW_MODE_VERSION;
-	dev_info(dev, "M5IOE1 version 0x%02x, using %s keyboard mode\n",
+	dev_info(dev, "M5IOE1 version 0x%02x, using %s keyboard mode with %s LED control\n",
 		 m5ioe1_version,
-		 keypad_data->new_keyboard_mode ? "new" : "old");
+		 keypad_data->new_keyboard_mode ? "new" : "old",
+		 use_led_mode ? "register" : "GPIO");
 	keypad_data->sym_key.scan_code = sym_button_code;
 	keypad_data->fn_key.scan_code = fn_button_code;
 	keypad_data->asmux_button_code = asmux_button_code;
 
-	if (keypad_data->new_keyboard_mode) {
+	if (use_led_mode) {
 		error = tca8418_parse_led_mode(dev, &keypad_data->tables_sel_led,
 					       "tables-sel-led-mode");
 		if (error)
@@ -1154,6 +1366,8 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 
 	keypad_data->sym_key.led = &keypad_data->tables_sel_led;
 	keypad_data->fn_key.led = &keypad_data->fn_led;
+	keypad_data->sym_key.keypad = keypad_data;
+	keypad_data->fn_key.keypad = keypad_data;
 
 	error = devm_add_action_or_reset(dev, tca8418_cleanup, keypad_data);
 	if (error)
@@ -1223,6 +1437,8 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 	}
 
 	input_set_capability(input, EV_MSC, MSC_SCAN);
+	if (keypad_data->new_keyboard_mode)
+		input_set_capability(input, EV_MSC, MSC_RAW);
 	// __set_bit(EV_MSC, input->evbit);
 	// __set_bit(MSC_SCAN, input->mscbit);
 
@@ -1248,8 +1464,55 @@ static int tca8418_keypad_probe(struct i2c_client *client)
 		return error;
 	}
 
+	if (keypad_data->new_keyboard_mode) {
+		error = devm_device_add_group(dev, &tca8418_state_group);
+		if (error)
+			return dev_err_probe(dev, error,
+					     "failed to create modifier state ABI\n");
+		mutex_lock(&keypad_data->state_publish_lock);
+		keypad_data->state_sysfs_ready = true;
+		mutex_unlock(&keypad_data->state_publish_lock);
+		tca8418_publish_state(keypad_data, CPZ_KBD_REASON_INIT);
+		error = devm_add_action_or_reset(dev, tca8418_state_remove,
+						 keypad_data);
+		if (error)
+			return error;
+	}
+
 	return 0;
 }
+
+static int tca8418_keypad_suspend(struct device *dev)
+{
+	struct tca8418_keypad *keypad_data = dev_get_drvdata(dev);
+
+	if (!keypad_data || !keypad_data->new_keyboard_mode)
+		return 0;
+	disable_irq(keypad_data->client->irq);
+	keypad_data->irq_suspended = true;
+	tca8418_cleanup(keypad_data);
+	tca8418_clear_modifier_state(keypad_data, CPZ_KBD_REASON_SUSPEND);
+	return 0;
+}
+
+static int tca8418_keypad_resume(struct device *dev)
+{
+	struct tca8418_keypad *keypad_data = dev_get_drvdata(dev);
+
+	if (keypad_data && keypad_data->new_keyboard_mode) {
+		tca8418_publish_state(keypad_data, CPZ_KBD_REASON_RESUME);
+		if (keypad_data->irq_suspended) {
+			keypad_data->irq_suspended = false;
+			enable_irq(keypad_data->client->irq);
+		}
+	}
+	return 0;
+}
+
+static const struct dev_pm_ops tca8418_keypad_pm_ops = {
+	.suspend = tca8418_keypad_suspend,
+	.resume = tca8418_keypad_resume,
+};
 
 static const struct i2c_device_id tca8418_id[] = {
 	{ "tca8418", 8418, },
@@ -1268,6 +1531,7 @@ static struct i2c_driver tca8418_keypad_driver = {
 	.driver = {
 		.name	= "tca8418_keypad",
 		.of_match_table = tca8418_dt_ids,
+		.pm = &tca8418_keypad_pm_ops,
 	},
 	.probe		= tca8418_keypad_probe,
 	.id_table	= tca8418_id,
