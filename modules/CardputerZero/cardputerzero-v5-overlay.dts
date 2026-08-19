@@ -130,7 +130,7 @@
                     0x0008000b /* row=0x00 col=0x08 keycode=0x000b  KEY_0          0 */
                     0x0009000e /* row=0x00 col=0x09 keycode=0x000e  KEY_BACKSPACE  Backspace */
 
-                    /* 0x0403000f                                   Sym function key */
+                    0x0403017f /* row=0x04 col=0x05 keycode=0x017f  KEY_CD  Sym function key */
                     0x01000010 /* row=0x01 col=0x00 keycode=0x0010  KEY_Q          Q */
                     0x01010011 /* row=0x01 col=0x01 keycode=0x0011  KEY_W          W */
                     0x01020012 /* row=0x01 col=0x02 keycode=0x0012  KEY_E          E */
@@ -155,7 +155,7 @@
                     0x02080026 /* row=0x02 col=0x08 keycode=0x0026  KEY_L          L */
                     0x0209001c /* row=0x02 col=0x09 keycode=0x001c  KEY_ENTER      Enter */
 
-                    /* 0x0402002a                                                  Fn function key */
+                    0x04020185 /* row=0x04 col=0x05 keycode=0x0185  KEY_DVD  Fn function key */
                     0x0300001d /* row=0x03 col=0x00 keycode=0x001d  KEY_LEFTCTRL   Left Ctrl */
                     0x03010038 /* row=0x03 col=0x01 keycode=0x0038  KEY_LEFTALT    Left Alt  */
                     0x0302002c /* row=0x03 col=0x02 keycode=0x002c  KEY_Z          Z */
@@ -185,7 +185,7 @@
                     0x0008005e /* row=0x00 col=0x08 keycode=0x005e  KEY_MUHENKAN           Muhenkan */
                     0x0009000e /* row=0x00 col=0x09 keycode=0x000e  KEY_BACKSPACE    Backspace */
 
-                    /* 0x0403000f                                                    Sym function key */
+                    0x0403017f /* row=0x04 col=0x05 keycode=0x017f  KEY_CD  Sym function key */
                     0x01000037 /* row=0x01 col=0x00 keycode=0x0037  KEY_KPASTERISK         Keypad Asterisk */
                     0x01010045 /* row=0x01 col=0x01 keycode=0x0045  KEY_NUMLOCK            Num Lock */
                     0x01020046 /* row=0x01 col=0x02 keycode=0x0046  KEY_SCROLLLOCK         Scroll Lock */
@@ -210,7 +210,7 @@
                     0x02080059 /* row=0x02 col=0x08 keycode=0x0059  KEY_RO                 Ro */
                     0x0209001c /* row=0x02 col=0x09 keycode=0x001c  KEY_ENTER        Enter */
 
-                    /* 0x0402002a                                                  Fn function key */
+                    0x04020185 /* row=0x04 col=0x05 keycode=0x0185  KEY_DVD  Fn function key */
                     0x0300001d /* row=0x03 col=0x00 keycode=0x001d  KEY_LEFTCTRL   Left Ctrl */
                     0x03010038 /* row=0x03 col=0x01 keycode=0x0038  KEY_LEFTALT    Left Alt  */
                     0x03020000 /* row=0x03 col=0x02 keycode=0x0000  KEY_RESERVED     Z disabled */
@@ -239,7 +239,7 @@
                     0x00080044 /* row=0x00 col=0x08 keycode=0x0044  KEY_F10          F10 */
                     0x0009006f /* row=0x00 col=0x09 keycode=0x006f  KEY_DELETE       Delete */
 
-                    /* 0x0403000f                                                     Sym function key */
+                    0x0403017f /* row=0x04 col=0x05 keycode=0x017f  KEY_CD  Sym function key */
                     0x010000a4 /* row=0x01 col=0x00 keycode=0x00a4  KEY_PLAYPAUSE          Play/Pause */
                     0x010100a5 /* row=0x01 col=0x01 keycode=0x00a5  KEY_PREVIOUSSONG       Previous Song */
                     0x010200a3 /* row=0x01 col=0x02 keycode=0x00a3  KEY_NEXTSONG           Next Song */
@@ -264,7 +264,7 @@
                     0x02080068 /* row=0x02 col=0x08 keycode=0x0068  KEY_PAGEUP      Page Up */
                     0x0209001c /* row=0x02 col=0x09 keycode=0x001c  KEY_ENTER      Enter */
 
-                    /* 0x0402002a                                                  Fn function key */
+                    0x04020185 /* row=0x04 col=0x05 keycode=0x0185  KEY_DVD  Fn function key */
                     0x0300001d /* row=0x03 col=0x00 keycode=0x001d  KEY_LEFTCTRL   Left Ctrl */
                     0x03010038 /* row=0x03 col=0x01 keycode=0x0038  KEY_LEFTALT    Left Alt  */
                     0x03020069 /* row=0x03 col=0x02 keycode=0x0069  KEY_LEFT        Left */
