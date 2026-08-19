@@ -49,7 +49,7 @@ fragment@2 {
 
                 sym-button-code = <0x43>; 
                 fn-button-code = <0x42>;  
-                asmux-button-code = <0x41>; 
+                shift-button-code = <0x41>; 
 
                 // switch-button-code = <73>; /* Switch button keycode */
                 // interrupt-controller;
