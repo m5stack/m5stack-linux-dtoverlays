@@ -10,7 +10,7 @@ obj-m += $(Target_ko).o
 
 all: $(Target_ko).ko $(Target_dts).dtbo
 
-$(Target_ko).ko: $(Target_ko).c
+$(Target_ko).ko: $(Target_ko).c tca8418_fsm.c
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) ARCH=$(ARCH) modules
 
 $(Target_dts).dtbo: $(Target_dts).dts
