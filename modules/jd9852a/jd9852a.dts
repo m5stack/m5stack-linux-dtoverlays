@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause)
+/*
+ * Copyright (c) 2025, Arduino SA
+ */
+
+/dts-v1/;
+/plugin/;
+
+&{/} {
+	panel_avdd: regulator-panel-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "panel-avdd";
+		regulator-always-on;
+	};
+
+	panel_iovcc: regulator-panel-iovcc {
+		compatible = "regulator-fixed";
+		regulator-name = "panel-iovcc";
+		regulator-always-on;
+	};
+};
+
+&mdp {
+    status = "okay";
+};
+
+&mdss_dsi0 {
+	vdda-supply = <&pm4125_l5>;
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	status = "okay";
+
+    panel@0 {
+        compatible = "elida,jd9852";  /* <-- 修改此项 */
+        reg = <0>;
+        status = "okay";
+
+        // /* 面板配置 */
+        // dsi-lanes = <1>;           /* DSI 通道数（2 或 4） */
+        // video-mode = <MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST | 
+        //               MIPI_DSI_MODE_LPM | MIPI_DSI_MODE_NO_EOT_PACKET | 
+        //               MIPI_DSI_CLOCK_NON_CONTINUOUS>;          /* 0=命令，1=视频同步脉冲，2=视频同步事件，3=视频突发 */
+
+        /* 电源 */
+		iovcc-supply = <&panel_iovcc>;
+		vdd-supply = <&panel_avdd>;
+
+        /* 复位 GPIO——请根据你的扩展板调整 */
+        // reset-gpios = <&tlmm 2 0>;  /* GPIO2，低电平有效 */
+
+        /* 可选：背光 */
+        /* backlight = <&backlight>; */
+
+        port {
+            panel_in: endpoint {
+                remote-endpoint = <&mdss_dsi0_out>;
+            };
+        };
+    };
+
+};
+
+
+&mdss_dsi0_out {
+	remote-endpoint = <&panel_in>;
+	data-lanes = <0>;
+	// qcom,te-source = "timer0";
+};
