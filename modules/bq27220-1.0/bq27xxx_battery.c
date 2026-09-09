@@ -150,6 +150,8 @@
 #define BQ27220_DM_SLEEP_CURRENT	0x9217
 #define BQ27220_DM_OPERATION_CONFIG_A	0x9206
 #define BQ27220_DM_OP_CFG_A_TEMPS	BIT(15)
+#define BQ27220_DM_BATTERY_LOW		0x9251
+#define BQ27220_DM_NEAR_FULL		0x926b
 
 #define BQ27XXX_DEFAULT_RS		10 /* Resistor sense mOhm */
 #define BQ27XXX_POWER_CONSTANT		(29200) /* 29.2 µV^2 * 1000 */
@@ -1707,6 +1709,89 @@ static int bq27220_battery_update_dm_reg(struct bq27xxx_device_info *di,
 	return 0;
 }
 
+/*
+ * Userspace persistence hook for the learned Full Charge Capacity.
+ *
+ * FullChargeCapacity() (command 0x12) is read-only: the value comes from the
+ * volatile data memory parameter Learned Full Charge Capacity (0x929D), which
+ * is lost when the gauge loses power. Userspace can poll charge_full every
+ * minute, save the value, and restore it here after a cold boot.
+ *
+ *   read  -> current FCC in uAh (same unit as charge_full)
+ *   write <- uAh, stored as mAh into data memory 0x929D
+ *
+ * A write needs unseal + CONFIG UPDATE and takes a few seconds, so call it
+ * once at boot instead of periodically.
+ */
+static ssize_t bq27220_fcc_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct bq27xxx_device_info *di = dev_get_drvdata(dev);
+	int fcc;
+
+	if (!di || !(di->opts & BQ27XXX_O_BQ27220))
+		return -ENODEV;
+
+	mutex_lock(&di->lock);
+	fcc = bq27xxx_read(di, BQ27XXX_REG_FCC, false);
+	mutex_unlock(&di->lock);
+
+	if (fcc < 0)
+		return fcc;
+
+	return sysfs_emit(buf, "%d\n", fcc * 1000);
+}
+
+static ssize_t bq27220_fcc_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct bq27xxx_device_info *di = dev_get_drvdata(dev);
+	bool updated = false;
+	u16 fcc_mah;
+	long uah;
+	int ret;
+
+	if (!di || !(di->opts & BQ27XXX_O_BQ27220))
+		return -ENODEV;
+
+	if (kstrtol(buf, 0, &uah))
+		return -EINVAL;
+
+	fcc_mah = (uah + 500) / 1000;
+	if (fcc_mah == 0 || fcc_mah > 32767)
+		return -ERANGE;
+
+	mutex_lock(&di->lock);
+
+	ret = bq27xxx_battery_unseal(di);
+	if (ret < 0)
+		goto out_unlock;
+
+	ret = bq27220_battery_full_access(di);
+	if (ret < 0)
+		goto out_seal;
+
+	ret = bq27220_battery_set_cfgupdate(di, true);
+	if (ret < 0)
+		goto out_seal;
+
+	ret = bq27220_battery_update_dm_reg(di, "full-charge-capacity",
+					    BQ27220_DM_FULL_CHARGE_CAP,
+					    fcc_mah, 0, 32767, &updated);
+
+	if (bq27220_battery_set_cfgupdate(di, false) < 0)
+		dev_err(di->dev, "failed to exit bq27220 cfgupdate\n");
+
+out_seal:
+	bq27xxx_battery_seal(di);
+out_unlock:
+	mutex_unlock(&di->lock);
+
+	return ret < 0 ? ret : count;
+}
+static DEVICE_ATTR(bq27xxx_fcc, 0644, bq27220_fcc_show, bq27220_fcc_store);
+
 static int bq27220_battery_update_dm_u8(struct bq27xxx_device_info *di,
 					const char *name, u16 addr,
 					u8 val, bool *updated)
@@ -2024,26 +2109,24 @@ struct bq27220_dm_default_u8 {
 };
 
 static const struct bq27220_dm_default_u16 bq27220_f7_dm_defaults_u16[] = {
-	{ "gauging-config", BQ27220_DM_GAUGING_CONFIG, 0x0d31 },
-	{ "emf", BQ27220_DM_EMF, 3679 },
-	{ "cedv-c0", BQ27220_DM_CEDV_C0, 430 },
-	{ "cedv-r0", BQ27220_DM_CEDV_R0, 334 },
-	{ "cedv-t0", BQ27220_DM_CEDV_T0, 4626 },
-	{ "cedv-r1", BQ27220_DM_CEDV_R1, 408 },
-	{ "start-dod0", BQ27220_DM_START_DOD0, 4044 },
-	{ "start-dod10", BQ27220_DM_START_DOD10, 3905 },
-	{ "start-dod20", BQ27220_DM_START_DOD20, 3807 },
-	{ "start-dod30", BQ27220_DM_START_DOD30, 3718 },
-	{ "start-dod40", BQ27220_DM_START_DOD40, 3642 },
-	{ "start-dod50", BQ27220_DM_START_DOD50, 3585 },
-	{ "start-dod60", BQ27220_DM_START_DOD60, 3546 },
-	{ "start-dod70", BQ27220_DM_START_DOD70, 3514 },
-	{ "start-dod80", BQ27220_DM_START_DOD80, 3477 },
-	{ "start-dod90", BQ27220_DM_START_DOD90, 3411 },
-	{ "start-dod100", BQ27220_DM_START_DOD100, 3299 },
-	{ "edv0", BQ27220_DM_FIXED_EDV0, 3300 },
-	{ "edv1", BQ27220_DM_EDV1, 3321 },
-	{ "edv2", BQ27220_DM_EDV2, 3355 },
+	{ "gauging-config", BQ27220_DM_GAUGING_CONFIG, 0x051B },
+	{ "emf", BQ27220_DM_EMF, 3526 },
+	{ "cedv-c0", BQ27220_DM_CEDV_C0, 36 },
+	{ "cedv-r0", BQ27220_DM_CEDV_R0, 1224 },
+	{ "cedv-t0", BQ27220_DM_CEDV_T0, 2624 },
+	{ "cedv-r1", BQ27220_DM_CEDV_R1, 2420 },
+	{ "start-dod0", BQ27220_DM_START_DOD0, 4120 },
+	{ "start-dod10", BQ27220_DM_START_DOD10, 3951 },
+	{ "start-dod20", BQ27220_DM_START_DOD20, 3841 },
+	{ "start-dod30", BQ27220_DM_START_DOD30, 3741 },
+	{ "start-dod40", BQ27220_DM_START_DOD40, 3653 },
+	{ "start-dod50", BQ27220_DM_START_DOD50, 3594 },
+	{ "start-dod60", BQ27220_DM_START_DOD60, 3554 },
+	{ "start-dod70", BQ27220_DM_START_DOD70, 3516 },
+	{ "start-dod80", BQ27220_DM_START_DOD80, 3466 },
+	{ "start-dod90", BQ27220_DM_START_DOD90, 3391 },
+	{ "start-dod100", BQ27220_DM_START_DOD100, 3010 },
+	{ "battery-low", BQ27220_DM_BATTERY_LOW, 500 },
 	{ "sleep-current", BQ27220_DM_SLEEP_CURRENT, 1 },
 };
 
@@ -2108,15 +2191,43 @@ static void bq27220_battery_program_config(struct bq27xxx_device_info *di,
 	BQ27XXX_MSLEEP(50);
 
 	if (capacity_mah != -EINVAL) {
-		/*
-		 * Full Charge Capacity is learned by the gauge after qualified
-		 * discharge cycles. Do not reset it from devicetree on every
-		 * probe, or the learned FCC will be lost across driver reloads.
-		 */
+		u16 fcc;
+
 		bq27220_battery_update_dm_reg(di, "design-capacity",
 					      BQ27220_DM_DESIGN_CAPACITY,
 					      capacity_mah, 0, 32767,
 					      &updated);
+
+		bq27220_battery_update_dm_reg(di, "near-full",
+					      BQ27220_DM_NEAR_FULL,
+					      capacity_mah / 10, 0, 32767,
+					      &updated);
+
+		/*
+		 * Learned Full Charge Capacity is a learned value, not a
+		 * config value. TRM SLUUBD4A section 1.1.10 requires its
+		 * power-up initial value to be the Design Capacity, but it
+		 * must not be rewritten on every probe or the learned FCC
+		 * would be lost across driver reloads. Seed it only while it
+		 * still looks uninitialized: blank OTP reads back as 0, and a
+		 * signed 16-bit FCC is never negative (hence > 32767).
+		 */
+		ret = bq27220_battery_read_dm_reg(di,
+						  BQ27220_DM_FULL_CHARGE_CAP,
+						  &fcc);
+		if (ret < 0) {
+			dev_warn(di->dev, "cannot read bq27220 FCC: %d\n", ret);
+		} else if (fcc == 0 || fcc > 32767) {
+			dev_info(di->dev,
+				 "seed bq27220 learned FCC = %d mAh (was %u)\n",
+				 capacity_mah, fcc);
+			bq27220_battery_update_dm_reg(di, "full-charge-capacity",
+						      BQ27220_DM_FULL_CHARGE_CAP,
+						      capacity_mah, 0, 32767,
+						      &updated);
+		} else {
+			dev_info(di->dev, "keep learned FCC %u mAh\n", fcc);
+		}
 	}
 
 	if (design_energy_mwh != -EINVAL)
@@ -3200,9 +3311,17 @@ int bq27xxx_battery_setup(struct bq27xxx_device_info *di)
 			return dev_err_probe(di->dev, ret,
 					     "failed to create bq27xxx_mac\n");
 
+		ret = device_create_file(di->dev, &dev_attr_bq27xxx_fcc);
+		if (ret) {
+			device_remove_file(di->dev, &dev_attr_bq27xxx_mac);
+			return dev_err_probe(di->dev, ret,
+					     "failed to create bq27xxx_fcc\n");
+		}
+
 		ret = device_create_file(&di->bat->dev,
 					 &dev_attr_current_instant);
 		if (ret) {
+			device_remove_file(di->dev, &dev_attr_bq27xxx_fcc);
 			device_remove_file(di->dev, &dev_attr_bq27xxx_mac);
 			return dev_err_probe(di->dev, ret,
 					     "failed to create current_instant\n");
@@ -3213,6 +3332,7 @@ int bq27xxx_battery_setup(struct bq27xxx_device_info *di)
 		if (ret) {
 			device_remove_file(&di->bat->dev,
 					   &dev_attr_current_instant);
+			device_remove_file(di->dev, &dev_attr_bq27xxx_fcc);
 			device_remove_file(di->dev, &dev_attr_bq27xxx_mac);
 			return dev_err_probe(di->dev, ret,
 					     "failed to create voltage_instant\n");
@@ -3235,6 +3355,7 @@ void bq27xxx_battery_teardown(struct bq27xxx_device_info *di)
 	if (di->opts & BQ27XXX_O_BQ27220) {
 		device_remove_file(&di->bat->dev, &dev_attr_voltage_instant);
 		device_remove_file(&di->bat->dev, &dev_attr_current_instant);
+		device_remove_file(di->dev, &dev_attr_bq27xxx_fcc);
 		device_remove_file(di->dev, &dev_attr_bq27xxx_mac);
 	}
 
