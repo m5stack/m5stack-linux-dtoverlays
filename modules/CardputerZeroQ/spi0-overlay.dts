@@ -12,6 +12,16 @@
         drive-strength = <2>;
         bias-pull-up;
     };
+
+    /* 覆盖板级 cam_mclk，把 gpio28 配成 IRQ 输入 */
+    m5io_hub_irq_default_state: m5io-hub-irq-default-state {
+        pins = "gpio28";
+        function = "gpio";
+        drive-strength = <2>;
+        bias-pull-up;
+        input-enable;
+        output-disable;
+    };
 };
 
 
@@ -30,8 +40,13 @@
         reg = <0>;
         spi-max-frequency = <20000000>;
 
+        pinctrl-names = "default";
+        pinctrl-0 = <&m5io_hub_irq_default_state>;
+
         /* ============================================
          * 1. m5io-hub 芯片本身向主机上报中断
+         *    gpio28 拉低 -> m5io_hub_irq_thread
+         *                 -> m5io_hub_rpc_transfer_once(from_irq)
          * ============================================ */
         interrupt-parent = <&tlmm>;
         interrupts = <28 IRQ_TYPE_LEVEL_LOW>;

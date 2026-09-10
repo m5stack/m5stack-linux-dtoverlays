@@ -2,17 +2,35 @@
 #include <linux/platform_device.h>
 #include <linux/spi/spi.h>
 #include <linux/mfd/m5io-hub.h>
+#include <linux/list.h>
+#include <linux/slab.h>
 
-struct m5io_hub_spi {
+
+// struct m5_rpc_data_node {
+//     int tid;
+//     struct list_head list;
+// };
+
+// struct m5_rpc_token_node {
+//     int tid;
+//     struct list_head list;
+// };
+
+
+
+
+struct m5io_hub_core {
     struct m5io_hub *hub;
     struct spi_controller *ctlr;
+
+
 };
 
 static int m5io_hub_spi_transfer_one(struct spi_controller *ctlr,
                                         struct spi_device *spi,
                                         struct spi_transfer *t)
 {
-    struct m5io_hub_spi *ms = spi_controller_get_devdata(ctlr);
+    struct m5io_hub_core *ms = spi_controller_get_devdata(ctlr);
 
     /* TODO: 把spi_transfer转换成对m5io-hub内部
        "SPI桥"寄存器的读写序列 */
@@ -24,7 +42,8 @@ static int m5io_hub_spi_probe(struct platform_device *pdev)
 {
     struct m5io_hub *hub = dev_get_drvdata(pdev->dev.parent);
     struct spi_controller *ctlr;
-    struct m5io_hub_spi *ms;
+    struct m5io_hub_core *ms;
+    void *fifo_buf;
     int ret;
 
     ctlr = devm_spi_alloc_host(&pdev->dev, sizeof(*ms));
@@ -32,6 +51,9 @@ static int m5io_hub_spi_probe(struct platform_device *pdev)
         return -ENOMEM;
 
     ms = spi_controller_get_devdata(ctlr);
+    {
+
+    }
     ms->hub = hub;
     ms->ctlr = ctlr;
 

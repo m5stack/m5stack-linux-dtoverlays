@@ -4,6 +4,7 @@
 #include <linux/regmap.h>
 #include <linux/mutex.h>
 #include <linux/kfifo.h>
+#include <linux/serial_core.h>
 
 #define M5IO_HUB_NGPIO          16
 
@@ -26,10 +27,26 @@ struct m5io_hub_uart_port {
 struct m5io_hub {
     struct device *dev;
     struct spi_device *spi;
+    struct regmap *regmap;
     struct mutex lock;          /* 保护寄存器读写 */
 
     /* gpio子模块会用到这个irq相关字段 */
     int irq;                    /* 芯片上行中断号（对应spi->irq）*/
 };
+
+typedef void (*m5io_hub_gpio_irq_handler_t)(void *data, unsigned int pin);
+
+int m5io_hub_pinMode(struct m5io_hub *hub, unsigned int pin, int mode);
+int m5io_hub_rpc_transfer(struct m5io_hub *hub);
+int m5io_hub_digitalWrite(struct m5io_hub *hub, unsigned int pin, int value);
+int m5io_hub_digitalRead(struct m5io_hub *hub, unsigned int pin);
+int m5io_hub_attachInterrupt(struct m5io_hub *hub, unsigned int pin,
+                             unsigned int type);
+int m5io_hub_detachInterrupt(struct m5io_hub *hub, unsigned int pin);
+int m5io_hub_register_gpio_irq_handler(
+    struct m5io_hub *hub, m5io_hub_gpio_irq_handler_t handler, void *data);
+void m5io_hub_unregister_gpio_irq_handler(
+    struct m5io_hub *hub, m5io_hub_gpio_irq_handler_t handler, void *data);
+
 
 #endif
