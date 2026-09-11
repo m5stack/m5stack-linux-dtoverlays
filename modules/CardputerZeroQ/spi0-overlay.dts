@@ -61,6 +61,16 @@
                     status = "okay";
                 };
 
+                m5io_hub_leds: leds {
+                    compatible = "m5hub-gpio-leds";
+
+                    grove-fun {
+                        label = "grove_fun";
+                        gpios = <&m5io_hub_gpio 1 GPIO_ACTIVE_HIGH>;
+                        default-state = "off";
+                    };
+                };
+
                 /* Enable these nodes when their transport drivers are ready. */
                 m5io_hub_uart: serial {
                     compatible = "m5stack,m5io-hub-uart";
@@ -95,19 +105,4 @@
         };
     };
 
-    fragment@2 {
-        target-path = "/";
-
-        __overlay__ {
-            m5io_hub_leds: leds {
-                compatible = "m5hub-gpio-leds";
-
-                grove-fun {
-                    label = "grove_fun";
-                    gpios = <&m5io_hub_gpio 1 GPIO_ACTIVE_HIGH>;
-                    default-state = "off";
-                };
-            };
-        };
-    };
 };

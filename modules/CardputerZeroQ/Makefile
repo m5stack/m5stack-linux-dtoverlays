@@ -4,6 +4,9 @@ obj-m += m5io-hub-core.o
 # drivers/gpio/Makefile
 obj-m += m5io-hub-gpio.o
 
+# drivers/leds/Makefile
+obj-m += m5hub-gpio-leds.o
+
 # # drivers/tty/serial/Makefile
 # obj-$(CONFIG_SERIAL_M5IO_HUB) += m5io-hub-uart.o
 

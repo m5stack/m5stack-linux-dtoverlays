@@ -1625,12 +1625,16 @@ static void m5io_hub_cancel_works(void *data) {
 /* -------------------------------------------------------------------------
  * MFD 子设备定义
  *
- * 与设备树 m5io-hub 节点下的 4 个子节点一一对应。
+ * 与设备树 m5io-hub 节点下的子节点一一对应。
  * ------------------------------------------------------------------------- */
 static const struct mfd_cell m5io_hub_devs[] = {
     {
         .name = "m5io-hub-gpio",
         .of_compatible = "m5stack,m5io-hub-gpio",
+    },
+    {
+        .name = "m5hub-gpio-leds",
+        .of_compatible = "m5hub-gpio-leds",
     },
     {
         .name = "m5io-hub-uart",
@@ -1651,8 +1655,8 @@ static const struct mfd_cell m5io_hub_devs[] = {
  * @spi: 绑定到 m5io-hub 的 SPI 设备
  *
  * 分配并初始化核心上下文（RPC 槽位、RX/TX FIFO、等待队列），配置 SPI
- * 模式后申请线程化 IRQ，最后按 MFD 框架注册 GPIO / UART / I2C / SPI
- * 四个子设备。资源均通过 devm 接口申请，unbind 时自动释放。
+ * 模式后申请线程化 IRQ，最后按 MFD 框架注册 GPIO、GPIO LEDs、UART、
+ * I2C 和 SPI 子设备。资源均通过 devm 接口申请，unbind 时自动释放。
  *
  * Return: 0 表示成功；负值为错误码（内存分配、spi_setup()、IRQ 申请或
  *         MFD 子设备注册失败）。
@@ -1768,7 +1772,7 @@ static int m5io_hub_probe(struct spi_device *spi) {
     dev_warn(&spi->dev, "no irq from DT, rpc irq sampling disabled\n");
   }
 
-  /* 依据设备树注册 GPIO/UART/I2C/SPI 子设备 */
+  /* 依据设备树注册 MFD 子设备。 */
   ret = devm_mfd_add_devices(&spi->dev, PLATFORM_DEVID_AUTO, m5io_hub_devs,
                              ARRAY_SIZE(m5io_hub_devs), NULL, 0, NULL);
   if (ret) {
