@@ -1,112 +1,113 @@
 /dts-v1/;
 /plugin/;
 
-#include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
 
+/ {
+    fragment@0 {
+        target = <&tlmm>;
 
-&tlmm {
-    qup_spi0_cs1_default_state: qup-spi0-cs1-default-state {
-        pins = "gpio82";
-        function = "gpio";
-        drive-strength = <2>;
-        bias-pull-up;
-    };
+        __overlay__ {
+            qup_spi0_cs1_default_state: qup-spi0-cs1-default-state {
+                pins = "gpio82";
+                function = "gpio";
+                drive-strength = <2>;
+                bias-pull-up;
+                output-high;
+            };
 
-    /* 覆盖板级 cam_mclk，把 gpio28 配成 IRQ 输入 */
-    m5io_hub_irq_default_state: m5io-hub-irq-default-state {
-        pins = "gpio28";
-        function = "gpio";
-        drive-strength = <2>;
-        bias-pull-up;
-        input-enable;
-        output-disable;
-    };
-};
-
-
-/* 主控 SoC 的 SPI 总线 */
-&spi0 {
-    pinctrl-0 = <&qup_spi0_default_state>, <&qup_spi0_cs1_default_state>;
-    pinctrl-names = "default";
-    num-cs = <2>;
-    cs-gpios = <0>, <&tlmm 82 GPIO_ACTIVE_LOW>;
-    status = "okay";
-    #address-cells = <1>;
-    #size-cells = <0>;
-
-    m5io_hub: m5io-hub@0 {
-        compatible = "m5stack,m5io-hub";
-        reg = <0>;
-        spi-max-frequency = <20000000>;
-
-        pinctrl-names = "default";
-        pinctrl-0 = <&m5io_hub_irq_default_state>;
-
-        /* ============================================
-         * 1. m5io-hub 芯片本身向主机上报中断
-         *    gpio28 拉低 -> m5io_hub_irq_thread
-         *                 -> m5io_hub_rpc_transfer_once(from_irq)
-         * ============================================ */
-        interrupt-parent = <&tlmm>;
-        interrupts = <28 IRQ_TYPE_LEVEL_LOW>;
-
-        /* ============================================
-         * 4. m5io-hub 派生出的子总线节点
-         * ============================================ */
-
-        /* ---- 4.0 GPIO + 中断控制器 ---- */
-        m5io_hub_gpio: gpio {
-            compatible = "m5stack,m5io-hub-gpio";
-
-            interrupt-controller;
-            #interrupt-cells = <2>;
-
-            gpio-controller;
-            #gpio-cells = <2>;
-        };
-
-        /* ---- 4.1 UART ---- */
-        m5io_hub_uart: serial {
-            compatible = "m5stack,m5io-hub-uart";
-        };
-
-        /* ---- 4.2 I2C ---- */
-        m5io_hub_i2c: i2c {
-            compatible = "m5stack,m5io-hub-i2c";
-            #address-cells = <1>;
-            #size-cells = <0>;
-
-            sensor@50 {
-                compatible = "vendor,some-sensor";
-                reg = <0x50>;
+            m5io_hub_irq_default_state: m5io-hub-irq-default-state {
+                pins = "gpio28";
+                function = "gpio";
+                drive-strength = <2>;
+                bias-pull-up;
+                input-enable;
+                output-disable;
             };
         };
+    };
 
-        /* ---- 4.3 SPI ---- */
-        m5io_hub_spi: spi {
-            compatible = "m5stack,m5io-hub-spi";
+    fragment@1 {
+        target = <&spi0>;
+
+        __overlay__ {
+            pinctrl-names = "default";
+            pinctrl-0 = <&qup_spi0_default_state>,
+                        <&qup_spi0_cs1_default_state>;
+            num-cs = <2>;
+            cs-gpios = <0>, <&tlmm 82 GPIO_ACTIVE_LOW>;
             #address-cells = <1>;
             #size-cells = <0>;
+            status = "okay";
 
-            flash@0 {
-                compatible = "jedec,spi-nor";
+            m5io_hub: m5io-hub@0 {
+                compatible = "m5stack,m5io-hub";
                 reg = <0>;
-                spi-max-frequency = <10000000>;
+                spi-max-frequency = <20000000>;
+
+                pinctrl-names = "default";
+                pinctrl-0 = <&m5io_hub_irq_default_state>;
+                interrupt-parent = <&tlmm>;
+                interrupts = <28 IRQ_TYPE_LEVEL_LOW>;
+                status = "okay";
+
+                m5io_hub_gpio: gpio {
+                    compatible = "m5stack,m5io-hub-gpio";
+                    gpio-controller;
+                    #gpio-cells = <2>;
+                    interrupt-controller;
+                    #interrupt-cells = <2>;
+                    status = "okay";
+                };
+
+                /* Enable these nodes when their transport drivers are ready. */
+                m5io_hub_uart: serial {
+                    compatible = "m5stack,m5io-hub-uart";
+                    status = "disabled";
+                };
+
+                m5io_hub_i2c: i2c {
+                    compatible = "m5stack,m5io-hub-i2c";
+                    #address-cells = <1>;
+                    #size-cells = <0>;
+                    status = "disabled";
+                };
+
+                m5io_hub_spi: spi {
+                    compatible = "m5stack,m5io-hub-spi";
+                    #address-cells = <1>;
+                    #size-cells = <0>;
+                    status = "disabled";
+                };
+            };
+
+            mmc-slot@1 {
+                compatible = "mmc-spi-slot";
+                reg = <1>;
+                spi-max-frequency = <20000000>;
+                voltage-ranges = <3300 3300>;
+                bus-width = <1>;
+                disable-wp;
+                cd-gpios = <&m5io_hub_gpio 13 GPIO_ACTIVE_LOW>;
+                status = "okay";
             };
         };
     };
 
-    mmc-slot@1 {
-        compatible = "mmc-spi-slot";
-        reg = <1>;
-        spi-max-frequency = <20000000>;
+    fragment@2 {
+        target-path = "/";
 
-        /* 卡检测引脚 & 中断都走 m5io-hub 的 GPIO 子节点 */
-        gpios = <&m5io_hub_gpio 13 GPIO_ACTIVE_LOW>;
-        interrupt-parent = <&m5io_hub_gpio>;
-        interrupts = <13 IRQ_TYPE_EDGE_BOTH>;
+        __overlay__ {
+            m5io_hub_leds: leds {
+                compatible = "m5hub-gpio-leds";
 
-        status = "okay";
+                grove-fun {
+                    label = "grove_fun";
+                    gpios = <&m5io_hub_gpio 1 GPIO_ACTIVE_HIGH>;
+                    default-state = "off";
+                };
+            };
+        };
     };
 };

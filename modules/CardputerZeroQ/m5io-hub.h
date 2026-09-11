@@ -8,6 +8,13 @@
 
 #define M5IO_HUB_NGPIO          16
 
+#define M5IO_HUB_CHN_IIC1       1
+#define M5IO_HUB_CHN_IIC2       2
+#define M5IO_HUB_CHN_SPI        3
+#define M5IO_HUB_CHN_UART1      4
+#define M5IO_HUB_CHN_UART2      5
+#define M5IO_HUB_CHN_MAX        M5IO_HUB_CHN_UART2
+
 /* ---- 寄存器映射（示例，需要根据实际协议手册确定）---- */
 #define M5IO_HUB_REG_GPIO_DIR      0x00  /* 方向寄存器 */
 #define M5IO_HUB_REG_GPIO_OUT      0x01  /* 输出电平寄存器 */
@@ -35,9 +42,19 @@ struct m5io_hub {
 };
 
 typedef void (*m5io_hub_gpio_irq_handler_t)(void *data, unsigned int pin);
+typedef void (*m5io_hub_chn_data_handler_t)(void *data, const u8 *buf,
+                                            unsigned int len);
 
 int m5io_hub_pinMode(struct m5io_hub *hub, unsigned int pin, int mode);
 int m5io_hub_rpc_transfer(struct m5io_hub *hub);
+int m5io_hub_SendChnData(struct m5io_hub *hub, unsigned int chn,
+                         const u8 *data, unsigned int len);
+int m5io_hub_register_chn_data_handler(
+    struct m5io_hub *hub, unsigned int chn,
+    m5io_hub_chn_data_handler_t handler, void *data);
+void m5io_hub_unregister_chn_data_handler(
+    struct m5io_hub *hub, unsigned int chn,
+    m5io_hub_chn_data_handler_t handler, void *data);
 int m5io_hub_digitalWrite(struct m5io_hub *hub, unsigned int pin, int value);
 int m5io_hub_digitalRead(struct m5io_hub *hub, unsigned int pin);
 int m5io_hub_attachInterrupt(struct m5io_hub *hub, unsigned int pin,
