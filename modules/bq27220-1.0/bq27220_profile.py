@@ -5,17 +5,17 @@
 TRM 的两处写入示例（§6.1 p65 写 Design Capacity、§4.6 p51 写 Hibernate I）
 用的都是 RAM 段地址，因此本文件一律使用 RAM 段。
 
-注意：bqcontrol.py 里原有的 0x40xx 地址属于 "Present OTP" 镜像段
-（例如 Chg Inhibit Temp Low = 0x4041），本文件对应项改用 RAM 段 0x91F5。
+本文件和 bqcontrol.py 都使用活动 RAM 段地址（例如 Chg Inhibit Temp Low =
+0x91F5），不使用 Present OTP 镜像地址。
 
 用法（在 modules/bq27220-1.0/ 目录下执行）：
 
     python3 bq27220_profile.py                    # 打印 v5 的推荐值（默认，不写器件）
     python3 bq27220_profile.py --profile v3       # 打印 v3 的值
     python3 bq27220_profile.py --read             # 读回器件当前值
-    python3 bq27220_profile.py --write            # 写入（unseal -> CFGUPDATE -> 写 -> 退出 -> seal）
+    python3 bq27220_profile.py --write            # 写入（unseal -> full access -> CFGUPDATE -> 写 -> seal）
     python3 bq27220_profile.py --write --seed-fcc # 新器件/首次配置：同时把 FCC 种成设计容量
-    python3 bq27220_profile.py --write --edv fixed  # 保留驱动原方案（EDV_CMP=0 + 固定 EDV）
+    python3 bq27220_profile.py --write --edv fixed  # 关闭 CEDV 补偿并使用固定 EDV
 
 不要写 0x92A1（"Design Energy"）：该参数在 SLUUBD4A 中不存在，详见审计报告。
 """
@@ -94,6 +94,8 @@ DATA_FIELDS: dict[str, tuple[int, str, str, int]] = {
     "SOC Delta":                      (0x920B, "u1", "%", 0),
     "Clk Ctl Reg":                    (0x920C, "u1", "hex", 0),
     "Sleep Current":                  (0x9217, "i2", "mA", 0),
+    # BQ27220 has no HIBERNATE mode; TRM 4.6 recommends clearing this field.
+    "Hibernate I":                    (0x9221, "u1", "mA", 0),
     "Bus Low Time":                   (0x9219, "u1", "s", 0),
     "Offset Cal Inhibit Temp Low":    (0x921A, "i2", "0.1C", 0),
     "Offset Cal Inhibit Temp High":   (0x921C, "i2", "0.1C", 0),
@@ -177,7 +179,9 @@ COMMON: dict[str, int] = {
     "Reserve Capacity": 0,
     "Chg Eff": 100,
     "Dsg Eff": 100,
-    "Smoothing Config": 0x08,             # SMEN=1，平滑到 EDV2
+    # Bit 0 enables discharge smoothing and bit 3 keeps end-of-charge
+    # smoothing enabled (the TRM default).  0x08 alone is not SMEN.
+    "Smoothing Config": 0x09,             # SMEN=1 + SMOOTHEOC_EN=1
     "Smoothing Start Voltage": 3700,
     "Smoothing Delta Voltage": 100,
     "Max Smoothing Current": 8000,
@@ -196,6 +200,7 @@ COMMON: dict[str, int] = {
     "SOC Delta": 1,
     "Clk Ctl Reg": 0x09,
     "Sleep Current": 10,                  # mA
+    "Hibernate I": 0,                      # BQ27220 has no HIBERNATE mode
     "Bus Low Time": 5,
     "Offset Cal Inhibit Temp Low": 50,
     "Offset Cal Inhibit Temp High": 450,
@@ -212,7 +217,9 @@ COMMON: dict[str, int] = {
     "SysDown Set Volt Time": 2,
     "SysDown Clear Volt Threshold": 3250,
     "Chg Inhibit Temp Low": 0,            # 0.0 °C
-    "Chg Inhibit Temp High": 550,         # 55.0 °C（默认 45 °C 在整机发热时会误禁充）
+    # This is the battery temperature. Keep the TRM default until the cell
+    # vendor explicitly rates charging above 45 °C.
+    "Chg Inhibit Temp High": 450,         # 45.0 °C
     "Temp Hys": 50,
     "Charging Current": 200,
     "Charging Voltage": 4200,
@@ -238,26 +245,32 @@ COMMON: dict[str, int] = {
 # ---------------------------------------------------------------------------
 PROFILES: dict[str, dict[str, int]] = {
     "v5": {
-        "Design Capacity": 2000,          # mAh
+        "Design Capacity": 2000,          # mAh; keep in sync with bq27220_v5.dts
         "Near Full": 200,                 # 0.1 × DC
-        "Operation Config A": 0x8484,     # 0x0484 | TEMPS(bit15)，v5 用外部 NTC
+        # TEMPS + BIEnable + BI_PUP_EN; both V3 and V5 use the pack NTC on BIN.
+        "Operation Config A": 0x84A4,
     },
     "v3": {
         "Design Capacity": 1200,          # mAh
         "Near Full": 120,                 # 0.1 × DC
-        "Operation Config A": 0x0484,     # 用内部温度传感器
+        # TEMPS + BIEnable + BI_PUP_EN; BAT_NTC is present on the V0.3 board.
+        "Operation Config A": 0x84A4,
     },
 }
 
 # EDV 门限的两种方案
 EDV_MODEL = {  # 推荐：打开 CEDV 补偿，让器件用 EMF/C0/R0/T0/R1/TC/C1 自己算 EDV1/EDV2
-    "Gauging Configuration": 0x102A,      # TRM 默认：EDV_CMP=1, FIXED_EDV0=1, CSYNC=1, SME0=1
+    # Keep this in sync with the kernel profile. It enables EDV compensation,
+    # charge-termination sync, independent-charger learning, FCC limiting,
+    # and the cycle-count threshold based on FCC. IGNORE_SD is also set so
+    # self-discharge does not look like a load discharge to the counter.
+    "Gauging Configuration": 0x093B,      # FCC_LIMIT + IGNORE_SD + FIXED_EDV0 + SC + EDV_CMP + CSYNC + CCT
     "Fixed EDV 0": 3000,                  # 等于 GPCCEDV 的 CellTermV
     "Fixed EDV 1": 3385,                  # EDV_CMP=1 时忽略
     "Fixed EDV 2": 3501,                  # EDV_CMP=1 时忽略
 }
-EDV_FIXED = {  # 保守：保留驱动的 EDV_CMP=0，但把固定门限改成真实低电量电压
-    "Gauging Configuration": 0x0D31,      # 驱动原值：EDV_CMP=0（关闭补偿）
+EDV_FIXED = {  # 保守：关闭 CEDV 补偿，直接使用固定 EDV 门限
+    "Gauging Configuration": 0x0D31,      # EDV_CMP=0
     "Fixed EDV 0": 3010,                  # OCV11 @ 0% SOC
     "Fixed EDV 1": 3120,                  # OCV11 @ 3% SOC
     "Fixed EDV 2": 3280,                  # OCV11 @ 7% SOC（= Battery Low %）
@@ -286,7 +299,10 @@ def build_values(profile: str, edv: str = "model", seed_fcc: bool = False,
     values.update(COMMON)
     values.update(PROFILES[profile])
     if seed_fcc:
-        values["Full Charge Capacity"] = values["Design Capacity"]
+        # The device programming procedure requires FCC before Design
+        # Capacity. Insert it at the front rather than appending it after the
+        # profile fields assembled above.
+        values = {"Full Charge Capacity": values["Design Capacity"], **values}
     if not with_calib:
         for name in CALIB_OFFSETS:
             values.pop(name, None)
@@ -304,24 +320,62 @@ def dump(values: dict[str, int]) -> None:
 
 def program(dev: bc.BQ27220, values: dict[str, int], seal: bool = True,
             bat_insert: bool = True) -> None:
-    """unseal -> CFGUPDATE -> 写全部 -> 退出 -> (BAT_INSERT) -> (SEALED)。"""
-    dev.unseal_default()
-    dev.enter_cfg_update()
+    """unseal -> FULL ACCESS -> CFGUPDATE -> 写全部 -> 退出 -> seal。"""
     try:
-        dev.control(bc.MAC_SET_PROFILE_1, wait=0.05)
-        for name, value in values.items():
-            dev.write_field(name, value)
-            print(f"  wrote {name} = {value}")
-    finally:
-        dev.exit_cfg_update(reinit=True)
-    if bat_insert:
+        dev.unseal_default()
+        dev.full_access()
+        cfgupdate_active = False
         try:
-            dev.control(bc.MAC_BAT_INSERT, wait=0.05)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  warn: BAT_INSERT failed: {exc}", file=sys.stderr)
-    if seal:
-        dev.control(0x0030, wait=0.05)  # SEALED
-    time.sleep(0.2)
+            dev.enter_cfg_update()
+            cfgupdate_active = True
+            for name, value in values.items():
+                dev.write_field(name, value)
+                print(f"  wrote {name} = {value}")
+        finally:
+            # Do not hide a write failure with a cleanup failure.  Always try
+            # to leave CFGUPDATE because entering it may have succeeded before
+            # a later command reported an error.
+            if not cfgupdate_active:
+                try:
+                    cfgupdate_active = dev.is_cfg_update_active()
+                except Exception as exc:  # noqa: BLE001
+                    if sys.exc_info()[0] is not None:
+                        print(f"  warn: cannot determine CFGUPDATE state: {exc}",
+                              file=sys.stderr)
+                    else:
+                        raise
+            if cfgupdate_active:
+                had_error = sys.exc_info()[0] is not None
+                try:
+                    dev.exit_cfg_update(reinit=True)
+                except Exception as exc:  # noqa: BLE001
+                    if had_error:
+                        print(f"  warn: exit CFGUPDATE failed: {exc}", file=sys.stderr)
+                    else:
+                        raise
+
+        # BAT_INSERT is only required when Operation Config A[BIEnable] is
+        # clear.  The v3/v5 profiles use the gauge's automatic BIN detection.
+        op_cfg_a = values.get("Operation Config A")
+        if bat_insert and op_cfg_a is not None and not (op_cfg_a & (1 << 7)):
+            try:
+                dev.control(bc.MAC_BAT_INSERT, wait=0.05)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  warn: BAT_INSERT failed: {exc}", file=sys.stderr)
+                raise
+    finally:
+        # Preserve an earlier operation error if sealing itself fails, but do
+        # not silently ignore a seal failure on an otherwise successful write.
+        had_error = sys.exc_info()[0] is not None
+        if seal:
+            try:
+                dev.seal()
+            except Exception as exc:  # noqa: BLE001
+                if had_error:
+                    print(f"  warn: SEALED failed: {exc}", file=sys.stderr)
+                else:
+                    raise
+        time.sleep(0.2)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -329,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--profile", choices=sorted(PROFILES), default="v5")
     ap.add_argument("--edv", choices=["model", "fixed"], default="model",
-                    help="model=CEDV 补偿开启(推荐)；fixed=保留驱动 EDV_CMP=0 并修正门限")
+                    help="model=CEDV 补偿开启(推荐)；fixed=关闭补偿并使用固定 EDV 门限")
     ap.add_argument("--seed-fcc", action="store_true",
                     help="把 Learned FCC 写成设计容量（新器件/首次配置时用一次）")
     ap.add_argument("--with-calib", action="store_true",
@@ -363,11 +417,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.read:
             bc.show_registers(dev)
-            bc.show_config(dev)
+            # Data Memory is inaccessible while SEALED. Temporarily unlock
+            # reads and restore the original security state afterwards.
+            bc.show_config_with_access(dev, DATA_FIELDS)
         if args.write:
             program(dev, values, seal=not args.no_seal)
             print("\n[read back]")
-            bc.show_config(dev)
+            bc.show_config_with_access(dev, DATA_FIELDS)
     except KeyboardInterrupt:
         return 130
     except Exception as exc:  # noqa: BLE001

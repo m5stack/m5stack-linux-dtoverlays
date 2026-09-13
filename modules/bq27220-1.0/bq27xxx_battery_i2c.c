@@ -62,6 +62,8 @@ static int bq27xxx_battery_i2c_read(struct bq27xxx_device_info *di, u8 reg,
 
 	if (ret < 0)
 		return ret;
+	if (ret != ARRAY_SIZE(msg))
+		return -EIO;
 
 	if (!single)
 		ret = get_unaligned_le16(data);
@@ -111,6 +113,8 @@ static int bq27xxx_battery_i2c_bulk_read(struct bq27xxx_device_info *di, u8 reg,
 
 	if (!client->adapter)
 		return -ENODEV;
+	if (len < 1 || len > I2C_SMBUS_BLOCK_MAX)
+		return -EINVAL;
 
 	ret = i2c_smbus_read_i2c_block_data(client, reg, len, data);
 	if (ret < 0)
@@ -130,6 +134,8 @@ static int bq27xxx_battery_i2c_bulk_write(struct bq27xxx_device_info *di,
 
 	if (!client->adapter)
 		return -ENODEV;
+	if (len < 1 || len > sizeof(buf) - 1)
+		return -EINVAL;
 
 	buf[0] = reg;
 	memcpy(&buf[1], data, len);
