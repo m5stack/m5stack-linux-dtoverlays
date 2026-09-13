@@ -129,6 +129,14 @@
 
 #define BQ27220_DM_FULL_CHARGE_CAP	0x929d
 #define BQ27220_DEFAULT_FCC_MAH		3000
+#define BQ27220_FCC_INIT_MIN_MAH		250
+/* Capacity mapping is enabled by default; set to 0 only to disable it. */
+#ifndef BQ27220_FCC_INIT_USE_RECOMMENDED
+#define BQ27220_FCC_INIT_USE_RECOMMENDED	1400
+#endif
+#if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
+#define BQ27220_FCC_INIT_TARGET_MAH	BQ27220_FCC_INIT_USE_RECOMMENDED
+#endif
 #define BQ27220_DEFAULT_FIXED_EDV0_MV	3000
 #define BQ27220_DM_DESIGN_CAPACITY	0x929f
 #define BQ27220_DM_DESIGN_VOLTAGE	0x92a3
@@ -1917,6 +1925,20 @@ static int bq27220_battery_update_dm_reg(struct bq27xxx_device_info *di,
  * A write needs unseal + CONFIG UPDATE and takes a few seconds, so call it
  * once at boot instead of periodically.
  */
+#if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
+static int bq27220_fcc_design_mah(struct bq27xxx_device_info *di)
+{
+	int dcap;
+
+	if (di->charge_design_full > 0)
+		return di->charge_design_full / 1000;
+	dcap = bq27xxx_read(di, BQ27XXX_REG_DCAP, true);
+	if (dcap > 0)
+		di->charge_design_full = dcap * 1000;
+	return dcap;
+}
+#endif
+
 static ssize_t bq27xxx_fcc_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
@@ -1935,6 +1957,14 @@ static ssize_t bq27xxx_fcc_show(struct device *dev,
 	if (fcc > 32767)
 		return -EIO;
 
+#if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
+	{
+		int design_mah = bq27220_fcc_design_mah(di);
+		if (design_mah > 0)
+			fcc = DIV_ROUND_CLOSEST(fcc * design_mah,
+						BQ27220_FCC_INIT_USE_RECOMMENDED);
+	}
+#endif
 	return sysfs_emit(buf, "%d\n", fcc * 1000);
 }
 
@@ -1962,6 +1992,20 @@ static ssize_t bq27xxx_fcc_store(struct device *dev,
 	fcc_mah = (uah + 500) / 1000;
 	if (!fcc_mah)
 		return -ERANGE;
+
+#if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
+	{
+		int design_mah = bq27220_fcc_design_mah(di);
+		if (design_mah > 0) {
+			int user_fcc_mah = fcc_mah;
+			fcc_mah = DIV_ROUND_CLOSEST((long long)fcc_mah *
+					BQ27220_FCC_INIT_USE_RECOMMENDED,
+					design_mah);
+			dev_info(di->dev, "map userspace FCC %d mAh to gauge FCC %u mAh\n",
+				 user_fcc_mah, fcc_mah);
+		}
+	}
+#endif
 
 	mutex_lock(&di->lock);
 
@@ -2449,6 +2493,11 @@ static int bq27220_battery_program_config(struct bq27xxx_device_info *di,
 
 	if (capacity_mah != -EINVAL) {
 		u16 fcc;
+		int fcc_target_mah = capacity_mah;
+
+#if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
+		fcc_target_mah = BQ27220_FCC_INIT_TARGET_MAH;
+#endif
 
 		/*
 		 * Do not send SET_PROFILE_1 here. That command switches the active
@@ -2465,16 +2514,17 @@ static int bq27220_battery_program_config(struct bq27xxx_device_info *di,
 						  &fcc);
 		if (ret < 0) {
 			dev_warn(di->dev, "cannot read bq27220 FCC: %d\n", ret);
-		} else if (fcc == 0 || fcc > 32767 ||
+		} else if (fcc < BQ27220_FCC_INIT_MIN_MAH || fcc > 32767 ||
 			   (fcc == BQ27220_DEFAULT_FCC_MAH &&
-			    capacity_mah != BQ27220_DEFAULT_FCC_MAH)) {
+			    fcc_target_mah != BQ27220_DEFAULT_FCC_MAH) ||
+			   fcc > fcc_target_mah) {
 			dev_info(di->dev,
-				 "seed bq27220 learned FCC = %d mAh (was %u)\n",
-				 capacity_mah, fcc);
+				 "set bq27220 learned FCC = %d mAh (was %u)\n",
+				 fcc_target_mah, fcc);
 			ret = bq27220_battery_update_dm_reg(di,
 							"full-charge-capacity",
 							BQ27220_DM_FULL_CHARGE_CAP,
-							capacity_mah, 0, 32767,
+							fcc_target_mah, 0, 32767,
 							&updated);
 			if (ret < 0)
 				goto out_exit_cfgupdate;

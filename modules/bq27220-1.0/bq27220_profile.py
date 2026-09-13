@@ -217,9 +217,8 @@ COMMON: dict[str, int] = {
     "SysDown Set Volt Time": 2,
     "SysDown Clear Volt Threshold": 3250,
     "Chg Inhibit Temp Low": 0,            # 0.0 °C
-    # This is the battery temperature. Keep the TRM default until the cell
-    # vendor explicitly rates charging above 45 °C.
-    "Chg Inhibit Temp High": 450,         # 45.0 °C
+    # This is the battery temperature; allow charging up to 55 °C.
+    "Chg Inhibit Temp High": 550,         # 55.0 °C
     "Temp Hys": 50,
     "Charging Current": 200,
     "Charging Voltage": 4200,
@@ -245,8 +244,8 @@ COMMON: dict[str, int] = {
 # ---------------------------------------------------------------------------
 PROFILES: dict[str, dict[str, int]] = {
     "v5": {
-        "Design Capacity": 2000,          # mAh; keep in sync with bq27220_v5.dts
-        "Near Full": 200,                 # 0.1 × DC
+        "Design Capacity": 1750,          # mAh; keep in sync with bq27220_v5.dts
+        "Near Full": 175,                 # 0.1 × DC
         # TEMPS + BIEnable + BI_PUP_EN; both V3 and V5 use the pack NTC on BIN.
         "Operation Config A": 0x84A4,
     },

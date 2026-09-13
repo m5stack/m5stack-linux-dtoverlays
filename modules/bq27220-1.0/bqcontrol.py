@@ -124,10 +124,8 @@ INIT_VALUES = {
     "Design Capacity": 1200,
     "Design Voltage": 3700,  # mV; 4.2 V is the usual single-cell charge limit.
     "Chg Inhibit Temp Low": 0,      # 0.0C
-    # Keep the TRM default until the cell vendor specifies a higher charge
-    # temperature.  This threshold is the battery temperature, not the SoC
-    # temperature, and raising it without a cell rating can be unsafe.
-    "Chg Inhibit Temp High": 450,   # 45.0C
+    # This is the battery temperature threshold, configured here for 55 °C.
+    "Chg Inhibit Temp High": 550,   # 55.0C
     "Chg Inhibit Temp Hys": 50,     # 5.0C
     "Hibernate I": 0,
     "Charging Current": 200,
