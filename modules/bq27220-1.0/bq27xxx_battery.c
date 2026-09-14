@@ -2719,6 +2719,29 @@ static bool bq27220_battery_read_design_dt(struct bq27xxx_device_info *di)
 		has_capacity = capacity_mah != -EINVAL;
 	}
 
+	/*
+	 * Design Capacity is retained while the gauge remains powered.  When it
+	 * already matches the board profile, do not enter CONFIG UPDATE: exiting
+	 * that mode performs a soft reset and makes the gauge recalculate SOC.
+	 * A failed read is treated conservatively and falls through to the normal
+	 * initialization path.
+	 */
+	if (has_capacity) {
+		/* Design Capacity is a 16-bit register; read both bytes. */
+		int current_capacity = bq27xxx_read(di, BQ27XXX_REG_DCAP, false);
+
+		if (current_capacity >= 0 && current_capacity == capacity_mah) {
+			dev_info(di->dev,
+				 "bq27220 design capacity %d mAh already matches profile; "
+				 "skip configuration reset\n", capacity_mah);
+			return true;
+		}
+		if (current_capacity >= 0)
+			dev_info(di->dev,
+				 "bq27220 design capacity is %d mAh, profile requests %d mAh\n",
+				 current_capacity, capacity_mah);
+	}
+
 	if (!device_property_read_u64(di->dev,
 				      "ti,design-energy-nanowatt-hours",
 				      &energy_nwh)) {
