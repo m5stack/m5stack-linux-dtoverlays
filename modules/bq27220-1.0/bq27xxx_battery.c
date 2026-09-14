@@ -2727,7 +2727,8 @@ static bool bq27220_battery_read_design_dt(struct bq27xxx_device_info *di)
 	 * initialization path.
 	 */
 	if (has_capacity) {
-		int current_capacity = bq27xxx_read(di, BQ27XXX_REG_DCAP, true);
+		/* Design Capacity is a 16-bit register; read both bytes. */
+		int current_capacity = bq27xxx_read(di, BQ27XXX_REG_DCAP, false);
 
 		if (current_capacity >= 0 && current_capacity == capacity_mah) {
 			dev_info(di->dev,
