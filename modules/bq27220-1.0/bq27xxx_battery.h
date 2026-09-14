@@ -3,6 +3,8 @@
 #define __LINUX_BQ27X00_BATTERY_H__
 
 #include <linux/power_supply.h>
+#include <linux/spinlock.h>
+#include <linux/workqueue.h>
 
 enum bq27xxx_chip {
 	BQ27000 = 1, /* bq27000, bq27200 */
@@ -73,6 +75,12 @@ struct bq27xxx_device_info {
 	unsigned long last_update;
 	union power_supply_propval last_status;
 	struct delayed_work work;
+	struct work_struct reset_work;
+	/* Protects reset admission, independently of the sleeping I/O lock. */
+	spinlock_t reset_lock;
+	bool reset_busy;
+	bool reset_stopping;
+	bool reset_suspended;
 	struct power_supply *bat;
 	struct list_head list;
 	struct mutex lock;
