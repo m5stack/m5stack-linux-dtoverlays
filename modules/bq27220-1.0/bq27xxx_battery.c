@@ -55,6 +55,7 @@
 #include <linux/of.h>
 #include <linux/math64.h>
 #include <linux/property.h>
+#include <linux/string.h>
 #include "bq27xxx_battery.h"
 
 #define BQ27XXX_MANUFACTURER	"Texas Instruments"
@@ -132,7 +133,7 @@
 #define BQ27220_FCC_INIT_MIN_MAH		250
 /* Capacity mapping is enabled by default; set to 0 only to disable it. */
 #ifndef BQ27220_FCC_INIT_USE_RECOMMENDED
-#define BQ27220_FCC_INIT_USE_RECOMMENDED	1400
+#define BQ27220_FCC_INIT_USE_RECOMMENDED	1300
 #endif
 #if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
 #define BQ27220_FCC_INIT_TARGET_MAH	BQ27220_FCC_INIT_USE_RECOMMENDED
@@ -1879,10 +1880,14 @@ static int bq27220_battery_update_dm_reg(struct bq27xxx_device_info *di,
 		dev_info(di->dev, "bq27220 %s has %d\n", name, val);
 		return 0;
 	}
-
-	dev_info(di->dev, "update bq27220 %s from %u to %d\n", name, old,
-		 val);
-
+#if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
+	if(strcmp(name, "full-charge-capacity") != 0) {
+#endif
+		dev_info(di->dev, "update bq27220 %s from %u to %d\n", name, old,
+			val);
+#if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
+}
+#endif
 	ret = bq27220_battery_write_dm_reg(di, addr, (u16)val);
 	if (ret < 0) {
 		dev_err(di->dev, "failed to write bq27220 %s: %d\n", name,
@@ -1957,15 +1962,6 @@ static ssize_t bq27xxx_fcc_show(struct device *dev,
 		fcc = -EIO;
 		goto out_unlock;
 	}
-
-#if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
-	{
-		int design_mah = bq27220_fcc_design_mah(di);
-		if (design_mah > 0)
-			fcc = DIV_ROUND_CLOSEST(fcc * design_mah,
-						BQ27220_FCC_INIT_USE_RECOMMENDED);
-	}
-#endif
 out_unlock:
 	mutex_unlock(&di->lock);
 	return fcc < 0 ? fcc : sysfs_emit(buf, "%d\n", fcc * 1000);
@@ -1997,20 +1993,6 @@ static ssize_t bq27xxx_fcc_store(struct device *dev,
 		return -ERANGE;
 
 	mutex_lock(&di->lock);
-
-#if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
-	{
-		int design_mah = bq27220_fcc_design_mah(di);
-		if (design_mah > 0) {
-			int user_fcc_mah = fcc_mah;
-			fcc_mah = DIV_ROUND_CLOSEST((long long)fcc_mah *
-					BQ27220_FCC_INIT_USE_RECOMMENDED,
-					design_mah);
-			dev_info(di->dev, "map userspace FCC %d mAh to gauge FCC %u mAh\n",
-				 user_fcc_mah, fcc_mah);
-		}
-	}
-#endif
 
 	ret = bq27xxx_battery_unseal(di);
 	if (ret < 0)
@@ -2531,9 +2513,12 @@ static int bq27220_battery_program_config(struct bq27xxx_device_info *di,
 			   (fcc == BQ27220_DEFAULT_FCC_MAH &&
 			    fcc_target_mah != BQ27220_DEFAULT_FCC_MAH) ||
 			   fcc > fcc_target_mah) {
+#if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
+#else
 			dev_info(di->dev,
 				 "set bq27220 learned FCC = %d mAh (was %u)\n",
 				 fcc_target_mah, fcc);
+#endif
 			ret = bq27220_battery_update_dm_reg(di,
 							"full-charge-capacity",
 							BQ27220_DM_FULL_CHARGE_CAP,
