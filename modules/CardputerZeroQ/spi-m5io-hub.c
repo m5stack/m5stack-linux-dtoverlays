@@ -1,7 +1,7 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/spi/spi.h>
-#include <linux/mfd/m5io-hub.h>
+#include "m5io-hub.h"
 #include <linux/list.h>
 #include <linux/slab.h>
 

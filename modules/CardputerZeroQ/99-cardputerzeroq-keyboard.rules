@@ -1,0 +1,2 @@
+# Match the custom TCA8418 driver without depending on the I2C adapter number.
+ACTION!="remove", SUBSYSTEM=="input", KERNEL=="event*", DRIVERS=="tca8418_keypad", KERNELS=="*-0034", SYMLINK+="input/cardputer-zero-internal", GROUP="input", MODE="0660"

@@ -1,6 +1,6 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
-#include <linux/mfd/m5io-hub.h>
+#include "m5io-hub.h"
 #include <linux/serial_core.h>
 #include <linux/tty.h>
 #include <linux/tty_flip.h>

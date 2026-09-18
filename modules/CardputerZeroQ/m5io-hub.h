@@ -6,7 +6,7 @@
 #include <linux/kfifo.h>
 #include <linux/serial_core.h>
 
-#define M5IO_HUB_NGPIO          16
+#define M5IO_HUB_NGPIO          17
 
 #define M5IO_HUB_CHN_IIC1       1
 #define M5IO_HUB_CHN_IIC2       2
@@ -14,6 +14,28 @@
 #define M5IO_HUB_CHN_UART1      4
 #define M5IO_HUB_CHN_UART2      5
 #define M5IO_HUB_CHN_MAX        M5IO_HUB_CHN_UART2
+
+#define M5IO_HUB_FUNC_I2C       2
+#define M5IO_HUB_TOKEN_PAYLOAD_MAX 15
+#define M5IO_HUB_DATA_PAYLOAD_MAX 255
+
+/* Synchronous TOKEN request. Optional I2C DATA uses PID=0, CH=bus.
+ * reply/status are the terminal TOKEN payload/ARG, even on firmware errors.
+ * data_rx is published only after both DATA and a successful TOKEN arrive.
+ */
+struct m5io_hub_request {
+    u8 func;
+    u8 arg;
+    const u8 *payload;
+    unsigned int payload_len;
+    u8 status;
+    u8 reply[M5IO_HUB_TOKEN_PAYLOAD_MAX];
+    unsigned int reply_len;
+    u8 data_chn;
+    const u8 *data_tx;
+    u8 *data_rx;
+    unsigned int data_len;
+};
 
 /* ---- 寄存器映射（示例，需要根据实际协议手册确定）---- */
 #define M5IO_HUB_REG_GPIO_DIR      0x00  /* 方向寄存器 */
@@ -46,6 +68,7 @@ typedef void (*m5io_hub_chn_data_handler_t)(void *data, const u8 *buf,
                                             unsigned int len);
 
 int m5io_hub_pinMode(struct m5io_hub *hub, unsigned int pin, int mode);
+int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request);
 int m5io_hub_rpc_transfer(struct m5io_hub *hub);
 int m5io_hub_SendChnData(struct m5io_hub *hub, unsigned int chn,
                          const u8 *data, unsigned int len);

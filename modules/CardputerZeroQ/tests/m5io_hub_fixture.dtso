@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: GPL-2.0
+/dts-v1/;
+/plugin/;
+
+&{/} {
+    m5io-test-spi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        spidev@0 {
+            compatible = "m5stack,m5io-hub";
+            reg = <0>;
+            spi-max-frequency = <20000000>;
+            spi-cs-setup-delay-ns = <10000>;
+            spi-cs-inactive-delay-ns = <100000>;
+
+            i2c {
+                compatible = "m5stack,m5io-hub-i2c";
+                #address-cells = <1>;
+                #size-cells = <0>;
+
+                i2c@1 {
+                    reg = <1>;
+                    #address-cells = <1>;
+                    #size-cells = <0>;
+                    clock-frequency = <100000>;
+
+                    peripheral@50 {
+                        compatible = "m5io-test,peripheral";
+                        reg = <0x50>;
+                    };
+                };
+
+                i2c@2 {
+                    reg = <2>;
+                    #address-cells = <1>;
+                    #size-cells = <0>;
+                    clock-frequency = <400000>;
+
+                    peripheral@50 {
+                        compatible = "m5io-test,peripheral";
+                        reg = <0x50>;
+                    };
+                };
+            };
+        };
+    };
+};

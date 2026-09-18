@@ -9,13 +9,20 @@
 #include <linux/gpio/driver.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
-#include <linux/mfd/m5io-hub.h>
+#include "m5io-hub.h"
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/version.h>
 
-#define M5IO_HUB_PIN_MODE_INPUT 0
-#define M5IO_HUB_PIN_MODE_OUTPUT 1
+#define M5IO_HUB_PIN_MODE_OUTPUT 0
+#define M5IO_HUB_PIN_MODE_INPUT 1
+
+static const char *const m5io_hub_gpio_names[M5IO_HUB_NGPIO] = {
+    "GPIO1", "GPIO2", "GPIO3", "LED1", "LED2", "LED3", "SD_DET",
+    "MIC_EN", "CAMERA_EN", "GROVE1_EN", "SD_EN", "AMP_EN", "QWIIC_EN",
+    "HAT_EN", "GROVE2_EN", "MIC_SW", "LCD_KEY_RST",
+};
 
 struct m5io_hub_gpio {
   struct m5io_hub *hub;
@@ -139,11 +146,23 @@ static int m5io_hub_gpio_get(struct gpio_chip *gc, unsigned int offset) {
   return m5io_hub_digitalRead(mg->hub, offset);
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
 static int m5io_hub_gpio_set(struct gpio_chip *gc, unsigned int offset,
                              int value) {
+#else
+static void m5io_hub_gpio_set(struct gpio_chip *gc, unsigned int offset,
+                              int value) {
+#endif
   struct m5io_hub_gpio *mg = gpiochip_get_data(gc);
+  int ret;
 
-  return m5io_hub_digitalWrite(mg->hub, offset, value);
+  ret = m5io_hub_digitalWrite(mg->hub, offset, value);
+  if (ret)
+    dev_err_ratelimited(gc->parent, "failed to set GPIO %u: %d\n", offset,
+                        ret);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+  return ret;
+#endif
 }
 
 static int m5io_hub_gpio_direction_input(struct gpio_chip *gc,
@@ -158,12 +177,12 @@ static int m5io_hub_gpio_direction_output(struct gpio_chip *gc,
   struct m5io_hub_gpio *mg = gpiochip_get_data(gc);
   int ret;
 
-  /* Program the output latch before enabling the output to avoid a glitch. */
-  ret = m5io_hub_digitalWrite(mg->hub, offset, value);
+  /* MCU rejects digitalWrite on an input; the protocol has no atomic mode/value command. */
+  ret = m5io_hub_pinMode(mg->hub, offset, M5IO_HUB_PIN_MODE_OUTPUT);
   if (ret)
     return ret;
 
-  return m5io_hub_pinMode(mg->hub, offset, M5IO_HUB_PIN_MODE_OUTPUT);
+  return m5io_hub_digitalWrite(mg->hub, offset, value);
 }
 
 static int m5io_hub_gpio_probe(struct platform_device *pdev) {
@@ -186,6 +205,7 @@ static int m5io_hub_gpio_probe(struct platform_device *pdev) {
   mg->gc.owner = THIS_MODULE;
   mg->gc.base = -1;
   mg->gc.ngpio = M5IO_HUB_NGPIO;
+  mg->gc.names = m5io_hub_gpio_names;
   mg->gc.get = m5io_hub_gpio_get;
   mg->gc.set = m5io_hub_gpio_set;
   mg->gc.direction_input = m5io_hub_gpio_direction_input;

@@ -679,12 +679,12 @@ static int tca8418_parse_led_mode(struct device *dev,
 		return -EINVAL;
 	}
 
+	/* Boards without the external LED controller still provide a keypad. */
+	if (!of_property_present(dev->of_node, property))
+		return 0;
+
 	error = of_parse_phandle_with_fixed_args(dev->of_node, property, 1, 0,
 						 &args);
-	if (error == -ENOENT) {
-		dev_err(dev, "missing required property %s\n", property);
-		return -EINVAL;
-	}
 	if (error)
 		return error;
 

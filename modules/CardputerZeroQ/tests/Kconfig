@@ -1,0 +1,5 @@
+config M5IO_HUB_KUNIT_TEST
+    bool "M5IO-HUB protocol integration tests"
+    depends on KUNIT && SPI && I2C && OF_OVERLAY
+    select MFD_CORE
+    select CRC_ITU_T

@@ -1,0 +1,67 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/* Apply offline to the full DTB with the already enabled SE0 SPI controller. */
+&spi0 {
+    #address-cells = <1>;
+    #size-cells = <0>;
+
+    spidev@0 {
+        reg = <0>;
+        compatible = "m5stack,m5io-hub";
+        spi-max-frequency = <20000000>;
+        spi-cs-setup-delay-ns = <10000>;
+        spi-cs-inactive-delay-ns = <100000>;
+        pinctrl-names = "default";
+        pinctrl-0 = <&m5io_hub_irq_default_state>;
+        interrupt-parent = <&tlmm>;
+        interrupts = <28 IRQ_TYPE_LEVEL_LOW>;
+        status = "okay";
+
+        m5io_hub_gpio: gpio {
+            compatible = "m5stack,m5io-hub-gpio";
+            gpio-controller;
+            #gpio-cells = <2>;
+            interrupt-controller;
+            #interrupt-cells = <2>;
+            status = "okay";
+        };
+
+        i2c {
+            compatible = "m5stack,m5io-hub-i2c";
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+
+            m5io_i2c1: i2c@1 {
+                reg = <1>;
+                #address-cells = <1>;
+                #size-cells = <0>;
+                clock-frequency = <100000>;
+                status = "okay";
+            };
+
+            m5io_i2c2: i2c@2 {
+                reg = <2>;
+                #address-cells = <1>;
+                #size-cells = <0>;
+                clock-frequency = <100000>;
+                status = "okay";
+            };
+        };
+    };
+};
+
+&tlmm {
+    m5io_hub_irq_default_state: m5io-hub-irq-default-state {
+        pins = "gpio28";
+        function = "gpio";
+        drive-strength = <2>;
+        bias-pull-up;
+        input-enable;
+        output-disable;
+    };
+};

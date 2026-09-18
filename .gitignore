@@ -10,3 +10,4 @@
 *.order
 *.symvers
 *.tmp
+.slave

@@ -1,0 +1,30 @@
+/dts-v1/;
+/plugin/;
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+/ {
+    fragment@0 {
+        target = <&i2c0>;
+
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+    fragment@1 {
+        target = <&spi0>;
+        __overlay__ {
+            num-cs = <1>;
+            cs-gpios = <0>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+
+            spidev@0 {
+                compatible = "spidev";
+                reg = <0>;
+                spi-max-frequency = <20000000>;
+                status = "okay";
+            };
+        };
+    };
+};
