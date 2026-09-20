@@ -1,0 +1,316 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+    fragment@0 {
+        target = <&tlmm>;
+
+        __overlay__ {
+            qup_spi0_cs1_default_state: qup-spi0-cs1-default-state {
+                pins = "gpio82";
+                function = "gpio";
+                drive-strength = <2>;
+                bias-pull-up;
+                output-high;
+            };
+
+            m5io_hub_irq_default_state: m5io-hub-irq-default-state {
+                pins = "gpio28";
+                function = "gpio";
+                drive-strength = <2>;
+                bias-pull-up;
+                input-enable;
+                output-disable;
+            };
+
+            tca8418_irq_default_state: tca8418-irq-default-state {
+                /* SOC_GPIO_86_SE0 is a SoC GPIO, not an M5IO-HUB GPIO. */
+                pins = "gpio86";
+                function = "gpio";
+                drive-strength = <2>;
+                bias-pull-up;
+                input-enable;
+                output-disable;
+            };
+        };
+    };
+
+    fragment@1 {
+        target = <&spi0>;
+
+        __overlay__ {
+            pinctrl-names = "default";
+            pinctrl-0 = <&qup_spi0_default>,
+                        <&qup_spi0_cs1_default_state>;
+            num-cs = <2>;
+            cs-gpios = <0>, <&tlmm 82 GPIO_ACTIVE_LOW>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+
+            /* The base DT already exposes SE0 CS0 as spidev@0.  Configure
+             * that node in place so the overlay cannot create a second
+             * device at SPI chip-select 0.
+             */
+            m5io_hub: spidev@0 {
+                compatible = "m5stack,m5io-hub";
+                reg = <0>;
+                spi-max-frequency = <20000000>;
+                spi-cs-setup-delay-ns = <10000>;
+                spi-cs-inactive-delay-ns = <100000>;
+
+                pinctrl-names = "default";
+                pinctrl-0 = <&m5io_hub_irq_default_state>;
+                interrupt-parent = <&tlmm>;
+                interrupts = <28 IRQ_TYPE_LEVEL_LOW>;
+                status = "okay";
+
+                m5io_hub_gpio: gpio {
+                    compatible = "m5stack,m5io-hub-gpio";
+                    gpio-controller;
+                    #gpio-cells = <2>;
+                    interrupt-controller;
+                    #interrupt-cells = <2>;
+                    status = "okay";
+                };
+
+                /* CardputerZeroQ does not use the optional M5IO LED output. */
+                m5io_hub_leds: leds {
+                    compatible = "m5hub-gpio-leds";
+                    status = "disabled";
+
+                    grove-fun {
+                        label = "grove_fun";
+                        gpios = <&m5io_hub_gpio 1 GPIO_ACTIVE_HIGH>;
+                        default-state = "off";
+                    };
+                };
+
+                /* Enable these nodes when their transport drivers are ready. */
+                m5io_hub_uart: serial {
+                    compatible = "m5stack,m5io-hub-uart";
+                    status = "disabled";
+                };
+
+                m5io_hub_i2c: i2c {
+                    compatible = "m5stack,m5io-hub-i2c";
+                    #address-cells = <1>;
+                    #size-cells = <0>;
+                    status = "okay";
+
+                    m5io_i2c1: i2c@1 {
+                        reg = <1>;
+                        #address-cells = <1>;
+                        #size-cells = <0>;
+                        clock-frequency = <100000>;
+                        status = "okay";
+
+                        tca8418: keypad@34 {
+                            compatible = "m5stack,tca8418c";
+                            reg = <0x34>;
+                            pinctrl-names = "default";
+                            pinctrl-0 = <&tca8418_irq_default_state>;
+                            interrupt-parent = <&tlmm>;
+                            interrupts = <86 IRQ_TYPE_LEVEL_LOW>;
+                            irq-gpios = <&tlmm 86 GPIO_ACTIVE_LOW>;
+                            status = "okay";
+
+                            keypad,num-rows = <5>;
+                            keypad,num-columns = <10>;
+                            sym-button-code = <0x43>;
+                            fn-button-code = <0x42>;
+                            shift-button-code = <0x41>;
+
+                            /* This board has no TCA8418 LED indicators. */
+                            /delete-property/ tables-sel-led-gpio;
+                            /delete-property/ capslock-led-gpio;
+                            /delete-property/ fn-led-gpio;
+                            /delete-property/ tables-sel-led-mode;
+                            /delete-property/ capslock-led-mode;
+                            /delete-property/ fn-led-mode;
+
+                            /* CardputerZero v5 keymaps. */
+                            linux,keymap = <
+                                0x04000001 /* KEY_ESC */
+                                0x0409000f /* KEY_TAB */
+                                0x04040002 /* KEY_1 */
+                                0x00000003 /* KEY_2 */
+                                0x00010004 /* KEY_3 */
+                                0x00020005 /* KEY_4 */
+                                0x00030006 /* KEY_5 */
+                                0x00040007 /* KEY_6 */
+                                0x00050008 /* KEY_7 */
+                                0x00060009 /* KEY_8 */
+                                0x0007000a /* KEY_9 */
+                                0x0008000b /* KEY_0 */
+                                0x0009000e /* KEY_BACKSPACE */
+                                0x0403017f /* Sym */
+                                0x01000010 /* KEY_Q */
+                                0x01010011 /* KEY_W */
+                                0x01020012 /* KEY_E */
+                                0x01030013 /* KEY_R */
+                                0x01040014 /* KEY_T */
+                                0x01050015 /* KEY_Y */
+                                0x01060016 /* KEY_U */
+                                0x01070017 /* KEY_I */
+                                0x01080018 /* KEY_O */
+                                0x01090019 /* KEY_P */
+                                0x0401002a /* KEY_LEFTSHIFT */
+                                0x0200001e /* KEY_A */
+                                0x0201001f /* KEY_S */
+                                0x02020020 /* KEY_D */
+                                0x02030021 /* KEY_F */
+                                0x02040022 /* KEY_G */
+                                0x02050023 /* KEY_H */
+                                0x02060024 /* KEY_J */
+                                0x02070025 /* KEY_K */
+                                0x02080026 /* KEY_L */
+                                0x0209001c /* KEY_ENTER */
+                                0x04020185 /* Fn */
+                                0x0300001d /* KEY_LEFTCTRL */
+                                0x03010038 /* KEY_LEFTALT */
+                                0x0302002c /* KEY_Z */
+                                0x0303002d /* KEY_X */
+                                0x0304002e /* KEY_C */
+                                0x0305002f /* KEY_V */
+                                0x03060030 /* KEY_B */
+                                0x03070031 /* KEY_N */
+                                0x03080032 /* KEY_M */
+                                0x03090039 /* KEY_SPACE */
+                            >;
+
+                            linux,keymap1 = <
+                                0x04000001 /* KEY_ESC */
+                                0x0409000f /* KEY_TAB */
+                                0x0404001a /* KEY_LEFTBRACE */
+                                0x0000001b /* KEY_RIGHTBRACE */
+                                0x00010027 /* KEY_SEMICOLON */
+                                0x00020028 /* KEY_APOSTROPHE */
+                                0x00030029 /* KEY_GRAVE */
+                                0x0004002b /* KEY_BACKSLASH */
+                                0x00050033 /* KEY_COMMA */
+                                0x00060034 /* KEY_DOT */
+                                0x00070035 /* KEY_SLASH */
+                                0x0008005e /* KEY_MUHENKAN */
+                                0x0009000e /* KEY_BACKSPACE */
+                                0x0403017f /* Sym */
+                                0x01000037 /* KEY_KPASTERISK */
+                                0x01010045 /* KEY_NUMLOCK */
+                                0x01020046 /* KEY_SCROLLLOCK */
+                                0x01030047 /* KEY_KP7 */
+                                0x01040048 /* KEY_KP8 */
+                                0x01050049 /* KEY_KP9 */
+                                0x0106004a /* KEY_KPMINUS */
+                                0x0107004b /* KEY_KP4 */
+                                0x0108004c /* KEY_KP5 */
+                                0x0109004d /* KEY_KP6 */
+                                0x0401004e /* KEY_KPPLUS */
+                                0x0200004f /* KEY_KP1 */
+                                0x02010050 /* KEY_KP2 */
+                                0x02020051 /* KEY_KP3 */
+                                0x02030000 /* F disabled */
+                                0x02040052 /* KEY_KP0 */
+                                0x02050053 /* KEY_KPDOT */
+                                0x02060055 /* KEY_ZENKAKUHANKAKU */
+                                0x02070056 /* KEY_102ND */
+                                0x02080059 /* KEY_RO */
+                                0x0209001c /* KEY_ENTER */
+                                0x04020185 /* Fn */
+                                0x0300001d /* KEY_LEFTCTRL */
+                                0x03010038 /* KEY_LEFTALT */
+                                0x03020000 /* Z disabled */
+                                0x03030000 /* X disabled */
+                                0x03040000 /* C disabled */
+                                0x0305005a /* KEY_KATAKANA */
+                                0x0306005b /* KEY_HIRAGANA */
+                                0x0307005c /* KEY_HENKAN */
+                                0x0308005d /* KEY_KATAKANAHIRAGANA */
+                                0x03090039 /* KEY_SPACE */
+                            >;
+
+                            linux,keymap2 = <
+                                0x04000001 /* KEY_ESC */
+                                0x0409000f /* KEY_TAB */
+                                0x0404003b /* KEY_F1 */
+                                0x0000003c /* KEY_F2 */
+                                0x0001003d /* KEY_F3 */
+                                0x0002003e /* KEY_F4 */
+                                0x0003003f /* KEY_F5 */
+                                0x00040040 /* KEY_F6 */
+                                0x00050041 /* KEY_F7 */
+                                0x00060042 /* KEY_F8 */
+                                0x00070043 /* KEY_F9 */
+                                0x00080044 /* KEY_F10 */
+                                0x0009006f /* KEY_DELETE */
+                                0x0403017f /* Sym */
+                                0x010000a4 /* KEY_PLAYPAUSE */
+                                0x010100a5 /* KEY_PREVIOUSSONG */
+                                0x010200a3 /* KEY_NEXTSONG */
+                                0x01030013 /* KEY_R */
+                                0x01040014 /* KEY_T */
+                                0x01050015 /* KEY_Y */
+                                0x010600e0 /* KEY_BRIGHTNESSDOWN */
+                                0x010700e1 /* KEY_BRIGHTNESSUP */
+                                0x01080057 /* KEY_F11 */
+                                0x01090058 /* KEY_F12 */
+                                0x0401002a /* KEY_LEFTSHIFT */
+                                0x02000071 /* KEY_MUTE */
+                                0x02010072 /* KEY_VOLUMEDOWN */
+                                0x02020073 /* KEY_VOLUMEUP */
+                                0x02030067 /* KEY_UP */
+                                0x02040022 /* KEY_G */
+                                0x0205008a /* KEY_HELP */
+                                0x02060063 /* KEY_SYSRQ */
+                                0x02070066 /* KEY_HOME */
+                                0x02080068 /* KEY_PAGEUP */
+                                0x0209001c /* KEY_ENTER */
+                                0x04020185 /* Fn */
+                                0x0300001d /* KEY_LEFTCTRL */
+                                0x03010038 /* KEY_LEFTALT */
+                                0x03020069 /* KEY_LEFT */
+                                0x0303006c /* KEY_DOWN */
+                                0x0304006a /* KEY_RIGHT */
+                                0x0305002f /* KEY_V */
+                                0x0306006e /* KEY_INSERT */
+                                0x0307006b /* KEY_END */
+                                0x0308006d /* KEY_PAGEDOWN */
+                                0x03090039 /* KEY_SPACE */
+                            >;
+                        };
+                    };
+
+                    /* The keyboard is wired to I2C1 only. */
+                    m5io_i2c2: i2c@2 {
+                        reg = <2>;
+                        #address-cells = <1>;
+                        #size-cells = <0>;
+                        clock-frequency = <100000>;
+                        status = "disabled";
+                    };
+                };
+
+                m5io_hub_spi: spi {
+                    compatible = "m5stack,m5io-hub-spi";
+                    #address-cells = <1>;
+                    #size-cells = <0>;
+                    status = "disabled";
+                };
+            };
+
+            mmc-slot@1 {
+                compatible = "mmc-spi-slot";
+                reg = <1>;
+                spi-max-frequency = <20000000>;
+                voltage-ranges = <3300 3300>;
+                bus-width = <1>;
+                disable-wp;
+                cd-gpios = <&m5io_hub_gpio 13 GPIO_ACTIVE_LOW>;
+                status = "disabled";
+            };
+        };
+    };
+
+};
