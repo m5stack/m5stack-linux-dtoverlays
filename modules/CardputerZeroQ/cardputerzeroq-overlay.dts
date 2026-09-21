@@ -314,3 +314,68 @@
     };
 
 };
+
+/* JD9852 MIPI-DSI panel configuration. */
+/ {
+fragment@2 {
+    target-path = "/";
+
+    __overlay__ {
+        panel_avdd: regulator-panel-avdd {
+            compatible = "regulator-fixed";
+            regulator-name = "panel-avdd";
+            regulator-always-on;
+        };
+
+        panel_iovcc: regulator-panel-iovcc {
+            compatible = "regulator-fixed";
+            regulator-name = "panel-iovcc";
+            regulator-always-on;
+        };
+    };
+};
+
+fragment@3 {
+    target = <&mdp>;
+
+    __overlay__ {
+        status = "okay";
+    };
+};
+
+fragment@4 {
+    target = <&mdss_dsi0>;
+
+    __overlay__ {
+        vdda-supply = <&pm4125_l5>;
+        #address-cells = <1>;
+        #size-cells = <0>;
+        status = "okay";
+
+        panel@0 {
+            compatible = "elida,jd9852";
+            reg = <0>;
+            status = "okay";
+
+            iovcc-supply = <&panel_iovcc>;
+            vdd-supply = <&panel_avdd>;
+
+            port {
+                panel_in: endpoint {
+                    remote-endpoint = <&mdss_dsi0_out>;
+                };
+            };
+        };
+    };
+};
+
+fragment@5 {
+    target = <&mdss_dsi0_out>;
+
+    __overlay__ {
+        remote-endpoint = <&panel_in>;
+        data-lanes = <0>;
+    };
+};
+
+};

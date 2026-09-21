@@ -4,7 +4,8 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 
-/* Apply after spi0-m5io-hub-runtime.dtbo (or spi0-overlay.dtbo).
+/* Standalone keyboard fragment for use after the runtime M5IO overlay.
+ * The complete cardputerzeroq-overlay.dtbo already contains this node.
  * Linux adapter numbers are dynamic; m5io_i2c1 is m5io-hub-i2c1.
  */
 &m5io_i2c2 {

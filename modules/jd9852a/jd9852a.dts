@@ -6,6 +6,15 @@
 /dts-v1/;
 /plugin/;
 
+/* The ANX7625 HDMI/DP bridge and the JD9852 panel share dsi@5e94000.
+ * Only one DSI peripheral can exist at a time: disabling the bridge here
+ * avoids "kobject_add_internal failed ... -EEXIST / fail to create dsi
+ * device -17" when the panel DTB is the active one.
+ */
+&{/soc@0/geniqup@4ac0000/i2c@4a84000/encoder@58} {
+	status = "disabled";
+};
+
 &{/} {
 	panel_avdd: regulator-panel-avdd {
 		compatible = "regulator-fixed";

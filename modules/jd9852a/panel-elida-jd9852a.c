@@ -104,16 +104,17 @@ static void jd9852_init_sequence(struct mipi_dsi_multi_context *dsi_ctx)
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xde, 0x00);
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x20); /* NINV */
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x35); /* TE ON */
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x36, 0x00);
+	/* Rotate the panel scan direction to landscape (MV | MY). */
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x36, 0xa0);
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x3a, 0x66); /* RGB666 */
 
-	/* Column address: X = 35..204 */
+	/* Column address: X = 0..319 */
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x2a,
-					0x00, 0x23, 0x00, 0xcc);
-
-	/* Page address: Y = 0..319 */
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x2b,
 					0x00, 0x00, 0x01, 0x3f);
+
+	/* Page address: Y = 35..204 (the active 170-line window). */
+	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x2b,
+					0x00, 0x23, 0x00, 0xcc);
 
 }
 
@@ -190,16 +191,16 @@ disable_vdd:
 
 static const struct drm_display_mode default_mode = {
 	.clock = 8334,
-	.hdisplay = 170,
-	.hsync_start = 170 + 187,
-	.hsync_end = 170 + 187 + 28,
-	.htotal = 170 + 187 + 28 + 28,
-	.vdisplay = 320,
-	.vsync_start = 320 + 8,
-	.vsync_end = 320 + 8 + 2,
-	.vtotal = 320 + 8 + 2 + 6,
-	.width_mm = 22,
-	.height_mm = 42,
+	.hdisplay = 320,
+	.hsync_start = 320 + 8,
+	.hsync_end = 320 + 8 + 2,
+	.htotal = 320 + 8 + 2 + 6,
+	.vdisplay = 170,
+	.vsync_start = 170 + 187,
+	.vsync_end = 170 + 187 + 28,
+	.vtotal = 170 + 187 + 28 + 28,
+	.width_mm = 42,
+	.height_mm = 22,
 	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
 };
 
@@ -295,7 +296,7 @@ static int jd9852_probe(struct mipi_dsi_device *dsi)
 			  MIPI_DSI_CLOCK_NON_CONTINUOUS;
 
 	dev_info(dev,
-		 "DSI config: 170x320 lanes=%u format=%u hs_rate=%lu flags=0x%lx\n",
+		 "DSI config: 320x170 lanes=%u format=%u hs_rate=%lu flags=0x%lx\n",
 		 dsi->lanes, dsi->format, dsi->hs_rate, dsi->mode_flags);
 
 

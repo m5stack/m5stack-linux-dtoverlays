@@ -1,80 +1,38 @@
-ifneq ($(KERNELRELEASE),)
+KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+EXTRADIR ?= /lib/modules/$(shell uname -r)/extra
+ROOTFSPATH ?=
+PWD := $(CURDIR)
+ARCH ?= $(shell uname -m)
+CC ?= gcc
+CFLAGS ?= -O2 -Wall -Wextra
 
-obj-m := panel-elida-jd9852a.o
+Target_ko   := panel-elida-jd9852a
+Target_dts  := jd9852a
+Target_dtbo := $(addsuffix .dtbo,$(Target_dts))
 
-else
+# Module name
+obj-m += $(Target_ko).o
 
-KDIR ?= /lib/modules/$(shell uname -r)/build
-ARCH ?= arm64
-ifeq ($(shell uname -m),aarch64)
-CROSS_COMPILE ?=
-else
-CROSS_COMPILE ?= aarch64-linux-gnu-
-endif
-DTC ?= dtc
-PKG_CONFIG ?= pkg-config
-HOSTCC ?= cc
+all: $(Target_ko).ko $(Target_dtbo)
 
-MODULE := panel-elida-jd9852a.ko
-OVERLAY := jd9852a.dtbo
-COLOR_TEST := drm-color-test
-DRM_CFLAGS := $(shell $(PKG_CONFIG) --cflags libdrm 2>/dev/null)
-DRM_LIBS := $(shell $(PKG_CONFIG) --libs libdrm 2>/dev/null)
+$(Target_ko).ko: $(Target_ko).c
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) ARCH=$(ARCH) modules
 
-.PHONY: all module overlay color-test clean help check-kernel
+%.dtbo: %.dts
+	cpp -nostdinc -undef -x assembler-with-cpp $(DTS_CC_FLAGE) $< $<.tmp
+	dtc -@ -I dts -O dtb -o $@ $<.tmp
 
-all: module overlay
-
-module: check-kernel
-	$(MAKE) -C "$(KDIR)" M="$(CURDIR)" \
-		ARCH="$(ARCH)" CROSS_COMPILE="$(CROSS_COMPILE)" modules
-
-overlay: $(OVERLAY)
-
-color-test: $(COLOR_TEST)
-
-$(COLOR_TEST): drm-color-test.c
-	@test -n "$(DRM_LIBS)" || { \
-		echo "libdrm development files not found (install libdrm-dev)." >&2; \
-		exit 1; \
-	}
-	$(HOSTCC) $(CPPFLAGS) $(CFLAGS) $(DRM_CFLAGS) -O2 -Wall -Wextra \
-		-o $@ $< $(LDFLAGS) $(DRM_LIBS)
-
-$(OVERLAY): jd9852a.dts
-	$(DTC) -@ -I dts -O dtb -o $@ $<
-
-check-kernel:
-	@test -f "$(KDIR)/Makefile" || { \
-		echo "Kernel tree not found: $(KDIR)" >&2; \
-		echo "Set it with: make KDIR=/path/to/kernel" >&2; \
-		exit 1; \
-	}
-	@test -f "$(KDIR)/include/config/auto.conf" && \
-	 test -f "$(KDIR)/include/generated/autoconf.h" || { \
-		echo "Kernel build files are incomplete: $(KDIR)" >&2; \
-		echo "Install headers for the running kernel or prepare the kernel tree." >&2; \
-		exit 1; \
-	}
+color-test: drm-color-test.c
+	$(CC) $(CFLAGS) -o drm-color-test $< $(shell pkg-config --cflags --libs libdrm 2>/dev/null)
 
 clean:
-	$(MAKE) -C "$(KDIR)" M="$(CURDIR)" \
-		ARCH="$(ARCH)" CROSS_COMPILE="$(CROSS_COMPILE)" clean
-	$(RM) $(OVERLAY)
-	$(RM) $(COLOR_TEST)
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) ARCH=$(ARCH) clean
+	rm -f $(Target_dtbo) *.tmp drm-color-test
 
-help:
-	@echo "Targets:"
-	@echo "  all      Build $(MODULE) and $(OVERLAY) (default)"
-	@echo "  module   Build the panel kernel module"
-	@echo "  overlay  Build the device-tree overlay"
-	@echo "  color-test  Build the DRM/KMS color-bar test"
-	@echo "  clean    Remove generated files"
-	@echo ""
-	@echo "Variables:"
-	@echo "  KDIR=$(KDIR)"
-	@echo "  ARCH=$(ARCH)"
-	@echo "  CROSS_COMPILE=$(CROSS_COMPILE)"
-	@echo "  DTC=$(DTC)"
+install: all
+	mkdir -p $(ROOTFSPATH)$(EXTRADIR)
+	cp $(Target_ko).ko $(ROOTFSPATH)$(EXTRADIR)
+# 	cp $(Target_dtbo) $(ROOTFSPATH)/boot/firmware/overlays/
+	if [ "$(KERNELDIR)" = "/lib/modules/$(shell uname -r)/build" ] && [ -z "$(ROOTFSPATH)" ]; then depmod -a ; fi
 
-endif
+.PHONY: all clean install color-test

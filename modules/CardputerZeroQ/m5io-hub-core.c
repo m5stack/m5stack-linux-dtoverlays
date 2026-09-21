@@ -1,9 +1,9 @@
 /*
- * M5Stack M5IO-HUB MFD 核心驱动
+ * M5Stack M5IO-HUB 核心驱动
  *
  * 通过 SPI 与 M5IO-HUB 芯片通信，向上提供寄存器读写、RPC 事务调度
- * （TX/RX FIFO + 工作队列）以及 Arduino 风格的 GPIO 接口，并按 MFD
- * 框架注册 GPIO / UART / I2C / SPI 四个子设备。
+ * （TX/RX FIFO + 工作队列）以及 Arduino 风格的 GPIO 接口，并按设备树
+ * 注册 GPIO / UART / I2C / SPI 子设备。
  */
 
 #include <linux/bitops.h>
@@ -13,7 +13,6 @@
 #include <linux/irq.h>
 #include <linux/jiffies.h>
 #include <linux/kfifo.h>
-#include <linux/mfd/core.h>
 #include "m5io-hub.h"
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -1747,44 +1746,16 @@ static void m5io_hub_cancel_works(void *data) {
   cancel_work_sync(&mcore->gpio_irq_work);
 }
 
-/* -------------------------------------------------------------------------
- * MFD 子设备定义
- *
- * 与设备树 m5io-hub 节点下的子节点一一对应。
- * ------------------------------------------------------------------------- */
-static const struct mfd_cell m5io_hub_devs[] = {
-    {
-        .name = "m5io-hub-gpio",
-        .of_compatible = "m5stack,m5io-hub-gpio",
-    },
-    {
-        .name = "m5hub-gpio-leds",
-        .of_compatible = "m5hub-gpio-leds",
-    },
-    {
-        .name = "m5io-hub-uart",
-        .of_compatible = "m5stack,m5io-hub-uart",
-    },
-    {
-        .name = "m5io-hub-i2c",
-        .of_compatible = "m5stack,m5io-hub-i2c",
-    },
-    {
-        .name = "m5io-hub-spi",
-        .of_compatible = "m5stack,m5io-hub-spi",
-    },
-};
-
 /**
  * m5io_hub_probe - SPI 设备探测
  * @spi: 绑定到 m5io-hub 的 SPI 设备
  *
  * 分配并初始化核心上下文（RPC 槽位、RX/TX FIFO、等待队列），配置 SPI
- * 模式后申请线程化 IRQ，最后按 MFD 框架注册 GPIO、GPIO LEDs、UART、
- * I2C 和 SPI 子设备。资源均通过 devm 接口申请，unbind 时自动释放。
+ * 模式后申请线程化 IRQ，最后按设备树注册 GPIO、GPIO LEDs、UART、I2C
+ * 和 SPI 子设备。资源均通过 devm 接口申请，unbind 时自动释放。
  *
  * Return: 0 表示成功；负值为错误码（内存分配、spi_setup()、IRQ 申请或
- *         MFD 子设备注册失败）。
+ *         设备树子设备注册失败）。
  */
 static int m5io_hub_probe(struct spi_device *spi) {
   struct m5io_hub_core *mcore;
@@ -1863,7 +1834,7 @@ static int m5io_hub_probe(struct spi_device *spi) {
 
   spi_set_drvdata(spi, &mcore->hub);
 
-  /* Runs after MFD children and the devm IRQ have been removed. */
+  /* Runs after DT child devices and the devm IRQ have been removed. */
   ret = devm_add_action_or_reset(&spi->dev, m5io_hub_cancel_works, mcore);
   if (ret)
     return ret;
@@ -1899,14 +1870,10 @@ static int m5io_hub_probe(struct spi_device *spi) {
     dev_warn(&spi->dev, "no irq from DT, rpc irq sampling disabled\n");
   }
 
-  /* Populate only enabled DT children and let OF own their node references. */
-  if (spi->dev.of_node)
-    ret = devm_of_platform_populate(&spi->dev);
-  else
-    ret = devm_mfd_add_devices(&spi->dev, PLATFORM_DEVID_AUTO, m5io_hub_devs,
-                               ARRAY_SIZE(m5io_hub_devs), NULL, 0, NULL);
+  /* All child devices are described by enabled nodes in the device tree. */
+  ret = devm_of_platform_populate(&spi->dev);
   if (ret) {
-    dev_err(&spi->dev, "failed to add mfd devices: %d\n", ret);
+    dev_err(&spi->dev, "failed to populate DT child devices: %d\n", ret);
     return ret;
   }
 
@@ -1932,5 +1899,5 @@ static struct spi_driver m5io_hub_driver = {
 };
 module_spi_driver(m5io_hub_driver);
 
-MODULE_DESCRIPTION("M5Stack M5IO-HUB MFD core driver");
+MODULE_DESCRIPTION("M5Stack M5IO-HUB core driver");
 MODULE_LICENSE("GPL");
