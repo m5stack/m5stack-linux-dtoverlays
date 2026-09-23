@@ -57,6 +57,7 @@ struct panel_mipi_dbi_device {
     struct gpio_desc *te;		/* Optional TE pin */
     int te_irq;			/* IRQ number for TE */
     struct completion te_completion;/* Used to wait for the TE IRQ */
+    struct mutex display_lock;		/* Serialize reset and display transfers */
 };
 
 static inline struct panel_mipi_dbi_device *
@@ -258,6 +259,76 @@ static void panel_mipi_dbi_commands_execute(struct mipi_dbi *dbi,
     }
 }
 
+static int panel_mipi_dbi_reinitialize(struct panel_mipi_dbi_device *panel)
+{
+    struct mipi_dbi_dev *dbidev = &panel->dbidev;
+    struct mipi_dbi *dbi = &dbidev->dbi;
+    int ret;
+
+    /* Balance the temporary regulator references after initialization. */
+    ret = mipi_dbi_poweron_reset(dbidev);
+    if (ret)
+        return ret;
+
+    panel_mipi_dbi_commands_execute(dbi, dbidev->driver_private);
+
+    if (panel->te)
+        mipi_dbi_command(dbi, MIPI_DCS_SET_TEAR_ON,
+                 MIPI_DCS_TEAR_MODE_VBLANK);
+
+    if (dbidev->regulator)
+        regulator_disable(dbidev->regulator);
+    if (dbidev->io_regulator)
+        regulator_disable(dbidev->io_regulator);
+
+    return 0;
+}
+
+static ssize_t panel_mipi_dbi_reset_store(struct device *dev,
+                      struct device_attribute *attr,
+                      const char *buf, size_t count)
+{
+    struct spi_device *spi = to_spi_device(dev);
+    struct drm_device *drm = spi_get_drvdata(spi);
+    struct panel_mipi_dbi_device *panel;
+    unsigned int value;
+    int idx, ret;
+
+    ret = kstrtouint(buf, 0, &value);
+    if (ret)
+        return ret;
+
+    if (value != 1)
+        return -EINVAL;
+
+    if (!drm)
+        return -ENODEV;
+
+    panel = to_panel_mipi_dbi_device(drm_to_mipi_dbi_dev(drm));
+
+    if (!drm_dev_enter(drm, &idx))
+        return -ENODEV;
+
+    mutex_lock(&panel->display_lock);
+    ret = panel_mipi_dbi_reinitialize(panel);
+    mutex_unlock(&panel->display_lock);
+
+    drm_dev_exit(idx);
+
+    return ret ? ret : count;
+}
+
+static DEVICE_ATTR(reset, 0200, NULL, panel_mipi_dbi_reset_store);
+
+static struct attribute *panel_mipi_dbi_attrs[] = {
+    &dev_attr_reset.attr,
+    NULL,
+};
+
+static const struct attribute_group panel_mipi_dbi_attr_group = {
+    .attrs = panel_mipi_dbi_attrs,
+};
+
 /* TE interrupt handler: wake waiters when a TE signal arrives */
 static irqreturn_t panel_mipi_dbi_te_isr(int irq, void *data)
 {
@@ -301,6 +372,8 @@ static void panel_mipi_dbi_enable(struct drm_simple_display_pipe *pipe,
 
     drm_dbg(pipe->crtc.dev, "\n");
 
+    mutex_lock(&panel->display_lock);
+
     ret = mipi_dbi_poweron_conditional_reset(dbidev);
     if (ret < 0)
         goto out_exit;
@@ -314,6 +387,7 @@ static void panel_mipi_dbi_enable(struct drm_simple_display_pipe *pipe,
 
     mipi_dbi_enable_flush(dbidev, crtc_state, plane_state);
 out_exit:
+    mutex_unlock(&panel->display_lock);
     drm_dev_exit(idx);
 }
 
@@ -324,13 +398,26 @@ static void panel_mipi_dbi_pipe_update(struct drm_simple_display_pipe *pipe,
     struct mipi_dbi_dev *dbidev = drm_to_mipi_dbi_dev(pipe->crtc.dev);
     struct panel_mipi_dbi_device *panel = to_panel_mipi_dbi_device(dbidev);
 
+    mutex_lock(&panel->display_lock);
     panel_mipi_dbi_wait_for_te(panel);
 
     mipi_dbi_pipe_update(pipe, old_state);
+    mutex_unlock(&panel->display_lock);
+}
+
+static void panel_mipi_dbi_disable(struct drm_simple_display_pipe *pipe)
+{
+    struct mipi_dbi_dev *dbidev = drm_to_mipi_dbi_dev(pipe->crtc.dev);
+    struct panel_mipi_dbi_device *panel = to_panel_mipi_dbi_device(dbidev);
+
+    mutex_lock(&panel->display_lock);
+    mipi_dbi_pipe_disable(pipe);
+    mutex_unlock(&panel->display_lock);
 }
 
 static const struct drm_simple_display_pipe_funcs panel_mipi_dbi_pipe_funcs = {
     DRM_MIPI_DBI_SIMPLE_DISPLAY_PIPE_FUNCS(panel_mipi_dbi_enable),
+    .disable = panel_mipi_dbi_disable,
     .update = panel_mipi_dbi_pipe_update,
 };
 
@@ -409,6 +496,7 @@ static int panel_mipi_dbi_spi_probe(struct spi_device *spi)
     dbidev = &panel->dbidev;
     dbi = &dbidev->dbi;
     drm = &dbidev->drm;
+    mutex_init(&panel->display_lock);
 
     ret = panel_mipi_dbi_get_mode(dbidev, &mode);
     if (ret)
@@ -490,6 +578,13 @@ static int panel_mipi_dbi_spi_probe(struct spi_device *spi)
         return ret;
 
     spi_set_drvdata(spi, drm);
+
+    ret = devm_device_add_group(dev, &panel_mipi_dbi_attr_group);
+    if (ret) {
+        drm_dev_unplug(drm);
+        drm_atomic_helper_shutdown(drm);
+        return ret;
+    }
 
     if (bpp == 16)
         drm_client_setup_with_fourcc(drm, DRM_FORMAT_RGB565);
