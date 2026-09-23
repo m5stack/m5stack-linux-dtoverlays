@@ -9,7 +9,6 @@
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/gpio/consumer.h>
-#include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/property.h>
@@ -30,10 +29,16 @@
 #include <video/mipi_display.h>
 
 
+/*
+ * TE support is intentionally disabled for now. Keep these definitions here
+ * so TE can be enabled again when the panel wiring and timing are verified.
+ */
+#if 0
 #ifndef MIPI_DCS_SET_TEAR_ON
 #define MIPI_DCS_SET_TEAR_ON		0x35
 #endif
 #define MIPI_DCS_TEAR_MODE_VBLANK	0x00
+#endif
 
 
 struct panel_mipi_dbi_format {
@@ -47,16 +52,16 @@ static const struct panel_mipi_dbi_format panel_mipi_dbi_formats[] = {
     { "b6x2g6x2r6x2", DRM_FORMAT_RGB888, 24 },
 };
 
-/*
- * Wrapper structure: extends mipi_dbi_dev with TE (Tearing Effect) pin fields.
- * dbidev must be the first member so container_of can cast it safely.
- */
+/* dbidev must be the first member so container_of can cast it safely. */
 struct panel_mipi_dbi_device {
     struct mipi_dbi_dev dbidev;
 
-    struct gpio_desc *te;		/* Optional TE pin */
-    int te_irq;			/* IRQ number for TE */
-    struct completion te_completion;/* Used to wait for the TE IRQ */
+    /*
+     * TE support is intentionally disabled for now and may be enabled later.
+     * struct gpio_desc *te;
+     * int te_irq;
+     * struct completion te_completion;
+     */
     struct mutex display_lock;		/* Serialize reset and display transfers */
 };
 
@@ -272,9 +277,12 @@ static int panel_mipi_dbi_reinitialize(struct panel_mipi_dbi_device *panel)
 
     panel_mipi_dbi_commands_execute(dbi, dbidev->driver_private);
 
+    /* TE support is intentionally disabled; re-enable this with TE support. */
+    /*
     if (panel->te)
         mipi_dbi_command(dbi, MIPI_DCS_SET_TEAR_ON,
                  MIPI_DCS_TEAR_MODE_VBLANK);
+    */
 
     if (dbidev->regulator)
         regulator_disable(dbidev->regulator);
@@ -329,6 +337,11 @@ static const struct attribute_group panel_mipi_dbi_attr_group = {
     .attrs = panel_mipi_dbi_attrs,
 };
 
+/*
+ * TE support is intentionally disabled for now. Keep the handler and wait
+ * logic here for possible later re-enablement when TE timing is verified.
+ */
+#if 0
 /* TE interrupt handler: wake waiters when a TE signal arrives */
 static irqreturn_t panel_mipi_dbi_te_isr(int irq, void *data)
 {
@@ -357,6 +370,7 @@ static void panel_mipi_dbi_wait_for_te(struct panel_mipi_dbi_device *panel)
 
     disable_irq(panel->te_irq);
 }
+#endif
 
 static void panel_mipi_dbi_enable(struct drm_simple_display_pipe *pipe,
                   struct drm_crtc_state *crtc_state,
@@ -380,10 +394,12 @@ static void panel_mipi_dbi_enable(struct drm_simple_display_pipe *pipe,
     if (!ret)
         panel_mipi_dbi_commands_execute(dbi, dbidev->driver_private);
 
-    /* If a TE pin is present, enable the panel TE output in V-blank mode */
+    /* TE support is intentionally disabled; re-enable this with TE support. */
+    /*
     if (panel->te)
         mipi_dbi_command(dbi, MIPI_DCS_SET_TEAR_ON,
                  MIPI_DCS_TEAR_MODE_VBLANK);
+    */
 
     mipi_dbi_enable_flush(dbidev, crtc_state, plane_state);
 out_exit:
@@ -391,7 +407,7 @@ out_exit:
     drm_dev_exit(idx);
 }
 
-/* Custom update callback: wait for TE before flushing to avoid tearing */
+/* Update callback remains locked to serialize normal transfers with reset. */
 static void panel_mipi_dbi_pipe_update(struct drm_simple_display_pipe *pipe,
                        struct drm_plane_state *old_state)
 {
@@ -399,8 +415,6 @@ static void panel_mipi_dbi_pipe_update(struct drm_simple_display_pipe *pipe,
     struct panel_mipi_dbi_device *panel = to_panel_mipi_dbi_device(dbidev);
 
     mutex_lock(&panel->display_lock);
-    panel_mipi_dbi_wait_for_te(panel);
-
     mipi_dbi_pipe_update(pipe, old_state);
     mutex_unlock(&panel->display_lock);
 }
@@ -532,6 +546,11 @@ static int panel_mipi_dbi_spi_probe(struct spi_device *spi)
     if (device_property_present(dev, "write-only"))
         dbi->read_commands = NULL;
 
+    /*
+     * TE support is intentionally disabled for now. Keep GPIO and IRQ setup
+     * commented out so it can be enabled later after TE timing is verified.
+     */
+#if 0
     /* Get the optional TE pin and request its IRQ */
     panel->te = devm_gpiod_get_optional(dev, "te", GPIOD_IN);
     if (IS_ERR(panel->te))
@@ -555,6 +574,7 @@ static int panel_mipi_dbi_spi_probe(struct spi_device *spi)
         if (ret)
             return dev_err_probe(dev, ret, "Failed to request TE irq\n");
     }
+#endif
 
     dbidev->driver_private = panel_mipi_dbi_commands_from_fw(dev);
     if (IS_ERR(dbidev->driver_private))
