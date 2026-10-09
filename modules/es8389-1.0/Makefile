@@ -2,7 +2,7 @@ KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 EXTRADIR ?= /lib/modules/$(shell uname -r)/extra
 PWD := $(shell pwd)
 ARCH := $(shell uname -m)
-DTS_CC_FLAGE ?=
+DTS_CC_FLAGS ?=
 
 Target_ko := es8389_m5stack
 Target1_ko := simple-amplifier
@@ -17,7 +17,7 @@ kernel_module: $(Target_ko).c $(Target1_ko).c
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) ARCH=$(ARCH) modules
 
 $(Target_dts).dtbo: $(Target_dts).dts
-	cpp -nostdinc -undef -x assembler-with-cpp $(DTS_CC_FLAGE) $< $<.tmp
+	cpp -nostdinc -undef -x assembler-with-cpp $(DTS_CC_FLAGS) $< $<.tmp
 	dtc -@ -I dts -O dtb -o $@ $<.tmp
 
 clean:

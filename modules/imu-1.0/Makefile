@@ -5,27 +5,27 @@ PWD := $(CURDIR)
 ARCH ?= $(shell uname -m)
 
 
-kermel_module := magnetometer bmi270
-kermel_module_flage  := CONFIG_BMC150_MAGN=m CONFIG_BMC150_MAGN_BMI270=m CONFIG_BMI270=m CONFIG_BMI270_I2C=m
-kermel_ko     := 
-kermel_dtbo   := bmi270_bmm150_overlay.dtbo bmi270_overlay.dtbo
+kernel_module := magnetometer bmi270
+kernel_module_flags  := CONFIG_BMC150_MAGN=m CONFIG_BMC150_MAGN_BMI270=m CONFIG_BMI270=m CONFIG_BMI270_I2C=m
+kernel_ko     := 
+kernel_dtbo   := bmi270_bmm150_overlay.dtbo bmi270_overlay.dtbo
 
 
-define kermel_module_template
+define kernel_module_template
 $(1): $$(wildcard $(1)/*.c)
-	$$(kermel_module_flage) $$(MAKE) -C $$(KERNELDIR) M=$$(PWD)/$(1) ARCH=$$(ARCH) modules
+	$$(kernel_module_flags) $$(MAKE) -C $$(KERNELDIR) M=$$(PWD)/$(1) ARCH=$$(ARCH) modules
 	cp $$(PWD)/$(1)/*.ko ./
 endef
 
-$(foreach m,$(kermel_module),$(eval $(call kermel_module_template,$(m))))
+$(foreach m,$(kernel_module),$(eval $(call kernel_module_template,$(m))))
 
 
 %.dtbo: %.dts
-	cpp -nostdinc -undef -x assembler-with-cpp $(DTS_CC_FLAGE) $< $<.tmp
+	cpp -nostdinc -undef -x assembler-with-cpp $(DTS_CC_FLAGS) $< $<.tmp
 	dtc -@ -I dts -O dtb -o $@ $<.tmp
 
 
-all: $(kermel_module) $(kermel_dtbo)
+all: $(kernel_module) $(kernel_dtbo)
 
 
 clean:

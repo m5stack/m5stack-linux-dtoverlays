@@ -9,7 +9,7 @@ ARCH ?= $(shell uname -m)
 # endif
 
 
-kermel_ko := powerfail_suo.ko cardputerzero-audio.ko gpio-forwarder.ko
+kernel_ko := powerfail_suo.ko cardputerzero-audio.ko gpio-forwarder.ko
 
 # Multiple dts targets, separated by spaces; omit the .dts suffix
 Target_dts := cardputerzero-v5-overlay cardputerzero-v3-overlay spk-gpio24-high-overlay spi0-spidev2-gpio22-overlay camera-gpio16-high-overlay camera-py12-high-overlay mic-pyg4-high-overlay
@@ -17,20 +17,20 @@ Target_dts := cardputerzero-v5-overlay cardputerzero-v3-overlay spk-gpio24-high-
 Target_dtbo := $(addsuffix .dtbo,$(Target_dts))
 
 ifeq ($(CONFIG_CARDPUTERO_V0_5),y)
-DTS_CC_FLAGE := -DCONFIG_CARDPUTERO_V0_5=1
+DTS_CC_FLAGS := -DCONFIG_CARDPUTERO_V0_5=1
 export CONFIG_CARDPUTERO_V0_5
-export DTS_CC_FLAGE
+export DTS_CC_FLAGS
 endif
 
-obj-m += $(patsubst %.ko,%.o,$(kermel_ko))
+obj-m += $(patsubst %.ko,%.o,$(kernel_ko))
 
-all: $(Target_dtbo) kermel_ko_t
+all: $(Target_dtbo) kernel_ko_t
 
-kermel_ko_t: $(patsubst %.ko,%.c,$(kermel_ko))
+kernel_ko_t: $(patsubst %.ko,%.c,$(kernel_ko))
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) ARCH=$(ARCH) modules
 
 %.dtbo: %.dts
-	cpp -nostdinc -undef -x assembler-with-cpp $(DTS_CC_FLAGE) $< $<.tmp
+	cpp -nostdinc -undef -x assembler-with-cpp $(DTS_CC_FLAGS) $< $<.tmp
 	dtc -@ -I dts -O dtb -o $@ $<.tmp
 
 install_dts: $(Target_dtbo)

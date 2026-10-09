@@ -32,7 +32,7 @@ modules:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
 
 $(Target_dts).dtbo: $(Target_dts).dts
-	cpp -nostdinc -undef -x assembler-with-cpp $(DTS_CC_FLAGE) $< $<.tmp
+	cpp -nostdinc -undef -x assembler-with-cpp $(DTS_CC_FLAGS) $< $<.tmp
 	dtc -@ -I dts -O dtb -o $@ $<.tmp
 
 clean:

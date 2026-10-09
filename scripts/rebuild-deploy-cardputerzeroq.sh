@@ -63,7 +63,7 @@ while (($#)); do
 	esac
 done
 
-for command in adb make dtc fdtoverlay; do
+for command in adb make dtc fdtoverlay fdtget; do
 	command -v "$command" >/dev/null || die "missing host command: $command"
 done
 [[ -f "$KERNELDIR/Makefile" ]] || die "kernel source not found: $KERNELDIR"
@@ -123,15 +123,23 @@ make "${KERNEL_ARGS[@]}" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
 BASE_DTB="$KERNEL_TREE/arch/$ARCH/boot/dts/qcom/$BASE_DTB_NAME"
 VIDEO_DTBO="$KERNEL_TREE/arch/$ARCH/boot/dts/qcom/$VIDEO_DTBO_NAME"
 CARDPUTER_DTBO="$CARDPUTER_DIR/cardputerzeroq-overlay.dtbo"
+JD9852_DTBO="$JD9852_DIR/jd9852a.dtbo"
 MERGED_VIDEO="$BUILD_DIR/qrb2210-arduino-imola-video.dtb"
+MERGED_CARDPUTER="$BUILD_DIR/qrb2210-arduino-imola-cardputerzeroq-unfiltered.dtb"
 FINAL_DTB="$BUILD_DIR/$FINAL_DTB_NAME"
 
 [[ -f "$BASE_DTB" ]] || die "base DTB was not built: $BASE_DTB"
 [[ -f "$VIDEO_DTBO" ]] || die "video overlay was not built: $VIDEO_DTBO"
 [[ -f "$CARDPUTER_DTBO" ]] || die "CardputerZeroQ overlay was not built: $CARDPUTER_DTBO"
+[[ -f "$JD9852_DTBO" ]] || die "JD9852 overlay was not built: $JD9852_DTBO"
 
 fdtoverlay -i "$BASE_DTB" -o "$MERGED_VIDEO" "$VIDEO_DTBO"
-fdtoverlay -i "$MERGED_VIDEO" -o "$FINAL_DTB" "$CARDPUTER_DTBO"
+fdtoverlay -i "$MERGED_VIDEO" -o "$MERGED_CARDPUTER" "$CARDPUTER_DTBO"
+
+# The Cardputer overlay adds the JD9852 panel, while jd9852a.dtbo disables
+# the stock ANX7625 bridge. Both share dsi@5e94000, so the latter must be
+# applied to the final DTB before it is installed.
+fdtoverlay -i "$MERGED_CARDPUTER" -o "$FINAL_DTB" "$JD9852_DTBO"
 
 strings "$FINAL_DTB" > "$BUILD_DIR/final-dtb.strings"
 if ! grep -Fq 'elida,jd9852' "$BUILD_DIR/final-dtb.strings"; then
@@ -139,6 +147,19 @@ if ! grep -Fq 'elida,jd9852' "$BUILD_DIR/final-dtb.strings"; then
 fi
 if ! grep -Fq 'm5stack,m5io-hub' "$BUILD_DIR/final-dtb.strings"; then
 	die "merged DTB does not contain the M5IO-HUB node"
+fi
+dtc -I dtb -O dts -o "$BUILD_DIR/final-dtb.dts" "$FINAL_DTB"
+ANX7625_PATH='/soc@0/geniqup@4ac0000/i2c@4a84000/encoder@58'
+if [[ "$(fdtget "$FINAL_DTB" "$ANX7625_PATH" status 2>/dev/null || true)" != "disabled" ]]; then
+	die "merged DTB leaves the ANX7625 bridge enabled; it conflicts with JD9852 on dsi@5e94000"
+fi
+awk '
+/i2c@4a80000[[:space:]]*\{/ { in_i2c = 1 }
+in_i2c { print }
+in_i2c && /};/ { exit }
+' "$BUILD_DIR/final-dtb.dts" > "$BUILD_DIR/qup0-i2c.dts"
+if ! grep -Fq 'status = "disabled";' "$BUILD_DIR/qup0-i2c.dts"; then
+	die "merged DTB leaves physical QUP0 I2C enabled"
 fi
 
 cp "$JD9852_DIR/panel-elida-jd9852a.ko" "$BUILD_DIR/"
