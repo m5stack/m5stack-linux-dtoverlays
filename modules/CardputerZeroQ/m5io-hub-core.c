@@ -191,7 +191,6 @@ struct m5_rpc_i2c {
   unsigned int rx_len;
   u8 rx[M5_RPC_DATA_MAX_PLEN];
   int error;
-  bool faulted;
 };
 
 struct m5io_hub_core {
@@ -473,6 +472,9 @@ static void m5_rpc_token_done_cb(struct m5io_hub_core *mcore, int tid,
   if (!mcore || tid < 0 || tid >= M5IO_HUB_RPC_TID_NR)
     return;
 
+  if (mcore->rpc.token.expected_func[tid] == M5IO_HUB_FUNC_I2C)
+    pr_info("m5io-hub-core: i2c token complete tid=%d status=%d\n",
+            tid, status);
   mcore->rpc.token.status[tid] = status;
   complete(&mcore->rpc.token.done[tid]);
 }
@@ -625,6 +627,9 @@ static void m5_rpc_token_rx_dispatch(struct m5io_hub_core *mcore, const u8 *buf,
     return;
 
   if (matched) {
+    if (func == M5IO_HUB_FUNC_I2C)
+      pr_info("m5io-hub-core: i2c TOKEN rx tid=%d arg=%u len=%u status=%d\n",
+              tid, arg, payload_len, status);
     return;
   }
 
@@ -766,19 +771,37 @@ static void m5_rpc_i2c_data_rx(struct m5io_hub_core *mcore,
                               const struct m5_rpc_data_frame *frame) {
   struct m5_rpc_i2c *i2c = &mcore->i2c;
   unsigned long flags;
+  bool accepted = false;
+  int error = 0;
+  int tid;
+  u8 chn;
+  unsigned int expected_len;
 
   spin_lock_irqsave(&mcore->rpc.token.state_lock, flags);
+  tid = i2c->tid;
+  chn = i2c->chn;
+  expected_len = i2c->expected_len;
   if (i2c->tid >= 0 && mcore->rpc.token.waiting[i2c->tid]) {
     if (m5_rpc_data_tid(frame) || m5_rpc_data_chn(frame) != i2c->chn ||
         !i2c->expected_len || m5_rpc_data_len(frame) != i2c->expected_len ||
         i2c->rx_len) {
       i2c->error = -EPROTO;
+      error = i2c->error;
     } else {
       memcpy(i2c->rx, frame->data, i2c->expected_len);
       i2c->rx_len = i2c->expected_len;
+      accepted = true;
     }
   }
   spin_unlock_irqrestore(&mcore->rpc.token.state_lock, flags);
+
+  if (accepted)
+    pr_info("m5io-hub-core: i2c DATA rx tid=%d chn=%u len=%u\n",
+            tid, chn, expected_len);
+  else
+    pr_info("m5io-hub-core: i2c DATA rx rejected tid=%d chn=%u len=%u expected=%u error=%d\n",
+            tid, m5_rpc_data_chn(frame), m5_rpc_data_len(frame),
+            expected_len, error);
 }
 
 /**
@@ -1119,6 +1142,7 @@ static int m5io_hub_rpc_transaction(struct m5io_hub_core *mcore) {
   unsigned int rx_needed = 0;
   int tx_len;
   unsigned int xfer_len;
+  bool i2c_token;
   bool slave_empty;
   u8 *tx_buf;
   u8 *rx_buf;
@@ -1166,7 +1190,17 @@ static int m5io_hub_rpc_transaction(struct m5io_hub_core *mcore) {
     transfer.rx_buf = rx_buf;
     transfer.len = xfer_len;
 
+    i2c_token = tx_len >= M5_RPC_TOKEN_HDR_LEN &&
+                !(tx_buf[0] & M5_RPC_TOKEN_TYPE_MASK) &&
+                ((tx_buf[0] >> M5_RPC_TOKEN_FUNC_SHIFT) &
+                 M5_RPC_TOKEN_FUNC_MASK) == M5IO_HUB_FUNC_I2C;
+    if (i2c_token)
+      pr_info("m5io-hub-core: SPI I2C TOKEN tx_len=%d xfer_len=%u\n",
+              tx_len, xfer_len);
+
     ret = spi_sync_transfer(mcore->hub.spi, &transfer, 1);
+    if (i2c_token)
+      pr_info("m5io-hub-core: SPI I2C TOKEN transfer ret=%d\n", ret);
     if (ret)
       break;
 
@@ -1400,8 +1434,8 @@ static int m5io_hub_check_pin(unsigned int pin) {
  *
  * Context: sleepable; never call from a DATA/GPIO event callback.
  * Return: 0 on terminal success, a mapped firmware error, or a transport error.
- * I2C timeouts/protocol failures block further I2C requests with -EPIPE.
- * Reset the peer and reprobe the core to recover: PID=0 cannot identify late DATA.
+ * An I2C timeout or protocol failure applies to the current request only;
+ * subsequent requests are allowed to use the bus normally.
  */
 int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
   struct m5io_hub_core *mcore;
@@ -1425,6 +1459,10 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
     return -EINVAL;
 
   is_i2c = request->func == M5IO_HUB_FUNC_I2C;
+  if (is_i2c)
+    pr_info("m5io-hub-core: exec start arg=%u payload_len=%u data_chn=%u data_tx=%u data_rx=%u data_len=%u\n",
+            request->arg, request->payload_len, request->data_chn,
+            !!request->data_tx, !!request->data_rx, request->data_len);
   if (request->data_len) {
     if (!is_i2c || request->data_len > M5_RPC_DATA_MAX_PLEN ||
         request->data_chn < M5_RPC_CHN_IIC1 ||
@@ -1440,16 +1478,13 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
   mcore = container_of(hub, struct m5io_hub_core, hub);
   if (is_i2c) {
     mutex_lock(&mcore->i2c.lock);
-    /* No DATA transaction ID exists to distinguish a late reply after timeout. */
-    if (mcore->i2c.faulted) {
-      ret = -EPIPE;
-      goto out_unlock;
-    }
   }
 
   tid_lock = token_tid_alloc(mcore, m5_rpc_token_done_cb, request->func);
 
   tid = tid_lock - mcore->rpc.token.tid_lock;
+  if (is_i2c)
+    pr_info("m5io-hub-core: i2c TID allocated tid=%u\n", tid);
   if (is_i2c) {
     spin_lock_irqsave(&mcore->rpc.token.state_lock, flags);
     mcore->i2c.tid = tid;
@@ -1475,6 +1510,9 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
   }
   /* Reserve TOKEN+DATA together; the worker still sends one frame per NSS. */
   ret = m5_rpc_frame_put(mcore, tx_buf, tx_len);
+  if (is_i2c)
+    pr_info("m5io-hub-core: i2c frame queued tid=%u tx_len=%u ret=%d\n",
+            tid, tx_len, ret);
   if (ret)
     goto out_free;
 
@@ -1494,10 +1532,13 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
       ret = -EPROTO;
     if (!ret && request->data_rx)
       memcpy(request->data_rx, mcore->i2c.rx, request->data_len);
-    if (ret == -ETIMEDOUT || ret == -EPROTO)
-      mcore->i2c.faulted = true;
   }
   spin_unlock_irqrestore(&mcore->rpc.token.state_lock, flags);
+
+  if (is_i2c)
+    pr_info("m5io-hub-core: exec wait done tid=%u ret=%d status=%#x reply_len=%u rx_len=%u error=%d\n",
+            tid, ret, request->status, request->reply_len,
+            mcore->i2c.rx_len, mcore->i2c.error);
 
 out_free:
   if (is_i2c) {
@@ -1506,9 +1547,10 @@ out_free:
     spin_unlock_irqrestore(&mcore->rpc.token.state_lock, flags);
   }
   token_tid_free(mcore, tid_lock);
-out_unlock:
   if (is_i2c)
     mutex_unlock(&mcore->i2c.lock);
+  if (is_i2c)
+    pr_info("m5io-hub-core: exec end ret=%d\n", ret);
   return ret;
 }
 EXPORT_SYMBOL_GPL(m5io_hub_exec);

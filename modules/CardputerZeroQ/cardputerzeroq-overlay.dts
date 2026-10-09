@@ -313,6 +313,17 @@
         };
     };
 
+    /* QUP0 is wired as SPI0 above. Its alternate GENI I2C node would
+     * request the same GPIO0/GPIO1 pins and fail probe; M5IO I2C is
+     * provided virtually by m5io-hub-i2c on top of SPI. */
+    fragment@6 {
+        target = <&i2c0>;
+
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+
 };
 
 /* JD9852 MIPI-DSI panel configuration. */

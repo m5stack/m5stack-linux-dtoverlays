@@ -608,12 +608,25 @@ static void check_failed_read(struct kunit *test, int error)
     struct m5io_test_state *s = test->priv;
     u8 buf[16], expected[16];
     struct i2c_msg msg = { .addr = 0x50, .len = 16, .buf = buf, .flags = I2C_M_RD };
+    unsigned int i;
 
     memset(buf, 0xa5, sizeof(buf));
     memset(expected, 0xa5, sizeof(expected));
     KUNIT_EXPECT_EQ(test, test_xfer(s, 1, &msg, 1), error);
     KUNIT_EXPECT_MEMEQ(test, buf, expected, sizeof(buf));
-    KUNIT_EXPECT_EQ(test, test_xfer(s, 2, &msg, 1), -EPIPE);
+
+    /* A single failed transaction must not permanently disable the bridge. */
+    s->drop_token = false;
+    s->drop_data = false;
+    s->corrupt_data = false;
+    s->wrong_pid = false;
+    s->wrong_bus = false;
+    s->duplicate_data = false;
+    memset(buf, 0xa5, sizeof(buf));
+    KUNIT_EXPECT_EQ(test, test_xfer(s, 2, &msg, 1), 1);
+    for (i = 0; i < ARRAY_SIZE(buf); i++)
+        expected[i] = read_pattern(2, i);
+    KUNIT_EXPECT_MEMEQ(test, buf, expected, sizeof(buf));
 }
 
 static void m5io_missing_data(struct kunit *test)
