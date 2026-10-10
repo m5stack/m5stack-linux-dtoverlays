@@ -3,6 +3,9 @@ EXTRADIR ?= /lib/modules/$(shell uname -r)/extra
 ROOTFSPATH ?=
 PWD := $(shell pwd)
 ARCH := $(shell uname -m)
+ifeq ($(ARCH),aarch64)
+ARCH = arm64
+endif
 Target_ko := tca8418_keypad_m5stack
 Target_dts := tca8418_m5stack
 # Module name

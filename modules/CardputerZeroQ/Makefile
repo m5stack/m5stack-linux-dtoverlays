@@ -4,6 +4,11 @@ obj-m += m5io-hub-gpio.o
 obj-m += m5hub-gpio-leds.o
 obj-m += m5io-hub-i2c.o
 
+# M5IO-HUB detailed debug logging.
+# 0 = off (default), 1 = on. Enable with: make M5IO_HUB_DEBUG=1
+M5IO_HUB_DEBUG ?= 0
+ccflags-y += -DM5IO_HUB_DEBUG=$(M5IO_HUB_DEBUG)
+
 KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 KERNEL_OUT ?=
 EXTRADIR ?= /lib/modules/$(shell uname -r)/extra/m5io
@@ -11,6 +16,9 @@ ROOTFSPATH ?=
 OVERLAYDIR ?= $(ROOTFSPATH)/boot/firmware/overlays
 ARCH ?= $(shell uname -m)
 ifeq ($(ARCH),aarch64)
+ARCH = arm64
+endif
+ifeq ($(ARCH),arm64)
 CROSS_COMPILE ?=
 else
 CROSS_COMPILE ?= aarch64-linux-gnu-

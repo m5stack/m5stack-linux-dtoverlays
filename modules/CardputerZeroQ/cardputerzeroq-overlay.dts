@@ -324,6 +324,15 @@
         };
     };
 
+    /* JD9852 replaces the stock ANX7625 bridge on the same DSI host. */
+    fragment@7 {
+        target-path = "/soc@0/geniqup@4ac0000/i2c@4a84000/encoder@58";
+
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+
 };
 
 /* JD9852 MIPI-DSI panel configuration. */
@@ -342,6 +351,12 @@ fragment@2 {
             compatible = "regulator-fixed";
             regulator-name = "panel-iovcc";
             regulator-always-on;
+        };
+        panel_cam0: cam0-pwr {
+            compatible = "regulator-fixed";
+            regulator-name = "cam0-pwr";
+            regulator-always-on;
+            regulator-boot-on;
         };
     };
 };
@@ -388,5 +403,79 @@ fragment@5 {
         data-lanes = <0>;
     };
 };
+
+};
+
+/* cam MIPI-CSI configuration. */
+/ {
+
+    fragment@8 {
+        target = <&cci>;
+
+        __overlay__ {
+            status = "okay";
+        };
+    };
+
+    fragment@9 {
+        target = <&camss>;
+
+        __overlay__ {
+            status = "okay";
+			ports {
+				#address-cells = <0x01>;
+				#size-cells = <0x00>;
+
+				port@0 {
+					reg = <0x00>;
+					m5csiphy0_in: endpoint {
+						remote-endpoint = <&m5csiphy0_out>;
+						data-lanes = <0 1 2 3>;
+					};
+				};
+			};
+        };
+    };
+
+
+    fragment@10 {
+        target = <&cci_i2c0>;
+
+        __overlay__ {
+            status = "okay";
+
+            sensor@10 {
+                compatible = "sony,imx219";
+                reg = <0x10>;
+                
+                /* 电源 */
+                VANA-supply = <&panel_cam0>;
+                VDIG-supply = <&panel_cam0>;
+                VDDL-supply = <&panel_cam0>;
+                
+                /* 时钟配置：务必使用正确的 ID */
+                clocks = <&gcc 0x25>;              /* GCC（phandle），MCLK0_CLK (37) */
+                clock-names = "xclk";
+                assigned-clocks = <&gcc 0x26>;     /* GCC, MCLK0_CLK_SRC (38) */
+                assigned-clock-rates = <24000000>; /* 24 MHz */
+                
+                /* CSI-2 端口 */
+                port {
+                    
+                    m5csiphy0_out: endpoint {
+                        remote-endpoint = <&m5csiphy0_in>;  /* 链接到 csiphy0 */
+                        data-lanes = <0 1 2 3>;
+                        clock-lanes = <0>;
+                        link-frequencies = <0x00 0x1b2e0200>; /* 456 MHz */
+                    };
+                };
+            };
+
+        };
+    };
+
+
+
+
 
 };

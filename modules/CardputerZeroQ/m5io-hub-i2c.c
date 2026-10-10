@@ -32,43 +32,43 @@ static int m5io_hub_i2c_xfer(struct i2c_adapter *adap,
     int i, ret;
 
     if (!bus || !bus->hub) {
-        pr_info("m5io-hub-i2c: xfer without bus/hub adap=%s num=%d\n",
+        m5io_dbg("m5io-hub-i2c: xfer without bus/hub adap=%s num=%d\n",
                 adap ? adap->name : "<null>", num);
         return -ENODEV;
     }
-    pr_info("m5io-hub-i2c: xfer start bus=%u num=%d\n", bus->bus, num);
+    m5io_dbg("m5io-hub-i2c: xfer start bus=%u num=%d\n", bus->bus, num);
 
     /* Validate the whole vector before sending. A repeated START is available
      * only for a 1/2-byte write followed by a read of the same address.
      */
     if (!msgs || num < 1 || num > 2) {
-        pr_info("m5io-hub-i2c: reject invalid vector bus=%u msgs=%p num=%d\n",
+        m5io_dbg("m5io-hub-i2c: reject invalid vector bus=%u msgs=%p num=%d\n",
                 bus->bus, msgs, num);
         return -EOPNOTSUPP;
     }
     for (i = 0; i < num; i++) {
         if (msgs[i].flags & ~(I2C_M_RD | I2C_M_DMA_SAFE)) {
-            pr_info("m5io-hub-i2c: reject flags bus=%u msg=%d flags=%#x\n",
+            m5io_dbg("m5io-hub-i2c: reject flags bus=%u msg=%d flags=%#x\n",
                     bus->bus, i, msgs[i].flags);
             return -EOPNOTSUPP;
         }
         if (msgs[i].addr < 0x08 || msgs[i].addr > 0x77) {
-            pr_info("m5io-hub-i2c: reject address bus=%u msg=%d addr=%#x\n",
+            m5io_dbg("m5io-hub-i2c: reject address bus=%u msg=%d addr=%#x\n",
                     bus->bus, i, msgs[i].addr);
             return -EINVAL;
         }
         if (msgs[i].len > M5IO_HUB_DATA_PAYLOAD_MAX) {
-            pr_info("m5io-hub-i2c: reject length bus=%u msg=%d len=%u\n",
+            m5io_dbg("m5io-hub-i2c: reject length bus=%u msg=%d len=%u\n",
                     bus->bus, i, msgs[i].len);
             return -EOPNOTSUPP;
         }
         if (msgs[i].len && !msgs[i].buf) {
-            pr_info("m5io-hub-i2c: reject null buffer bus=%u msg=%d len=%u\n",
+            m5io_dbg("m5io-hub-i2c: reject null buffer bus=%u msg=%d len=%u\n",
                     bus->bus, i, msgs[i].len);
             return -EINVAL;
         }
         if (!msgs[i].len && (msgs[i].flags & I2C_M_RD)) {
-            pr_info("m5io-hub-i2c: reject zero read bus=%u msg=%d\n",
+            m5io_dbg("m5io-hub-i2c: reject zero read bus=%u msg=%d\n",
                     bus->bus, i);
             return -EOPNOTSUPP;
         }
@@ -77,7 +77,7 @@ static int m5io_hub_i2c_xfer(struct i2c_adapter *adap,
                     !(msgs[1].flags & I2C_M_RD) ||
                     msgs[0].addr != msgs[1].addr ||
                     msgs[0].len < 1 || msgs[0].len > 2)) {
-        pr_info("m5io-hub-i2c: reject combined transfer bus=%u addr=%#x wlen=%u rlen=%u\n",
+        m5io_dbg("m5io-hub-i2c: reject combined transfer bus=%u addr=%#x wlen=%u rlen=%u\n",
                 bus->bus, msgs[0].addr, msgs[0].len, msgs[1].len);
         return -EOPNOTSUPP;
     }
@@ -117,41 +117,41 @@ static int m5io_hub_i2c_xfer(struct i2c_adapter *adap,
         request.payload_len += msg->len;
     }
 
-    pr_info("m5io-hub-i2c: request bus=%u addr=%#x arg=%u num=%d len=%u payload=%u rx=%u tx=%u\n",
+    m5io_dbg("m5io-hub-i2c: request bus=%u addr=%#x arg=%u num=%d len=%u payload=%u rx=%u tx=%u\n",
             bus->bus, msg->addr, request.arg, num, msg->len,
             request.payload_len, !!request.data_rx, !!request.data_tx);
 
     ret = m5io_hub_exec(bus->hub, &request);
-    pr_info("m5io-hub-i2c: exec done bus=%u addr=%#x arg=%u ret=%d status=%#x reply_len=%u data_len=%u\n",
+    m5io_dbg("m5io-hub-i2c: exec done bus=%u addr=%#x arg=%u ret=%d status=%#x reply_len=%u data_len=%u\n",
             bus->bus, msg->addr, request.arg, ret, request.status,
             request.reply_len, request.data_len);
     if (ret)
         return ret;
     if (request.arg == M5IO_I2C_DETECT) {
         if (request.reply_len != 1 || request.reply[0] > 1) {
-            pr_info("m5io-hub-i2c: detect protocol error bus=%u reply_len=%u value=%#x\n",
+            m5io_dbg("m5io-hub-i2c: detect protocol error bus=%u reply_len=%u value=%#x\n",
                     bus->bus, request.reply_len,
                     request.reply_len ? request.reply[0] : 0);
             return -EPROTO;
         }
         if (!request.reply[0]) {
-            pr_info("m5io-hub-i2c: detect no device bus=%u addr=%#x\n",
+            m5io_dbg("m5io-hub-i2c: detect no device bus=%u addr=%#x\n",
                     bus->bus, msg->addr);
             return -ENXIO;
         }
     } else if ((msg->flags & I2C_M_RD) && !request.data_rx) {
         if (request.reply_len != msg->len) {
-            pr_info("m5io-hub-i2c: read protocol error bus=%u expected=%u got=%u\n",
+            m5io_dbg("m5io-hub-i2c: read protocol error bus=%u expected=%u got=%u\n",
                     bus->bus, msg->len, request.reply_len);
             return -EPROTO;
         }
         memcpy(msg->buf, request.reply, msg->len);
     } else if (request.reply_len) {
-        pr_info("m5io-hub-i2c: unexpected reply bus=%u arg=%u reply_len=%u\n",
+        m5io_dbg("m5io-hub-i2c: unexpected reply bus=%u arg=%u reply_len=%u\n",
                 bus->bus, request.arg, request.reply_len);
         return -EPROTO;
     }
-    pr_info("m5io-hub-i2c: xfer success bus=%u addr=%#x num=%d\n",
+    m5io_dbg("m5io-hub-i2c: xfer success bus=%u addr=%#x num=%d\n",
             bus->bus, msg->addr, num);
     return num;
 }
@@ -196,21 +196,21 @@ static int m5io_hub_i2c_add_bus(struct platform_device *pdev,
     u32 frequency = I2C_MAX_STANDARD_MODE_FREQ;
     int ret;
 
-    pr_info("m5io-hub-i2c: add bus=%u node=%p\n", id, node);
+    m5io_dbg("m5io-hub-i2c: add bus=%u node=%p\n", id, node);
 
     if (node && of_find_property(node, "clock-frequency", NULL)) {
         ret = of_property_read_u32(node, "clock-frequency", &frequency);
         if (ret) {
-            pr_info("m5io-hub-i2c: bus=%u clock-frequency read failed ret=%d\n",
+            m5io_dbg("m5io-hub-i2c: bus=%u clock-frequency read failed ret=%d\n",
                     id, ret);
             return ret;
         }
     }
-    pr_info("m5io-hub-i2c: bus=%u requested frequency=%u\n", id, frequency);
+    m5io_dbg("m5io-hub-i2c: bus=%u requested frequency=%u\n", id, frequency);
     if (frequency == I2C_MAX_FAST_MODE_FREQ)
         payload[1] = 1;
     else if (frequency != I2C_MAX_STANDARD_MODE_FREQ) {
-        pr_info("m5io-hub-i2c: bus=%u unsupported frequency=%u\n", id,
+        m5io_dbg("m5io-hub-i2c: bus=%u unsupported frequency=%u\n", id,
                 frequency);
         return dev_err_probe(&pdev->dev, -EINVAL,
                              "I2C%u supports only 100/400 kHz\n", id);
@@ -219,12 +219,12 @@ static int m5io_hub_i2c_add_bus(struct platform_device *pdev,
     bus->hub = dev_get_drvdata(pdev->dev.parent);
     bus->bus = id;
     ret = m5io_hub_exec(bus->hub, &request);
-    pr_info("m5io-hub-i2c: bus=%u config exec ret=%d reply_len=%u\n",
+    m5io_dbg("m5io-hub-i2c: bus=%u config exec ret=%d reply_len=%u\n",
             id, ret, request.reply_len);
     if (ret)
         return dev_err_probe(&pdev->dev, ret, "I2C%u configuration failed\n", id);
     if (request.reply_len) {
-        pr_info("m5io-hub-i2c: bus=%u config unexpected reply_len=%u\n",
+        m5io_dbg("m5io-hub-i2c: bus=%u config unexpected reply_len=%u\n",
                 id, request.reply_len);
         return -EPROTO;
     }
@@ -258,17 +258,17 @@ static int m5io_hub_i2c_probe(struct platform_device *pdev)
     unsigned int id;
     int ret;
 
-    pr_info("m5io-hub-i2c: probe start device=%s\n", dev_name(&pdev->dev));
+    m5io_dbg("m5io-hub-i2c: probe start device=%s\n", dev_name(&pdev->dev));
 
     if (!dev_get_drvdata(pdev->dev.parent)) {
-        pr_info("m5io-hub-i2c: probe parent drvdata missing\n");
+        m5io_dbg("m5io-hub-i2c: probe parent drvdata missing\n");
         return -ENODEV;
     }
     mi = devm_kzalloc(&pdev->dev, sizeof(*mi), GFP_KERNEL);
     if (!mi)
         return -ENOMEM;
 
-    pr_info("m5io-hub-i2c: probe child_count=%d\n",
+    m5io_dbg("m5io-hub-i2c: probe child_count=%d\n",
             of_get_child_count(pdev->dev.of_node));
 
     if (of_get_child_count(pdev->dev.of_node)) {
@@ -276,12 +276,12 @@ static int m5io_hub_i2c_probe(struct platform_device *pdev)
             ret = of_property_read_u32(node, "reg", &id);
             if (ret || id < 1 || id > M5IO_I2C_BUSES ||
                 test_and_set_bit(id - 1, &enabled)) {
-                pr_info("m5io-hub-i2c: invalid child reg id=%u ret=%d\n",
+                m5io_dbg("m5io-hub-i2c: invalid child reg id=%u ret=%d\n",
                         id, ret);
                 return -EINVAL;
             }
             ret = m5io_hub_i2c_add_bus(pdev, &mi->buses[id - 1], id, node);
-            pr_info("m5io-hub-i2c: bus=%u add result=%d\n", id, ret);
+            m5io_dbg("m5io-hub-i2c: bus=%u add result=%d\n", id, ret);
             /* Some M5IO-HUB firmware/boards expose only one MCU I2C bus.
              * Keep available DT-declared buses usable when another bus
              * rejects its CONFIG request, while still failing hard for
@@ -308,7 +308,7 @@ static int m5io_hub_i2c_probe(struct platform_device *pdev)
         }
     }
     platform_set_drvdata(pdev, mi);
-    pr_info("m5io-hub-i2c: probe complete enabled=%#lx registered=%#lx\n",
+    m5io_dbg("m5io-hub-i2c: probe complete enabled=%#lx registered=%#lx\n",
             enabled, registered);
     return 0;
 }

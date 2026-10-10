@@ -3,6 +3,10 @@ EXTRADIR ?= /lib/modules/$(shell uname -r)/extra
 ROOTFSPATH ?=
 PWD := $(CURDIR)
 ARCH ?= $(shell uname -m)
+ifeq ($(ARCH),aarch64)
+ARCH = arm64
+endif
+
 CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra
 

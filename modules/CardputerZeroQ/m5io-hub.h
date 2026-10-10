@@ -5,6 +5,26 @@
 #include <linux/mutex.h>
 #include <linux/kfifo.h>
 #include <linux/serial_core.h>
+#include <linux/printk.h>
+
+/*
+ * M5IO-HUB detailed debug logging switch.
+ *
+ * 0 (default): all per-transfer trace logging is compiled out, so the
+ *              drivers stay quiet in dmesg during normal operation.
+ * 1:           verbose trace logging, identical to the previous behaviour.
+ *
+ * Override at build time with: make M5IO_HUB_DEBUG=1
+ */
+#ifndef M5IO_HUB_DEBUG
+#define M5IO_HUB_DEBUG 0
+#endif
+
+#if M5IO_HUB_DEBUG
+#define m5io_dbg(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
+#else
+#define m5io_dbg(fmt, ...) no_printk(fmt, ##__VA_ARGS__)
+#endif
 
 #define M5IO_HUB_NGPIO          17
 

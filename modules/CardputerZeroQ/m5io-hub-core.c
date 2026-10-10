@@ -473,7 +473,7 @@ static void m5_rpc_token_done_cb(struct m5io_hub_core *mcore, int tid,
     return;
 
   if (mcore->rpc.token.expected_func[tid] == M5IO_HUB_FUNC_I2C)
-    pr_info("m5io-hub-core: i2c token complete tid=%d status=%d\n",
+    m5io_dbg("m5io-hub-core: i2c token complete tid=%d status=%d\n",
             tid, status);
   mcore->rpc.token.status[tid] = status;
   complete(&mcore->rpc.token.done[tid]);
@@ -628,7 +628,7 @@ static void m5_rpc_token_rx_dispatch(struct m5io_hub_core *mcore, const u8 *buf,
 
   if (matched) {
     if (func == M5IO_HUB_FUNC_I2C)
-      pr_info("m5io-hub-core: i2c TOKEN rx tid=%d arg=%u len=%u status=%d\n",
+      m5io_dbg("m5io-hub-core: i2c TOKEN rx tid=%d arg=%u len=%u status=%d\n",
               tid, arg, payload_len, status);
     return;
   }
@@ -796,10 +796,10 @@ static void m5_rpc_i2c_data_rx(struct m5io_hub_core *mcore,
   spin_unlock_irqrestore(&mcore->rpc.token.state_lock, flags);
 
   if (accepted)
-    pr_info("m5io-hub-core: i2c DATA rx tid=%d chn=%u len=%u\n",
+    m5io_dbg("m5io-hub-core: i2c DATA rx tid=%d chn=%u len=%u\n",
             tid, chn, expected_len);
   else
-    pr_info("m5io-hub-core: i2c DATA rx rejected tid=%d chn=%u len=%u expected=%u error=%d\n",
+    m5io_dbg("m5io-hub-core: i2c DATA rx rejected tid=%d chn=%u len=%u expected=%u error=%d\n",
             tid, m5_rpc_data_chn(frame), m5_rpc_data_len(frame),
             expected_len, error);
 }
@@ -1195,12 +1195,12 @@ static int m5io_hub_rpc_transaction(struct m5io_hub_core *mcore) {
                 ((tx_buf[0] >> M5_RPC_TOKEN_FUNC_SHIFT) &
                  M5_RPC_TOKEN_FUNC_MASK) == M5IO_HUB_FUNC_I2C;
     if (i2c_token)
-      pr_info("m5io-hub-core: SPI I2C TOKEN tx_len=%d xfer_len=%u\n",
+      m5io_dbg("m5io-hub-core: SPI I2C TOKEN tx_len=%d xfer_len=%u\n",
               tx_len, xfer_len);
 
     ret = spi_sync_transfer(mcore->hub.spi, &transfer, 1);
     if (i2c_token)
-      pr_info("m5io-hub-core: SPI I2C TOKEN transfer ret=%d\n", ret);
+      m5io_dbg("m5io-hub-core: SPI I2C TOKEN transfer ret=%d\n", ret);
     if (ret)
       break;
 
@@ -1460,7 +1460,7 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
 
   is_i2c = request->func == M5IO_HUB_FUNC_I2C;
   if (is_i2c)
-    pr_info("m5io-hub-core: exec start arg=%u payload_len=%u data_chn=%u data_tx=%u data_rx=%u data_len=%u\n",
+    m5io_dbg("m5io-hub-core: exec start arg=%u payload_len=%u data_chn=%u data_tx=%u data_rx=%u data_len=%u\n",
             request->arg, request->payload_len, request->data_chn,
             !!request->data_tx, !!request->data_rx, request->data_len);
   if (request->data_len) {
@@ -1484,7 +1484,7 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
 
   tid = tid_lock - mcore->rpc.token.tid_lock;
   if (is_i2c)
-    pr_info("m5io-hub-core: i2c TID allocated tid=%u\n", tid);
+    m5io_dbg("m5io-hub-core: i2c TID allocated tid=%u\n", tid);
   if (is_i2c) {
     spin_lock_irqsave(&mcore->rpc.token.state_lock, flags);
     mcore->i2c.tid = tid;
@@ -1511,7 +1511,7 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
   /* Reserve TOKEN+DATA together; the worker still sends one frame per NSS. */
   ret = m5_rpc_frame_put(mcore, tx_buf, tx_len);
   if (is_i2c)
-    pr_info("m5io-hub-core: i2c frame queued tid=%u tx_len=%u ret=%d\n",
+    m5io_dbg("m5io-hub-core: i2c frame queued tid=%u tx_len=%u ret=%d\n",
             tid, tx_len, ret);
   if (ret)
     goto out_free;
@@ -1536,7 +1536,7 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
   spin_unlock_irqrestore(&mcore->rpc.token.state_lock, flags);
 
   if (is_i2c)
-    pr_info("m5io-hub-core: exec wait done tid=%u ret=%d status=%#x reply_len=%u rx_len=%u error=%d\n",
+    m5io_dbg("m5io-hub-core: exec wait done tid=%u ret=%d status=%#x reply_len=%u rx_len=%u error=%d\n",
             tid, ret, request->status, request->reply_len,
             mcore->i2c.rx_len, mcore->i2c.error);
 
@@ -1550,7 +1550,7 @@ out_free:
   if (is_i2c)
     mutex_unlock(&mcore->i2c.lock);
   if (is_i2c)
-    pr_info("m5io-hub-core: exec end ret=%d\n", ret);
+    m5io_dbg("m5io-hub-core: exec end ret=%d\n", ret);
   return ret;
 }
 EXPORT_SYMBOL_GPL(m5io_hub_exec);
