@@ -422,6 +422,11 @@ fragment@5 {
 
         __overlay__ {
             status = "okay";
+
+            /* CSIPHY 供电：本内核驱动查的是 vdd-csiphy-* */
+            vdd-csiphy-1p2-supply = <&pm4125_l5>;    /* 1.2V，base 里 l5 = 1.23V */
+            vdd-csiphy-1p8-supply = <&pm4125_l13>;   /* 1.8V */
+
 			ports {
 				#address-cells = <0x01>;
 				#size-cells = <0x00>;
@@ -447,7 +452,8 @@ fragment@5 {
             sensor@10 {
                 compatible = "sony,imx219";
                 reg = <0x10>;
-                
+                status = "okay";
+
                 /* 电源 */
                 VANA-supply = <&panel_cam0>;
                 VDIG-supply = <&panel_cam0>;
@@ -464,9 +470,9 @@ fragment@5 {
                     
                     m5csiphy0_out: endpoint {
                         remote-endpoint = <&m5csiphy0_in>;  /* 链接到 csiphy0 */
-                        data-lanes = <0 1 2 3>;
+                        data-lanes = <1 2 3 4>;
                         clock-lanes = <0>;
-                        link-frequencies = <0x00 0x1b2e0200>; /* 456 MHz */
+                        link-frequencies = <0 364000000>; /* 456 MHz */
                     };
                 };
             };
