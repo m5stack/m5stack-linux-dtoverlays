@@ -77,7 +77,9 @@
                     status = "okay";
                 };
 
-                /* CardputerZeroQ does not use the optional M5IO LED output. */
+                /* CardputerZeroQ does not use the optional M5IO LED output.
+                 * CAMERA_EN (GPIO8) is modelled as a fixed regulator instead,
+                 * see cam0-pwr below. */
                 m5io_hub_leds: leds {
                     compatible = "m5hub-gpio-leds";
                     status = "disabled";
@@ -352,9 +354,16 @@ fragment@2 {
             regulator-name = "panel-iovcc";
             regulator-always-on;
         };
+        /* CAMERA_EN: M5IO-HUB GPIO8, held high.  The IMX219 node references
+         * this rail through VANA/VDIG/VDDL-supply, so the enable line is
+         * driven high (with the module's power-up delay) before the sensor
+         * driver reads its chip ID. */
         panel_cam0: cam0-pwr {
             compatible = "regulator-fixed";
             regulator-name = "cam0-pwr";
+            gpio = <&m5io_hub_gpio 8 GPIO_ACTIVE_HIGH>;
+            enable-active-high;
+            startup-delay-us = <100000>;
             regulator-always-on;
             regulator-boot-on;
         };
@@ -435,7 +444,9 @@ fragment@5 {
 					reg = <0x00>;
 					m5csiphy0_in: endpoint {
 						remote-endpoint = <&m5csiphy0_out>;
-						data-lanes = <0 1 2 3>;
+						/* Two-lane mode verified with the attached IMX219 module. */
+						data-lanes = <0 1>;
+						clock-lanes = <0>;
 					};
 				};
 			};
@@ -470,9 +481,9 @@ fragment@5 {
                     
                     m5csiphy0_out: endpoint {
                         remote-endpoint = <&m5csiphy0_in>;  /* 链接到 csiphy0 */
-                        data-lanes = <1 2 3 4>;
+                        data-lanes = <1 2>;
                         clock-lanes = <0>;
-                        link-frequencies = <0 364000000>; /* 456 MHz */
+                        link-frequencies = /bits/ 64 <456000000>;
                     };
                 };
             };
