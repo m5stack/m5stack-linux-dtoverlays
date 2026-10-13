@@ -4,6 +4,8 @@ obj-m += m5io-hub-gpio.o
 obj-m += m5hub-gpio-leds.o
 obj-m += m5io-hub-i2c.o
 obj-m += m5io-hub-spi.o
+obj-m += m5io-hub-backlight.o
+obj-m += m5io-hub-uart.o
 
 # M5IO-HUB detailed debug logging.
 # 0 = off (default), 1 = on. Enable with: make M5IO_HUB_DEBUG=1
@@ -30,7 +32,8 @@ CPP ?= cpp
 DTS_INCLUDE ?= $(if $(KERNEL_OUT),$(KERNEL_OUT)/include,$(KERNELDIR)/include)
 KBUILD_MODPOST_WARN ?= 1
 
-MODULES := m5io-hub-core m5io-hub-gpio m5hub-gpio-leds m5io-hub-i2c m5io-hub-spi
+MODULES := m5io-hub-core m5io-hub-gpio m5hub-gpio-leds m5io-hub-i2c \
+	m5io-hub-spi m5io-hub-backlight m5io-hub-uart
 MODULE_KOS := $(addsuffix .ko,$(MODULES))
 DTS_TARGETS := cardputerzeroq-overlay.dtbo spi0-spidev-overlay.dtbo \
 	spi0-m5io-hub-runtime.dtbo tca8418-m5io-overlay.dtbo

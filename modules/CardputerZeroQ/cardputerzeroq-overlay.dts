@@ -78,6 +78,15 @@
                     status = "okay";
                 };
 
+                m5io_hub_backlight: backlight {
+                    compatible = "m5stack,m5io-hub-backlight";
+                    /* The MCU defaults to 30 kHz; make the setting explicit
+                     * so the Linux driver can verify/configure it at probe. */
+                    pwm-frequency-hz = <30000>;
+                    default-brightness-level = <255>;
+                    status = "okay";
+                };
+
                 /* CardputerZeroQ does not use the optional M5IO LED output.
                  * CAMERA_EN (GPIO8) is modelled as a fixed regulator instead,
                  * see cam0-pwr below. */
@@ -96,19 +105,19 @@
                 m5io_hub_uart: serial {
                     compatible = "m5stack,m5io-hub-uart";
                     reg = <0>;
-                    status = "disabled";
+                    status = "okay";
                     m5io_hub_uart0: serial@0 {
                         reg = <0>;
                         #address-cells = <1>;
                         #size-cells = <0>;
-                        status = "disabled";
+                        status = "okay";
                     };
 
                     m5io_hub_uart1: serial@1 {
                         reg = <1>;
                         #address-cells = <1>;
                         #size-cells = <0>;
-                        status = "disabled";
+                        status = "okay";
                     };
                 };
 
@@ -324,7 +333,7 @@
                 voltage-ranges = <3300 3300>;
                 bus-width = <1>;
                 disable-wp;
-                cd-gpios = <&m5io_hub_gpio 13 GPIO_ACTIVE_LOW>;
+                cd-gpios = <&m5io_hub_gpio 6 GPIO_ACTIVE_LOW>;
                 status = "disabled";
             };
         };
@@ -478,6 +487,7 @@ fragment@7 {
 
             iovcc-supply = <&panel_iovcc>;
             vdd-supply = <&panel_avdd>;
+            backlight = <&m5io_hub_backlight>;
 
             port {
                 panel_in: endpoint {

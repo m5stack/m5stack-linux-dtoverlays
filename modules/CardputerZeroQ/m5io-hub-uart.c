@@ -1,27 +1,60 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * M5IO-HUB virtual UART driver.
+ *
+ * The UART pins live on the M5IO-HUB MCU.  The Linux tty side is therefore
+ * backed by FUNC=4 TOKEN requests and DATA channel 4/5 frames rather than by
+ * memory mapped registers or an IRQ line.  TX is serialized by a work item so
+ * the sleepable RPC transaction is never run while the uart_port spinlock is
+ * held.  RX DATA frames are delivered by the hub core's process-context
+ * channel callback directly to the tty flip buffer.
+ */
+
+#include <linux/atomic.h>
+#include <linux/kfifo.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
-#include "m5io-hub.h"
 #include <linux/serial_core.h>
+#include <linux/slab.h>
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
+#include <linux/workqueue.h>
 
-#define M5IO_HUB_UART_NAME      "m5io-hub-uart"
-#define M5IO_HUB_TTY_NAME       "ttyM5HUB"
-#define M5IO_HUB_UART_NR        1
+#include "m5io-hub.h"
+
+#define M5IO_HUB_UART_NAME          "m5io-hub-uart"
+#define M5IO_HUB_TTY_NAME           "ttyM5HUB"
+#define M5IO_HUB_UART_NR            2
+#define M5IO_HUB_UART_MAX_TX        1024
+#define M5IO_HUB_UART_MIN_BAUD      1200
+#define M5IO_HUB_UART_MAX_BAUD      1000000
+#define M5IO_HUB_UART_CONFIG_LEN    8
+#define M5IO_HUB_UART_ARG_CONFIG    1
+#define M5IO_HUB_UART_ARG_TX        2
 
 struct m5io_hub_uart;
 
 struct m5io_hub_uart_port {
     struct uart_port port;
     struct m5io_hub_uart *mu;
+    struct delayed_work tx_work;
+    struct mutex config_lock;
+    atomic_t tx_enabled;
+    atomic_t tx_inflight;
+    atomic_t tx_pending;
+    atomic_t rx_enabled;
+    unsigned int channel;
+    u8 tx_buf[M5IO_HUB_UART_MAX_TX];
+    bool registered;
 };
 
 struct m5io_hub_uart {
     struct m5io_hub *hub;
-    struct m5io_hub_uart_port up;
+    struct m5io_hub_uart_port ports[M5IO_HUB_UART_NR];
 };
 
-static struct uart_driver m5io_hub_uart_core_driver = {
+static struct uart_driver m5io_hub_uart_driver = {
     .owner = THIS_MODULE,
     .driver_name = M5IO_HUB_UART_NAME,
     .dev_name = M5IO_HUB_TTY_NAME,
@@ -32,128 +65,250 @@ static struct uart_driver m5io_hub_uart_core_driver = {
 
 static unsigned int m5io_hub_uart_tx_empty(struct uart_port *port)
 {
-    /* TODO: 根据硬件TX FIFO状态返回 TIOCSER_TEMT 或 0 */
-    return TIOCSER_TEMT;
+    struct m5io_hub_uart_port *up =
+        container_of(port, struct m5io_hub_uart_port, port);
+
+    return atomic_read(&up->tx_inflight) || atomic_read(&up->tx_pending) ?
+           0 : TIOCSER_TEMT;
 }
 
 static unsigned int m5io_hub_uart_get_mctrl(struct uart_port *port)
 {
-    /* TODO: 读取调制解调器状态位 */
+    /* The MCU protocol has no modem-status operation.  The virtual link is
+     * permanently present and has no hardware flow-control signals. */
     return TIOCM_CTS | TIOCM_DSR | TIOCM_CAR;
 }
 
 static void m5io_hub_uart_set_mctrl(struct uart_port *port, unsigned int mctrl)
 {
-    /* TODO: 根据mctrl控制RTS/DTR等信号 */
+    /* RTS/DTR are not exposed by FUNC=4. */
 }
 
 static void m5io_hub_uart_stop_tx(struct uart_port *port)
 {
-    /* TODO: 关闭TX中断或停止发送状态机 */
+    struct m5io_hub_uart_port *up =
+        container_of(port, struct m5io_hub_uart_port, port);
+
+    atomic_set(&up->tx_enabled, 0);
+    atomic_set(&up->tx_pending, 0);
 }
 
-static bool m5io_hub_uart_tx_fifo_has_room(struct m5io_hub_uart *mu)
+static void m5io_hub_uart_rx_data(void *data, const u8 *buf, unsigned int len)
 {
-    /* TODO: 查询硬件发送FIFO是否有空间 */
-    return true;
+    struct m5io_hub_uart_port *up = data;
+    struct tty_port *tty_port;
+    int copied;
+
+    if (!up || !buf || !len || !atomic_read(&up->rx_enabled) ||
+        !up->port.state)
+        return;
+
+    tty_port = &up->port.state->port;
+    copied = tty_insert_flip_string(tty_port, buf, len);
+    up->port.icount.rx += copied;
+    if (copied != len)
+        up->port.icount.buf_overrun++;
+    if (copied)
+        tty_flip_buffer_push(tty_port);
 }
 
-static int m5io_hub_uart_tx_fifo_write_byte(struct m5io_hub_uart *mu, u8 ch)
+static void m5io_hub_uart_tx_work(struct work_struct *work)
 {
-    /* TODO: 通过regmap/RPC把一个字节写入硬件发送FIFO */
-    return 0;
+    struct m5io_hub_uart_port *up = container_of(to_delayed_work(work),
+                                                  struct m5io_hub_uart_port,
+                                                  tx_work);
+    struct uart_port *port = &up->port;
+    for (;;) {
+        struct tty_port *tty_port;
+        struct m5io_hub_request request = {0};
+        unsigned long flags;
+        unsigned int count;
+        unsigned int pending;
+        int ret;
+
+        if (!atomic_read(&up->tx_enabled) || !port->state)
+            break;
+
+        spin_lock_irqsave(&port->lock, flags);
+        tty_port = &port->state->port;
+        if (uart_tx_stopped(port) || !kfifo_len(&tty_port->xmit_fifo)) {
+            atomic_set(&up->tx_pending, 0);
+            spin_unlock_irqrestore(&port->lock, flags);
+            break;
+        }
+
+        count = min_t(unsigned int, kfifo_len(&tty_port->xmit_fifo),
+                      M5IO_HUB_UART_MAX_TX);
+        if (kfifo_out_peek(&tty_port->xmit_fifo, up->tx_buf, count) != count) {
+            spin_unlock_irqrestore(&port->lock, flags);
+            mod_delayed_work(system_wq, &up->tx_work, msecs_to_jiffies(20));
+            break;
+        }
+        atomic_set(&up->tx_inflight, 1);
+        spin_unlock_irqrestore(&port->lock, flags);
+
+        request.func = M5IO_HUB_FUNC_UART;
+        request.arg = M5IO_HUB_UART_ARG_TX;
+        request.data_chn = up->channel;
+        if (count <= M5IO_HUB_TOKEN_PAYLOAD_MAX - 3) {
+            u8 payload[M5IO_HUB_TOKEN_PAYLOAD_MAX];
+
+            payload[0] = up->channel == M5IO_HUB_CHN_UART2 ? 2 : 1;
+            payload[1] = count;
+            payload[2] = count >> 8;
+            memcpy(payload + 3, up->tx_buf, count);
+            request.payload = payload;
+            request.payload_len = 3 + count;
+            ret = m5io_hub_exec(up->mu->hub, &request);
+        } else {
+            u8 payload[3];
+
+            payload[0] = up->channel == M5IO_HUB_CHN_UART2 ? 2 : 1;
+            payload[1] = count;
+            payload[2] = count >> 8;
+            request.payload = payload;
+            request.payload_len = sizeof(payload);
+            request.data_tx = up->tx_buf;
+            request.data_len = count;
+            ret = m5io_hub_exec(up->mu->hub, &request);
+        }
+
+        atomic_set(&up->tx_inflight, 0);
+        if (ret) {
+            dev_warn_ratelimited(port->dev,
+                                 "UART%u TX transaction failed: %d\n",
+                                 up->channel - M5IO_HUB_CHN_UART1 + 1, ret);
+            /* Leave the xmit tail untouched.  A transient RPC/FIFO failure
+             * can be retried without silently dropping tty data. */
+            mod_delayed_work(system_wq, &up->tx_work,
+                             msecs_to_jiffies(20));
+            break;
+        }
+
+        spin_lock_irqsave(&port->lock, flags);
+        tty_port = &port->state->port;
+        uart_xmit_advance(port, count);
+        pending = kfifo_len(&tty_port->xmit_fifo);
+        if (pending < WAKEUP_CHARS)
+            uart_write_wakeup(port);
+        if (!pending || uart_tx_stopped(port))
+            atomic_set(&up->tx_pending, 0);
+        spin_unlock_irqrestore(&port->lock, flags);
+
+        if (!pending)
+            break;
+    }
 }
 
 static void m5io_hub_uart_start_tx(struct uart_port *port)
 {
-    struct m5io_hub_uart_port *up = container_of(port, struct m5io_hub_uart_port,
-                                                 port);
-    struct m5io_hub_uart *mu = up->mu;
-    struct circ_buf *xmit;
-    unsigned long flags;
-    unsigned int budget;
+    struct m5io_hub_uart_port *up =
+        container_of(port, struct m5io_hub_uart_port, port);
 
-    if (!port->state)
-        return;
-
-    xmit = &port->state->xmit;
-    budget = port->fifosize ? port->fifosize : 16;
-
-    spin_lock_irqsave(&port->lock, flags);
-
-    if (uart_tx_stopped(port) || uart_circ_empty(xmit)) {
-        spin_unlock_irqrestore(&port->lock, flags);
-        return;
-    }
-
-    while (!uart_circ_empty(xmit) && budget--) {
-        u8 ch = xmit->buf[xmit->tail];
-        int ret;
-
-        if (!m5io_hub_uart_tx_fifo_has_room(mu))
-            break;
-
-        ret = m5io_hub_uart_tx_fifo_write_byte(mu, ch);
-        if (ret)
-            break;
-
-        xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
-        port->icount.tx++;
-    }
-
-    if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
-        uart_write_wakeup(port);
-
-    if (uart_circ_empty(xmit))
-        m5io_hub_uart_stop_tx(port);
-
-    spin_unlock_irqrestore(&port->lock, flags);
+    atomic_set(&up->tx_enabled, 1);
+    atomic_set(&up->tx_pending, 1);
+    mod_delayed_work(system_wq, &up->tx_work, 0);
 }
 
 static void m5io_hub_uart_stop_rx(struct uart_port *port)
 {
-    /* TODO: 关闭RX中断 */
+    struct m5io_hub_uart_port *up =
+        container_of(port, struct m5io_hub_uart_port, port);
+
+    atomic_set(&up->rx_enabled, 0);
 }
 
 static void m5io_hub_uart_enable_ms(struct uart_port *port)
 {
-    /* TODO: 打开调制解调器状态变化中断（如需） */
 }
 
 static void m5io_hub_uart_break_ctl(struct uart_port *port, int break_state)
 {
-    /* TODO: 控制发送BREAK信号 */
 }
 
 static int m5io_hub_uart_startup(struct uart_port *port)
 {
-    /* TODO:
-     * 1. 初始化硬件UART通道
-     * 2. 使能中断
-     * 3. 可选：清空FIFO
-     */
+    struct m5io_hub_uart_port *up =
+        container_of(port, struct m5io_hub_uart_port, port);
+
+    atomic_set(&up->rx_enabled, 1);
+    atomic_set(&up->tx_enabled, 1);
     return 0;
 }
 
 static void m5io_hub_uart_shutdown(struct uart_port *port)
 {
-    /* TODO: 关闭中断并释放硬件资源 */
+    struct m5io_hub_uart_port *up =
+        container_of(port, struct m5io_hub_uart_port, port);
+
+    atomic_set(&up->rx_enabled, 0);
+    atomic_set(&up->tx_enabled, 0);
+    atomic_set(&up->tx_pending, 0);
+    cancel_delayed_work_sync(&up->tx_work);
+}
+
+static int m5io_hub_uart_configure(struct m5io_hub_uart_port *up,
+                                    struct ktermios *termios,
+                                    unsigned int baud)
+{
+    struct m5io_hub_request request = {0};
+    u8 payload[M5IO_HUB_UART_CONFIG_LEN];
+    u8 port_number = up->channel == M5IO_HUB_CHN_UART2 ? 2 : 1;
+    int ret;
+
+    payload[0] = port_number;
+    payload[1] = baud;
+    payload[2] = baud >> 8;
+    payload[3] = baud >> 16;
+    payload[4] = baud >> 24;
+    payload[5] = (termios->c_cflag & CSIZE) == CS7 ? 7 : 8;
+    payload[6] = (termios->c_cflag & PARENB) ?
+                 ((termios->c_cflag & PARODD) ? 2 : 1) : 0;
+    payload[7] = (termios->c_cflag & CSTOPB) ? 2 : 1;
+
+    request.func = M5IO_HUB_FUNC_UART;
+    request.arg = M5IO_HUB_UART_ARG_CONFIG;
+    request.payload = payload;
+    request.payload_len = sizeof(payload);
+    ret = m5io_hub_exec(up->mu->hub, &request);
+    if (ret)
+        return ret;
+    if (request.reply_len != sizeof(payload) ||
+        request.reply[0] != port_number)
+        return -EPROTO;
+    return 0;
 }
 
 static void m5io_hub_uart_set_termios(struct uart_port *port,
                                        struct ktermios *new,
                                        const struct ktermios *old)
 {
+    struct m5io_hub_uart_port *up =
+        container_of(port, struct m5io_hub_uart_port, port);
     unsigned int baud;
+    int ret;
 
-    baud = uart_get_baud_rate(port, new, old, 1200, 4000000);
+    baud = uart_get_baud_rate(port, new, old, M5IO_HUB_UART_MIN_BAUD,
+                              M5IO_HUB_UART_MAX_BAUD);
     uart_update_timeout(port, new->c_cflag, baud);
 
-    /* TODO:
-     * 1. 根据new->c_cflag配置数据位/校验/停止位
-     * 2. 配置波特率
-     * 3. 根据new->c_iflag处理IGNPAR/INPCK等策略
-     */
+    if ((new->c_cflag & CSIZE) != CS7 && (new->c_cflag & CSIZE) != CS8) {
+        dev_warn(port->dev, "UART%u supports only CS7 and CS8\n",
+                 up->channel - M5IO_HUB_CHN_UART1 + 1);
+        return;
+    }
+    if (new->c_cflag & CMSPAR) {
+        dev_warn(port->dev, "UART%u does not support mark/space parity\n",
+                 up->channel - M5IO_HUB_CHN_UART1 + 1);
+        return;
+    }
+
+    mutex_lock(&up->config_lock);
+    ret = m5io_hub_uart_configure(up, new, baud);
+    mutex_unlock(&up->config_lock);
+    if (ret)
+        dev_warn(port->dev, "UART%u configuration failed: %d\n",
+                 up->channel - M5IO_HUB_CHN_UART1 + 1, ret);
 }
 
 static const char *m5io_hub_uart_type(struct uart_port *port)
@@ -163,12 +318,10 @@ static const char *m5io_hub_uart_type(struct uart_port *port)
 
 static void m5io_hub_uart_release_port(struct uart_port *port)
 {
-    /* 无需IORESOURCE，占位函数 */
 }
 
 static int m5io_hub_uart_request_port(struct uart_port *port)
 {
-    /* TODO: 若后续需要申请IO资源，可在此实现 */
     return 0;
 }
 
@@ -179,11 +332,12 @@ static void m5io_hub_uart_config_port(struct uart_port *port, int flags)
 }
 
 static int m5io_hub_uart_verify_port(struct uart_port *port,
-                                     struct serial_struct *ser)
+                                      struct serial_struct *ser)
 {
     if (ser->type != PORT_UNKNOWN && ser->type != PORT_16550A)
         return -EINVAL;
-
+    if (ser->baud_base && ser->baud_base < M5IO_HUB_UART_MIN_BAUD)
+        return -EINVAL;
     return 0;
 }
 
@@ -206,11 +360,55 @@ static const struct uart_ops m5io_hub_uart_ops = {
     .verify_port = m5io_hub_uart_verify_port,
 };
 
+static int m5io_hub_uart_register_port(struct platform_device *pdev,
+                                       struct m5io_hub_uart *mu,
+                                       unsigned int index)
+{
+    struct m5io_hub_uart_port *up = &mu->ports[index];
+    struct uart_port *port = &up->port;
+    int ret;
+
+    port->dev = &pdev->dev;
+    port->line = index;
+    port->type = PORT_16550A;
+    port->iotype = UPIO_MEM;
+    port->fifosize = M5IO_HUB_UART_MAX_TX;
+    port->flags = UPF_BOOT_AUTOCONF;
+    port->ops = &m5io_hub_uart_ops;
+    port->uartclk = M5IO_HUB_UART_MAX_BAUD * 16;
+    spin_lock_init(&port->lock);
+    mutex_init(&up->config_lock);
+    INIT_DELAYED_WORK(&up->tx_work, m5io_hub_uart_tx_work);
+    atomic_set(&up->tx_enabled, 0);
+    atomic_set(&up->tx_inflight, 0);
+    atomic_set(&up->tx_pending, 0);
+    atomic_set(&up->rx_enabled, 0);
+    up->mu = mu;
+    up->channel = M5IO_HUB_CHN_UART1 + index;
+
+    ret = m5io_hub_register_chn_data_handler(mu->hub, up->channel,
+                                              m5io_hub_uart_rx_data, up);
+    if (ret)
+        return ret;
+    ret = uart_add_one_port(&m5io_hub_uart_driver, port);
+    if (ret) {
+        m5io_hub_unregister_chn_data_handler(mu->hub, up->channel,
+                                             m5io_hub_uart_rx_data, up);
+        return ret;
+    }
+    up->registered = true;
+    return 0;
+}
+
 static int m5io_hub_uart_probe(struct platform_device *pdev)
 {
+    struct device_node *child;
     struct m5io_hub *hub = dev_get_drvdata(pdev->dev.parent);
     struct m5io_hub_uart *mu;
-    struct uart_port *port;
+    bool seen[M5IO_HUB_UART_NR] = {false, false};
+    unsigned int index;
+    unsigned int registered = 0;
+    u32 reg;
     int ret;
 
     if (!hub)
@@ -219,44 +417,72 @@ static int m5io_hub_uart_probe(struct platform_device *pdev)
     mu = devm_kzalloc(&pdev->dev, sizeof(*mu), GFP_KERNEL);
     if (!mu)
         return -ENOMEM;
-
     mu->hub = hub;
 
-    port = &mu->up.port;
-    port->dev = &pdev->dev;
-    port->line = 0;
-    port->type = PORT_16550A;
-    port->iotype = UPIO_MEM;
-    port->fifosize = 64;
-    port->flags = UPF_BOOT_AUTOCONF;
-    port->ops = &m5io_hub_uart_ops;
-    port->uartclk = 48000000; /* TODO: 换成设备真实输入时钟 */
-    spin_lock_init(&port->lock);
+    for_each_available_child_of_node(pdev->dev.of_node, child) {
+        if (of_property_read_u32(child, "reg", &reg) || reg >= M5IO_HUB_UART_NR) {
+            dev_warn(&pdev->dev, "ignoring UART child without valid reg\n");
+            continue;
+        }
+        seen[reg] = true;
+    }
 
-    mu->up.mu = mu;
+    /* A flat serial node is also accepted for older overlays. */
+    if (!seen[0] && !seen[1]) {
+        if (!of_property_read_u32(pdev->dev.of_node, "reg", &reg) &&
+            reg < M5IO_HUB_UART_NR)
+            seen[reg] = true;
+        else
+            seen[0] = true;
+    }
 
-    /* TODO:
-     * 1. 实现中断处理：RX数据进入tty_flip_buffer_push()
-     * 2. 实现发送路径：从port->state->xmit取数据写到硬件FIFO
-     * 3. 用hub->regmap或RPC接口访问M5IO-HUB寄存器
-     * 底层读写走 hub->regmap 访问SPI寄存器模拟UART FIFO
-     */
-
-    ret = uart_add_one_port(&m5io_hub_uart_core_driver, port);
-    if (ret)
-        return ret;
+    for (index = 0; index < M5IO_HUB_UART_NR; index++) {
+        if (!seen[index])
+            continue;
+        ret = m5io_hub_uart_register_port(pdev, mu, index);
+        if (ret)
+            goto err_unregister;
+        registered++;
+    }
+    if (!registered)
+        return -ENODEV;
 
     platform_set_drvdata(pdev, mu);
-    dev_info(&pdev->dev, "m5io-hub-uart probed, line=%u\n", port->line);
+    dev_info(&pdev->dev, "registered %u M5IO-HUB UART port(s)\n", registered);
     return 0;
+
+err_unregister:
+    while (index--) {
+        struct m5io_hub_uart_port *up = &mu->ports[index];
+
+        if (!up->registered)
+            continue;
+        cancel_delayed_work_sync(&up->tx_work);
+        uart_remove_one_port(&m5io_hub_uart_driver, &up->port);
+        m5io_hub_unregister_chn_data_handler(mu->hub, up->channel,
+                                             m5io_hub_uart_rx_data, up);
+    }
+    return ret;
 }
 
-static int m5io_hub_uart_remove(struct platform_device *pdev)
+static void m5io_hub_uart_remove(struct platform_device *pdev)
 {
     struct m5io_hub_uart *mu = platform_get_drvdata(pdev);
+    unsigned int index;
 
-    uart_remove_one_port(&m5io_hub_uart_core_driver, &mu->up.port);
-    return 0;
+    if (!mu)
+        return;
+    for (index = 0; index < M5IO_HUB_UART_NR; index++) {
+        struct m5io_hub_uart_port *up = &mu->ports[index];
+
+        if (!up->registered)
+            continue;
+        cancel_delayed_work_sync(&up->tx_work);
+        uart_remove_one_port(&m5io_hub_uart_driver, &up->port);
+        m5io_hub_unregister_chn_data_handler(mu->hub, up->channel,
+                                             m5io_hub_uart_rx_data, up);
+        up->registered = false;
+    }
 }
 
 static const struct of_device_id m5io_hub_uart_of_match[] = {
@@ -265,40 +491,35 @@ static const struct of_device_id m5io_hub_uart_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, m5io_hub_uart_of_match);
 
-static struct platform_driver m5io_hub_uart_plat_driver = {
+static struct platform_driver m5io_hub_uart_platform_driver = {
+    .probe = m5io_hub_uart_probe,
+    .remove = m5io_hub_uart_remove,
     .driver = {
         .name = M5IO_HUB_UART_NAME,
         .of_match_table = m5io_hub_uart_of_match,
     },
-    .probe = m5io_hub_uart_probe,
-    .remove = m5io_hub_uart_remove,
 };
 
 static int __init m5io_hub_uart_init(void)
 {
     int ret;
 
-    ret = uart_register_driver(&m5io_hub_uart_core_driver);
+    ret = uart_register_driver(&m5io_hub_uart_driver);
     if (ret)
         return ret;
-
-    ret = platform_driver_register(&m5io_hub_uart_plat_driver);
-    if (ret) {
-        uart_unregister_driver(&m5io_hub_uart_core_driver);
-        return ret;
-    }
-
-    return 0;
+    ret = platform_driver_register(&m5io_hub_uart_platform_driver);
+    if (ret)
+        uart_unregister_driver(&m5io_hub_uart_driver);
+    return ret;
 }
+module_init(m5io_hub_uart_init);
 
 static void __exit m5io_hub_uart_exit(void)
 {
-    platform_driver_unregister(&m5io_hub_uart_plat_driver);
-    uart_unregister_driver(&m5io_hub_uart_core_driver);
+    platform_driver_unregister(&m5io_hub_uart_platform_driver);
+    uart_unregister_driver(&m5io_hub_uart_driver);
 }
-
-module_init(m5io_hub_uart_init);
 module_exit(m5io_hub_uart_exit);
 
-MODULE_DESCRIPTION("M5Stack M5IO-HUB UART bridge driver (stub)");
+MODULE_DESCRIPTION("M5Stack M5IO-HUB virtual UART driver");
 MODULE_LICENSE("GPL");

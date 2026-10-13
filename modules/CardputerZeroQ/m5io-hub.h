@@ -40,10 +40,15 @@
 #define M5IO_HUB_SPI_MAX_LEN    1024
 /* Even DATA chunks also work with the MCU's 16-bit SPI mode. */
 #define M5IO_HUB_SPI_CHUNK_LEN  254
+#define M5IO_HUB_FUNC_UART      4
+#define M5IO_HUB_FUNC_BACKLIGHT 5
+#define M5IO_HUB_FUNC_IR        6
+#define M5IO_HUB_FUNC_MAX       M5IO_HUB_FUNC_IR
 #define M5IO_HUB_TOKEN_PAYLOAD_MAX 15
 #define M5IO_HUB_DATA_PAYLOAD_MAX 255
 
-/* Synchronous TOKEN request. Optional I2C DATA uses PID=0, CH=bus.
+/* Synchronous TOKEN request. Optional I2C or UART DATA follows the TOKEN;
+ * I2C uses one PID=0 frame while UART data is split into 255-byte frames.
  * SPI DATA requires both data_tx and data_rx, CH=3, up to 1024 bytes;
  * chunks are 254 bytes (last may be shorter), with PID cycling 0..3.
  * reply/status are the terminal TOKEN payload/ARG, even on firmware errors.
@@ -71,12 +76,6 @@ struct m5io_hub_request {
 #define M5IO_HUB_REG_IRQ_MASK      0x04  /* 中断屏蔽寄存器 */
 #define M5IO_HUB_REG_IRQ_TYPE_R    0x05  /* 上升沿触发使能 */
 #define M5IO_HUB_REG_IRQ_TYPE_F    0x06  /* 下降沿触发使能 */
-
-
-struct m5io_hub_uart_port {
-    struct uart_port port;
-    DECLARE_KFIFO(rx_fifo, u8, 256);   /* 256字节环形缓冲区 */
-};
 
 
 struct m5io_hub {

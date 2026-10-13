@@ -48,7 +48,11 @@
 #define M5_RPC_ARG_GPIO_DIGITALREAD 0x3
 #define M5_RPC_ARG_GPIO_ATTACHINTERRUPT 0x4
 #define M5_RPC_ARG_GPIO_DETACHINTERRUPT 0x5
+#define M5_RPC_GPIO_EDGE_FALLING 0x0
+#define M5_RPC_GPIO_EDGE_RISING  0x1
+#define M5_RPC_GPIO_EDGE_BOTH    0x2
 #define M5_RPC_TOKEN_TIMEOUT_MS 2000
+#define M5_RPC_UART_TOKEN_TIMEOUT_MS 30000
 
 #define M5_RPC_TYPE_DATA 1
 #define M5_RPC_CHN_UART1 M5IO_HUB_CHN_UART1
@@ -60,6 +64,15 @@
 #define M5_RPC_DATA_MAX_PLEN 0xff
 #define M5_RPC_DATA_MAX_LEN                                                        \
   (M5_RPC_DATA_HDR_LEN + M5_RPC_DATA_MAX_PLEN + M5_RPC_CRC_LEN)
+#define M5IO_HUB_SPI_TX_BUF_LEN                                                    \
+  (M5_RPC_TOKEN_MAX_LEN + M5IO_HUB_SPI_MAX_LEN +                                  \
+   DIV_ROUND_UP(M5IO_HUB_SPI_MAX_LEN, M5IO_HUB_SPI_CHUNK_LEN) *                    \
+   (M5_RPC_DATA_HDR_LEN + M5_RPC_CRC_LEN))
+#define M5_RPC_UART_MAX_TRANSACTION_LEN 1024U
+#define M5_RPC_UART_DATA_FRAME_COUNT \
+  DIV_ROUND_UP(M5_RPC_UART_MAX_TRANSACTION_LEN, M5_RPC_DATA_MAX_PLEN)
+#define M5_RPC_EXEC_TX_BUF_LEN \
+  (M5_RPC_TOKEN_MAX_LEN + M5_RPC_UART_DATA_FRAME_COUNT * M5_RPC_DATA_MAX_LEN)
 #define M5_RPC_MAX_FRAME_LEN M5_RPC_DATA_MAX_LEN
 #define M5_RPC_DATA_ACK_TID_MASK 0x03
 #define M5_RPC_DATA_ACK_CHN_SHIFT 2
@@ -196,6 +209,8 @@ struct m5_rpc_i2c {
 /* FUNC3 has one transaction context; DATA PID is a sequence, not a TID. */
 struct m5_rpc_spi {
   struct mutex lock;
+  /* Fixed maximum FUNC3 TOKEN+DATA stream, allocated during probe. */
+  u8 *tx_buf;
   int tid;
   unsigned int expected_len;
   unsigned int rx_len;
@@ -210,6 +225,13 @@ struct m5io_hub_core {
   struct m5_rpc rpc;
   struct m5_rpc_i2c i2c;
   struct m5_rpc_spi spi_rpc;
+
+  /* One fixed-size transaction buffer; protected while building/enqueuing. */
+  struct mutex exec_tx_lock;
+  u8 exec_tx_buf[M5_RPC_EXEC_TX_BUF_LEN];
+  /* SPI transfer scratch buffers, allocated during probe and spi_lock-held. */
+  u8 *rpc_xfer_tx_buf;
+  u8 *rpc_xfer_rx_buf;
 
   struct work_struct rpc_work;
   struct mutex spi_lock;
@@ -1187,17 +1209,13 @@ static int m5io_hub_rpc_transaction(struct m5io_hub_core *mcore) {
   u8 *rx_buf;
   int ret = 0;
 
-  tx_buf = kmalloc(M5IO_HUB_FIFO_SIZE, GFP_KERNEL);
-  if (!tx_buf)
-    return -ENOMEM;
-
-  rx_buf = kmalloc(M5IO_HUB_FIFO_SIZE, GFP_KERNEL);
-  if (!rx_buf) {
-    ret = -ENOMEM;
-    goto out_free_tx;
-  }
-
   mutex_lock(&mcore->spi_lock);
+  tx_buf = mcore->rpc_xfer_tx_buf;
+  rx_buf = mcore->rpc_xfer_rx_buf;
+  if (!tx_buf || !rx_buf) {
+    ret = -ENOMEM;
+    goto out_unlock;
+  }
 
   for (;;) {
     tx_len = m5io_hub_tx_frame_len(mcore);
@@ -1256,10 +1274,8 @@ static int m5io_hub_rpc_transaction(struct m5io_hub_core *mcore) {
     cond_resched();
   }
 
+out_unlock:
   mutex_unlock(&mcore->spi_lock);
-  kfree(rx_buf);
-out_free_tx:
-  kfree(tx_buf);
   return ret;
 }
 
@@ -1494,15 +1510,14 @@ static int m5_rpc_spi_exec(struct m5io_hub_core *mcore,
     return -EINVAL;
   }
 
-  tx = kmalloc(M5_RPC_TOKEN_MAX_LEN + M5IO_HUB_SPI_MAX_LEN +
-               DIV_ROUND_UP(M5IO_HUB_SPI_MAX_LEN, M5IO_HUB_SPI_CHUNK_LEN) *
-               (M5_RPC_DATA_HDR_LEN + M5_RPC_CRC_LEN), GFP_KERNEL);
-  if (!tx)
-    return -ENOMEM;
-
   request->reply_len = 0;
   request->status = 0xff;
   mutex_lock(&rpc->lock);
+  tx = rpc->tx_buf;
+  if (!tx) {
+    ret = -ENOMEM;
+    goto out_unlock;
+  }
   tid_lock = token_tid_alloc(mcore, m5_rpc_token_done_cb, request->func);
   tid = tid_lock - mcore->rpc.token.tid_lock;
   spin_lock_irqsave(&mcore->rpc.token.state_lock, flags);
@@ -1549,13 +1564,13 @@ static int m5_rpc_spi_exec(struct m5io_hub_core *mcore,
   rpc->tid = -1;
   spin_unlock_irqrestore(&mcore->rpc.token.state_lock, flags);
   token_tid_free(mcore, tid_lock);
+out_unlock:
   mutex_unlock(&rpc->lock);
-  kfree(tx);
   return ret;
 }
 
 /**
- * m5io_hub_exec - execute a TOKEN and optional I2C/SPI DATA transaction
+ * m5io_hub_exec - execute a TOKEN and optional I2C/SPI/UART DATA transaction
  * @hub: hub 句柄
  * @request: request fields and terminal reply; buffers must live until return
  *
@@ -1569,17 +1584,21 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
   struct m5_rpc_token_frame *frame;
   struct m5_rpc_data_frame *data_frame;
   struct mutex *tid_lock;
-  u8 tx_buf[M5_RPC_TOKEN_MAX_LEN + M5_RPC_DATA_MAX_LEN];
   unsigned long flags;
   unsigned int tid;
   unsigned int tx_len;
+  unsigned int data_offset;
+  unsigned int data_left;
+  u8 data_pid = 0;
   bool is_i2c;
+  bool is_uart;
+  bool tx_locked = false;
   int ret;
 
   if (!hub || !hub->spi)
     return -ENODEV;
 
-  if (!request || request->func > M5IO_HUB_FUNC_SPI ||
+  if (!request || request->func > M5IO_HUB_FUNC_MAX ||
       request->arg > M5_RPC_TOKEN_ARG_MASK ||
       request->payload_len > M5_RPC_TOKEN_MAX_PLEN ||
       (request->payload_len && !request->payload))
@@ -1589,15 +1608,21 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
     return m5_rpc_spi_exec(container_of(hub, struct m5io_hub_core, hub), request);
 
   is_i2c = request->func == M5IO_HUB_FUNC_I2C;
+  is_uart = request->func == M5IO_HUB_FUNC_UART;
   if (is_i2c)
     m5io_dbg("m5io-hub-core: exec start arg=%u payload_len=%u data_chn=%u data_tx=%u data_rx=%u data_len=%u\n",
             request->arg, request->payload_len, request->data_chn,
             !!request->data_tx, !!request->data_rx, request->data_len);
   if (request->data_len) {
-    if (!is_i2c || request->data_len > M5_RPC_DATA_MAX_PLEN ||
-        request->data_chn < M5_RPC_CHN_IIC1 ||
-        request->data_chn > M5_RPC_CHN_IIC2 ||
-        (!!request->data_tx == !!request->data_rx))
+    if ((!is_i2c && !is_uart) ||
+        (is_i2c && (request->data_len > M5_RPC_DATA_MAX_PLEN ||
+                    request->data_chn < M5_RPC_CHN_IIC1 ||
+                    request->data_chn > M5_RPC_CHN_IIC2 ||
+                    (!!request->data_tx == !!request->data_rx))) ||
+        (is_uart && (request->data_len > M5_RPC_UART_MAX_TRANSACTION_LEN ||
+                     request->data_chn < M5_RPC_CHN_UART1 ||
+                     request->data_chn > M5_RPC_CHN_UART2 ||
+                     !request->data_tx || request->data_rx)))
       return -EINVAL;
   } else if (request->data_tx || request->data_rx) {
     return -EINVAL;
@@ -1625,28 +1650,46 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
     spin_unlock_irqrestore(&mcore->rpc.token.state_lock, flags);
   }
 
-  frame = (struct m5_rpc_token_frame *)tx_buf;
+  mutex_lock(&mcore->exec_tx_lock);
+  tx_locked = true;
+  frame = (struct m5_rpc_token_frame *)mcore->exec_tx_buf;
   m5_rpc_token_frame_fill(frame, M5_RPC_TYPE_TOKEN, 1, tid, request->func,
                           request->payload_len, request->arg, request->payload);
   m5_rpc_token_frame_crc_fill(frame);
 
   tx_len = M5_RPC_TOKEN_HDR_LEN + request->payload_len + M5_RPC_CRC_LEN;
   if (request->data_tx) {
-    data_frame = (struct m5_rpc_data_frame *)(tx_buf + tx_len);
-    m5_rpc_data_frame_fill(data_frame, 0, request->data_chn,
-                           request->data_len, request->data_tx);
-    m5_rpc_data_frame_crc_fill(data_frame);
-    tx_len += M5_RPC_DATA_HDR_LEN + request->data_len + M5_RPC_CRC_LEN;
+    data_offset = tx_len;
+    data_left = request->data_len;
+    while (data_left) {
+      unsigned int chunk = min_t(unsigned int, data_left,
+                                 M5_RPC_DATA_MAX_PLEN);
+
+      data_frame = (struct m5_rpc_data_frame *)(mcore->exec_tx_buf +
+                                                data_offset);
+      m5_rpc_data_frame_fill(data_frame, data_pid, request->data_chn, chunk,
+                             request->data_tx + request->data_len - data_left);
+      m5_rpc_data_frame_crc_fill(data_frame);
+      data_offset += M5_RPC_DATA_HDR_LEN + chunk + M5_RPC_CRC_LEN;
+      data_left -= chunk;
+      data_pid = (data_pid + 1) & M5_RPC_DATA_TID_MASK;
+    }
+    tx_len = data_offset;
   }
   /* Reserve TOKEN+DATA together; the worker still sends one frame per NSS. */
-  ret = m5_rpc_frame_put(mcore, tx_buf, tx_len);
+  ret = m5_rpc_frame_put(mcore, mcore->exec_tx_buf, tx_len);
+  mutex_unlock(&mcore->exec_tx_lock);
+  tx_locked = false;
   if (is_i2c)
     m5io_dbg("m5io-hub-core: i2c frame queued tid=%u tx_len=%u ret=%d\n",
             tid, tx_len, ret);
   if (ret)
     goto out_free;
 
-  ret = m5_rpc_token_wait(mcore, tid, msecs_to_jiffies(M5_RPC_TOKEN_TIMEOUT_MS));
+  ret = m5_rpc_token_wait(mcore, tid,
+                          msecs_to_jiffies(is_uart ?
+                                           M5_RPC_UART_TOKEN_TIMEOUT_MS :
+                                           M5_RPC_TOKEN_TIMEOUT_MS));
   spin_lock_irqsave(&mcore->rpc.token.state_lock, flags);
   if (mcore->rpc.token.rx_len[tid]) {
     frame = (struct m5_rpc_token_frame *)mcore->rpc.token.rx[tid];
@@ -1671,6 +1714,8 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
             mcore->i2c.rx_len, mcore->i2c.error);
 
 out_free:
+  if (tx_locked)
+    mutex_unlock(&mcore->exec_tx_lock);
   if (is_i2c) {
     spin_lock_irqsave(&mcore->rpc.token.state_lock, flags);
     mcore->i2c.tid = -1;
@@ -1815,6 +1860,7 @@ EXPORT_SYMBOL_GPL(m5io_hub_digitalRead);
 int m5io_hub_attachInterrupt(struct m5io_hub *hub, unsigned int pin,
                              unsigned int type) {
   u8 cmd[2];
+  u8 wire_type;
   int ret;
 
   if (!hub || !hub->spi)
@@ -1825,16 +1871,23 @@ int m5io_hub_attachInterrupt(struct m5io_hub *hub, unsigned int pin,
     return ret;
 
   switch (type) {
-  case IRQ_TYPE_EDGE_RISING:
   case IRQ_TYPE_EDGE_FALLING:
+    /* MCU protocol values are FALLING=0, RISING=1, BOTH=2; they do not
+     * match Linux IRQ_TYPE_* bit values. */
+    wire_type = M5_RPC_GPIO_EDGE_FALLING;
+    break;
+  case IRQ_TYPE_EDGE_RISING:
+    wire_type = M5_RPC_GPIO_EDGE_RISING;
+    break;
   case IRQ_TYPE_EDGE_BOTH:
+    wire_type = M5_RPC_GPIO_EDGE_BOTH;
     break;
   default:
     return -EINVAL;
   }
 
   cmd[0] = pin;
-  cmd[1] = type;
+  cmd[1] = wire_type;
   return m5_rpc_token_gpio_exec(hub, M5_RPC_ARG_GPIO_ATTACHINTERRUPT, cmd,
                                 sizeof(cmd), NULL, NULL);
 }
@@ -1950,6 +2003,20 @@ static int m5io_hub_probe(struct spi_device *spi) {
   mcore->i2c.tid = -1;
   mutex_init(&mcore->spi_rpc.lock);
   mcore->spi_rpc.tid = -1;
+  mutex_init(&mcore->exec_tx_lock);
+
+  mcore->spi_rpc.tx_buf = devm_kmalloc(&spi->dev, M5IO_HUB_SPI_TX_BUF_LEN,
+                                       GFP_KERNEL);
+  if (!mcore->spi_rpc.tx_buf)
+    return -ENOMEM;
+  mcore->rpc_xfer_tx_buf = devm_kmalloc(&spi->dev, M5IO_HUB_FIFO_SIZE,
+                                        GFP_KERNEL);
+  if (!mcore->rpc_xfer_tx_buf)
+    return -ENOMEM;
+  mcore->rpc_xfer_rx_buf = devm_kmalloc(&spi->dev, M5IO_HUB_FIFO_SIZE,
+                                        GFP_KERNEL);
+  if (!mcore->rpc_xfer_rx_buf)
+    return -ENOMEM;
 
   /* RPC 工作项：调用方走 worker；IRQ 在线程化中断中激活排空事务 */
   {
