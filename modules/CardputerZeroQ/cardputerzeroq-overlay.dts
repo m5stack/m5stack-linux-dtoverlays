@@ -3,6 +3,7 @@
 
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/sound/qcom,q6afe.h>
 
 / {
     fragment@0 {
@@ -94,7 +95,21 @@
                 /* Enable these nodes when their transport drivers are ready. */
                 m5io_hub_uart: serial {
                     compatible = "m5stack,m5io-hub-uart";
+                    reg = <0>;
                     status = "disabled";
+                    m5io_hub_uart0: serial@0 {
+                        reg = <0>;
+                        #address-cells = <1>;
+                        #size-cells = <0>;
+                        status = "disabled";
+                    };
+
+                    m5io_hub_uart1: serial@1 {
+                        reg = <1>;
+                        #address-cells = <1>;
+                        #size-cells = <0>;
+                        status = "disabled";
+                    };
                 };
 
                 m5io_hub_i2c: i2c {
@@ -346,6 +361,61 @@
             hdmi-i2s-dai-link {
                 status = "disabled";
             };
+
+            /* The stock card only exposes the txmacro analog capture path.
+             * Add the VA DMA backend so the PDM microphone reaches ALSA.
+             */
+            dmic-capture-dai-link {
+                link-name = "DMIC Capture";
+
+                cpu {
+                    sound-dai = <&q6afedai VA_CODEC_DMA_TX_0>;
+                };
+
+                platform {
+                    sound-dai = <&q6routing>;
+                };
+
+                codec {
+                    sound-dai = <&vamacro 0>;
+                };
+            };
+        };
+    };
+
+    /* CardputerZeroQ routes the PDM microphone to the LPASS LPI pads:
+     *   SoC GPIO98 -> LPI GPIO6 -> DMIC01 clock
+     *   SoC GPIO99 -> LPI GPIO7 -> DMIC01 data
+     */
+    fragment@12 {
+        target = <&lpass_tlmm>;
+
+        __overlay__ {
+            dmic01_active: dmic01-active-state {
+                clk-pins {
+                    pins = "gpio6";
+                    function = "dmic01_clk";
+                    bias-disable;
+                };
+
+                data-pins {
+                    pins = "gpio7";
+                    function = "dmic01_data";
+                    bias-disable;
+                };
+            };
+        };
+    };
+
+    /* Enable the VA Macro DMIC clock and use the DMIC01 pin pair. */
+    fragment@13 {
+        target = <&vamacro>;
+
+        __overlay__ {
+            status = "okay";
+            pinctrl-0 = <&dmic01_active>;
+            pinctrl-names = "default";
+            qcom,dmic-sample-rate = <4800000>;
         };
     };
 
