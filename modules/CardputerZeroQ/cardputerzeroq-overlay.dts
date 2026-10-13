@@ -318,7 +318,7 @@
     /* QUP0 is wired as SPI0 above. Its alternate GENI I2C node would
      * request the same GPIO0/GPIO1 pins and fail probe; M5IO I2C is
      * provided virtually by m5io-hub-i2c on top of SPI. */
-    fragment@6 {
+    fragment@2 {
         target = <&i2c0>;
 
         __overlay__ {
@@ -327,7 +327,7 @@
     };
 
     /* JD9852 replaces the stock ANX7625 bridge on the same DSI host. */
-    fragment@7 {
+    fragment@3 {
         target-path = "/soc@0/geniqup@4ac0000/i2c@4a84000/encoder@58";
 
         __overlay__ {
@@ -335,11 +335,25 @@
         };
     };
 
+    /* The CardputerZeroQ panel disables ANX7625.  Disable the matching
+     * HDMI/I2S DAI link as well, otherwise snd-sm8250 keeps looking for the
+     * unavailable ANX7625 codec DAI and the complete sound card probe fails.
+     */
+    fragment@4 {
+        target-path = "/sound";
+
+        __overlay__ {
+            hdmi-i2s-dai-link {
+                status = "disabled";
+            };
+        };
+    };
+
 };
 
 /* JD9852 MIPI-DSI panel configuration. */
 / {
-fragment@2 {
+fragment@5 {
     target-path = "/";
 
     __overlay__ {
@@ -370,7 +384,7 @@ fragment@2 {
     };
 };
 
-fragment@3 {
+fragment@6 {
     target = <&mdp>;
 
     __overlay__ {
@@ -378,7 +392,7 @@ fragment@3 {
     };
 };
 
-fragment@4 {
+fragment@7 {
     target = <&mdss_dsi0>;
 
     __overlay__ {
@@ -404,7 +418,7 @@ fragment@4 {
     };
 };
 
-fragment@5 {
+fragment@8 {
     target = <&mdss_dsi0_out>;
 
     __overlay__ {
@@ -418,7 +432,7 @@ fragment@5 {
 /* cam MIPI-CSI configuration. */
 / {
 
-    fragment@8 {
+    fragment@9 {
         target = <&cci>;
 
         __overlay__ {
@@ -426,7 +440,7 @@ fragment@5 {
         };
     };
 
-    fragment@9 {
+    fragment@10 {
         target = <&camss>;
 
         __overlay__ {
@@ -454,7 +468,7 @@ fragment@5 {
     };
 
 
-    fragment@10 {
+    fragment@11 {
         target = <&cci_i2c0>;
 
         __overlay__ {
