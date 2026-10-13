@@ -36,10 +36,16 @@
 #define M5IO_HUB_CHN_MAX        M5IO_HUB_CHN_UART2
 
 #define M5IO_HUB_FUNC_I2C       2
+#define M5IO_HUB_FUNC_SPI       3
+#define M5IO_HUB_SPI_MAX_LEN    1024
+/* Even DATA chunks also work with the MCU's 16-bit SPI mode. */
+#define M5IO_HUB_SPI_CHUNK_LEN  254
 #define M5IO_HUB_TOKEN_PAYLOAD_MAX 15
 #define M5IO_HUB_DATA_PAYLOAD_MAX 255
 
 /* Synchronous TOKEN request. Optional I2C DATA uses PID=0, CH=bus.
+ * SPI DATA requires both data_tx and data_rx, CH=3, up to 1024 bytes;
+ * chunks are 254 bytes (last may be shorter), with PID cycling 0..3.
  * reply/status are the terminal TOKEN payload/ARG, even on firmware errors.
  * data_rx is published only after both DATA and a successful TOKEN arrive.
  */

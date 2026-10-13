@@ -193,11 +193,23 @@ struct m5_rpc_i2c {
   int error;
 };
 
+/* FUNC3 has one transaction context; DATA PID is a sequence, not a TID. */
+struct m5_rpc_spi {
+  struct mutex lock;
+  int tid;
+  unsigned int expected_len;
+  unsigned int rx_len;
+  u8 next_pid;
+  u8 rx[M5IO_HUB_SPI_MAX_LEN];
+  int error;
+};
+
 struct m5io_hub_core {
   struct m5io_hub hub;
 
   struct m5_rpc rpc;
   struct m5_rpc_i2c i2c;
+  struct m5_rpc_spi spi_rpc;
 
   struct work_struct rpc_work;
   struct mutex spi_lock;
@@ -804,6 +816,28 @@ static void m5_rpc_i2c_data_rx(struct m5io_hub_core *mcore,
             expected_len, error);
 }
 
+static void m5_rpc_spi_data_rx(struct m5io_hub_core *mcore,
+                              const struct m5_rpc_data_frame *frame) {
+  struct m5_rpc_spi *rpc = &mcore->spi_rpc;
+  unsigned long flags;
+  unsigned int len;
+
+  spin_lock_irqsave(&mcore->rpc.token.state_lock, flags);
+  if (rpc->tid >= 0 && mcore->rpc.token.waiting[rpc->tid] && !rpc->error) {
+    len = min_t(unsigned int, M5IO_HUB_SPI_CHUNK_LEN,
+                rpc->expected_len - rpc->rx_len);
+    if (!len || m5_rpc_data_len(frame) != len ||
+        m5_rpc_data_tid(frame) != rpc->next_pid) {
+      rpc->error = -EPROTO;
+    } else {
+      memcpy(rpc->rx + rpc->rx_len, frame->data, len);
+      rpc->rx_len += len;
+      rpc->next_pid = (rpc->next_pid + 1) & 3;
+    }
+  }
+  spin_unlock_irqrestore(&mcore->rpc.token.state_lock, flags);
+}
+
 /**
  * m5_rpc_rx_stream_feed - 将一次 SPI 读回的数据送入协议流解析器
  * @mcore: hub 核心上下文
@@ -893,6 +927,11 @@ static unsigned int m5_rpc_rx_stream_feed(struct m5io_hub_core *mcore,
       } else if (chn == M5_RPC_CHN_IIC1 || chn == M5_RPC_CHN_IIC2) {
         /* FUNC=2 has a completion TOKEN; this firmware has no DATA ACK. */
         m5_rpc_i2c_data_rx(mcore, data_frame);
+      } else if (chn == M5_RPC_CHN_SPI) {
+        /* FUNC3 mirrors the MOSI chunks, then sends a terminal TOKEN.
+         * It neither needs nor implements asynchronous DATA ACK windows.
+         */
+        m5_rpc_spi_data_rx(mcore, data_frame);
       } else if (m5_rpc_data_rx_frame_put(mcore, stream->frame,
                                            stream->expect_len,
                                            &queue_data_work)) {
@@ -1295,7 +1334,7 @@ static irqreturn_t m5io_hub_irq_thread(int irq, void *data) {
 /**
  * m5io_hub_SendChnData - 非阻塞发送一个 DATA 帧
  * @hub: hub 句柄
- * @chn: 异步 DATA 通道；I2C 通道须使用 m5io_hub_exec()
+ * @chn: 异步 DATA 通道；I2C/SPI 通道须使用 m5io_hub_exec()
  * @data: 待发送的 Payload，@len 为 0 时可为 NULL
  * @len: Payload 长度，最大 255 字节
  *
@@ -1325,7 +1364,8 @@ int m5io_hub_SendChnData(struct m5io_hub *hub, unsigned int chn,
       (len && !data))
     return -EINVAL;
 
-  if (chn == M5_RPC_CHN_IIC1 || chn == M5_RPC_CHN_IIC2)
+  if (chn == M5_RPC_CHN_IIC1 || chn == M5_RPC_CHN_IIC2 ||
+      chn == M5_RPC_CHN_SPI)
     return -EOPNOTSUPP;
 
   mcore = container_of(hub, struct m5io_hub_core, hub);
@@ -1365,7 +1405,8 @@ int m5io_hub_register_chn_data_handler(
   if (!hub || !hub->spi || !handler || !chn || chn > M5IO_HUB_CHN_MAX)
     return -EINVAL;
 
-  if (chn == M5_RPC_CHN_IIC1 || chn == M5_RPC_CHN_IIC2)
+  if (chn == M5_RPC_CHN_IIC1 || chn == M5_RPC_CHN_IIC2 ||
+      chn == M5_RPC_CHN_SPI)
     return -EOPNOTSUPP;
 
   mcore = container_of(hub, struct m5io_hub_core, hub);
@@ -1427,8 +1468,94 @@ static int m5io_hub_check_pin(unsigned int pin) {
  * Arduino 风格的用户接口
  * ------------------------------------------------------------------------- */
 
+/* Queue the complete FUNC3 request atomically so other requests cannot
+ * interleave with its MOSI stream. No DATA window allocation/ACK is involved.
+ */
+static int m5_rpc_spi_exec(struct m5io_hub_core *mcore,
+                          struct m5io_hub_request *request) {
+  struct m5_rpc_spi *rpc = &mcore->spi_rpc;
+  struct m5_rpc_token_frame *token;
+  struct m5_rpc_data_frame *data;
+  struct mutex *tid_lock;
+  unsigned long flags;
+  unsigned int tid, tx_len, offset, len;
+  u8 pid = 0;
+  u8 *tx;
+  int ret;
+
+  if (request->data_len) {
+    if (request->data_len <= 13 || request->data_len > M5IO_HUB_SPI_MAX_LEN ||
+        request->data_chn != M5_RPC_CHN_SPI ||
+        !request->data_tx || !request->data_rx ||
+        request->arg != 2 || request->payload_len != 2 ||
+        (request->payload[0] | (request->payload[1] << 8)) != request->data_len)
+      return -EINVAL;
+  } else if (request->data_tx || request->data_rx) {
+    return -EINVAL;
+  }
+
+  tx = kmalloc(M5_RPC_TOKEN_MAX_LEN + M5IO_HUB_SPI_MAX_LEN +
+               DIV_ROUND_UP(M5IO_HUB_SPI_MAX_LEN, M5IO_HUB_SPI_CHUNK_LEN) *
+               (M5_RPC_DATA_HDR_LEN + M5_RPC_CRC_LEN), GFP_KERNEL);
+  if (!tx)
+    return -ENOMEM;
+
+  request->reply_len = 0;
+  request->status = 0xff;
+  mutex_lock(&rpc->lock);
+  tid_lock = token_tid_alloc(mcore, m5_rpc_token_done_cb, request->func);
+  tid = tid_lock - mcore->rpc.token.tid_lock;
+  spin_lock_irqsave(&mcore->rpc.token.state_lock, flags);
+  rpc->tid = tid;
+  rpc->expected_len = request->data_len;
+  rpc->rx_len = 0;
+  rpc->next_pid = 0;
+  rpc->error = 0;
+  spin_unlock_irqrestore(&mcore->rpc.token.state_lock, flags);
+
+  token = (struct m5_rpc_token_frame *)tx;
+  m5_rpc_token_frame_fill(token, M5_RPC_TYPE_TOKEN, 1, tid, request->func,
+                          request->payload_len, request->arg, request->payload);
+  m5_rpc_token_frame_crc_fill(token);
+  tx_len = M5_RPC_TOKEN_HDR_LEN + request->payload_len + M5_RPC_CRC_LEN;
+  for (offset = 0; offset < request->data_len; offset += len) {
+    len = min_t(unsigned int, M5IO_HUB_SPI_CHUNK_LEN, request->data_len - offset);
+    data = (struct m5_rpc_data_frame *)(tx + tx_len);
+    m5_rpc_data_frame_fill(data, pid, M5_RPC_CHN_SPI, len,
+                           request->data_tx + offset);
+    m5_rpc_data_frame_crc_fill(data);
+    tx_len += M5_RPC_DATA_HDR_LEN + len + M5_RPC_CRC_LEN;
+    pid = (pid + 1) & 3;
+  }
+  ret = m5_rpc_frame_put(mcore, tx, tx_len);
+  if (!ret)
+    ret = m5_rpc_token_wait(mcore, tid, msecs_to_jiffies(M5_RPC_TOKEN_TIMEOUT_MS));
+
+  spin_lock_irqsave(&mcore->rpc.token.state_lock, flags);
+  if (mcore->rpc.token.rx_len[tid]) {
+    token = (struct m5_rpc_token_frame *)mcore->rpc.token.rx[tid];
+    request->status = m5_rpc_token_arg(token);
+    request->reply_len = m5_rpc_token_len(token);
+    memcpy(request->reply, token->data, request->reply_len);
+  }
+  if (!ret && rpc->error)
+    ret = rpc->error;
+  if (!ret && request->data_len &&
+      (rpc->rx_len != request->data_len || request->reply_len))
+    ret = -EPROTO;
+  /* Publish nothing until the entire stream and final TOKEN are valid. */
+  if (!ret && request->data_len)
+    memcpy(request->data_rx, rpc->rx, request->data_len);
+  rpc->tid = -1;
+  spin_unlock_irqrestore(&mcore->rpc.token.state_lock, flags);
+  token_tid_free(mcore, tid_lock);
+  mutex_unlock(&rpc->lock);
+  kfree(tx);
+  return ret;
+}
+
 /**
- * m5io_hub_exec - execute a TOKEN and optional I2C DATA transaction
+ * m5io_hub_exec - execute a TOKEN and optional I2C/SPI DATA transaction
  * @hub: hub 句柄
  * @request: request fields and terminal reply; buffers must live until return
  *
@@ -1452,11 +1579,14 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
   if (!hub || !hub->spi)
     return -ENODEV;
 
-  if (!request || request->func > M5IO_HUB_FUNC_I2C ||
+  if (!request || request->func > M5IO_HUB_FUNC_SPI ||
       request->arg > M5_RPC_TOKEN_ARG_MASK ||
       request->payload_len > M5_RPC_TOKEN_MAX_PLEN ||
       (request->payload_len && !request->payload))
     return -EINVAL;
+
+  if (request->func == M5IO_HUB_FUNC_SPI)
+    return m5_rpc_spi_exec(container_of(hub, struct m5io_hub_core, hub), request);
 
   is_i2c = request->func == M5IO_HUB_FUNC_I2C;
   if (is_i2c)
@@ -1818,6 +1948,8 @@ static int m5io_hub_probe(struct spi_device *spi) {
   mutex_init(&mcore->hub.lock);
   mutex_init(&mcore->i2c.lock);
   mcore->i2c.tid = -1;
+  mutex_init(&mcore->spi_rpc.lock);
+  mcore->spi_rpc.tid = -1;
 
   /* RPC 工作项：调用方走 worker；IRQ 在线程化中断中激活排空事务 */
   {
