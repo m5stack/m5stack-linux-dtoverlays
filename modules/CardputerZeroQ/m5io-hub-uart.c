@@ -458,9 +458,9 @@ err_unregister:
         if (!up->registered)
             continue;
         cancel_delayed_work_sync(&up->tx_work);
-        uart_remove_one_port(&m5io_hub_uart_driver, &up->port);
         m5io_hub_unregister_chn_data_handler(mu->hub, up->channel,
                                              m5io_hub_uart_rx_data, up);
+        uart_remove_one_port(&m5io_hub_uart_driver, &up->port);
     }
     return ret;
 }
@@ -478,9 +478,9 @@ static void m5io_hub_uart_remove(struct platform_device *pdev)
         if (!up->registered)
             continue;
         cancel_delayed_work_sync(&up->tx_work);
-        uart_remove_one_port(&m5io_hub_uart_driver, &up->port);
         m5io_hub_unregister_chn_data_handler(mu->hub, up->channel,
                                              m5io_hub_uart_rx_data, up);
+        uart_remove_one_port(&m5io_hub_uart_driver, &up->port);
         up->registered = false;
     }
 }

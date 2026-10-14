@@ -77,6 +77,10 @@
 #define M5_RPC_DATA_ACK_TID_MASK 0x03
 #define M5_RPC_DATA_ACK_CHN_SHIFT 2
 #define M5_RPC_DATA_ACK_RESERVED_MASK BIT(7)
+#define M5_RPC_DATA_ACK_RETRY_FIFO_SIZE 128
+#define M5_RPC_DATA_ACK_RETRY_PENDING_BITS \
+  (M5IO_HUB_RPC_TID_NR * (M5IO_HUB_CHN_MAX + 1))
+#define M5_RPC_DATA_ACK_RETRY_DELAY_MS 20
 
 #define M5_RPC_TOKEN_TYPE_MASK BIT(0)
 #define M5_RPC_TOKEN_P_MASK BIT(1)
@@ -153,15 +157,27 @@ struct m5io_hub_core;
 
 typedef void (*m5_rpc_cb_t)(struct m5io_hub_core *mcore, int tid, int status);
 
+struct m5_rpc_data_ack {
+  u8 tid;
+  u8 chn;
+};
+
 struct m5_rpc_data {
   spinlock_t tx_window_lock;
   unsigned long tx_windows;
   u8 tx_chn[M5IO_HUB_RPC_TID_NR];
+  spinlock_t ack_retry_lock;
+  DECLARE_KFIFO(ack_retry_fifo, struct m5_rpc_data_ack,
+                M5_RPC_DATA_ACK_RETRY_FIFO_SIZE);
+  DECLARE_BITMAP(ack_retry_pending, M5_RPC_DATA_ACK_RETRY_PENDING_BITS);
   struct kfifo rx_fifo;
   spinlock_t rx_lock;
   wait_queue_head_t rx_wq;
   bool rx_work_scheduled;
   struct mutex handler_lock;
+  /* Protect callback lifetime while handler_lock is not held in callbacks. */
+  wait_queue_head_t handler_wq[M5IO_HUB_CHN_MAX + 1];
+  atomic_t handler_inflight[M5IO_HUB_CHN_MAX + 1];
   m5io_hub_chn_data_handler_t handler[M5IO_HUB_CHN_MAX + 1];
   void *handler_data[M5IO_HUB_CHN_MAX + 1];
 };
@@ -234,6 +250,8 @@ struct m5io_hub_core {
   u8 *rpc_xfer_rx_buf;
 
   struct work_struct rpc_work;
+  struct delayed_work data_ack_retry_work;
+  bool data_ack_retry_work_scheduled;
   struct mutex spi_lock;
   atomic_t active_reqs;
   struct m5_rpc_rx_stream rx_stream;
@@ -254,6 +272,11 @@ struct m5io_hub_core {
   void *gpio_irq_handler_data;
   u32 gpio_irq_handler_generation;
 };
+
+static void m5_rpc_rx_stream_reset(struct m5io_hub_core *mcore) {
+  mcore->rx_stream.len = 0;
+  mcore->rx_stream.expect_len = 0;
+}
 
 static void m5io_hub_gpio_irq_worker(struct work_struct *work) {
   struct m5io_hub_core *mcore;
@@ -493,6 +516,78 @@ static int m5_rpc_data_ack_send(struct m5io_hub_core *mcore, u8 tid, u8 chn) {
   m5_rpc_token_frame_crc_fill(frame);
 
   return m5_rpc_frame_put(mcore, tx_buf, sizeof(tx_buf));
+}
+
+/*
+ * Keep a failed DATA ACK until the TX FIFO can accept it.  The MCU stops
+ * advancing its DATA window until this ACK arrives, so dropping it here can
+ * eventually stall both directions of DATA traffic.
+ */
+static void m5_rpc_data_ack_retry_work(struct work_struct *work) {
+  struct m5io_hub_core *mcore;
+  struct m5_rpc_data_ack ack;
+  unsigned long flags;
+  bool have_ack;
+  int ret;
+
+  mcore = container_of(to_delayed_work(work), struct m5io_hub_core,
+                       data_ack_retry_work);
+
+  for (;;) {
+    spin_lock_irqsave(&mcore->rpc.data.ack_retry_lock, flags);
+    have_ack = kfifo_peek(&mcore->rpc.data.ack_retry_fifo, &ack);
+    if (!have_ack) {
+      mcore->data_ack_retry_work_scheduled = false;
+      spin_unlock_irqrestore(&mcore->rpc.data.ack_retry_lock, flags);
+      return;
+    }
+    spin_unlock_irqrestore(&mcore->rpc.data.ack_retry_lock, flags);
+
+    ret = m5_rpc_data_ack_send(mcore, ack.tid, ack.chn);
+    if (ret) {
+      mod_delayed_work(system_wq, &mcore->data_ack_retry_work,
+                       max_t(unsigned long, 1,
+                             msecs_to_jiffies(M5_RPC_DATA_ACK_RETRY_DELAY_MS)));
+      return;
+    }
+
+    spin_lock_irqsave(&mcore->rpc.data.ack_retry_lock, flags);
+    kfifo_skip(&mcore->rpc.data.ack_retry_fifo);
+    clear_bit(ack.chn * M5IO_HUB_RPC_TID_NR + ack.tid,
+              mcore->rpc.data.ack_retry_pending);
+    spin_unlock_irqrestore(&mcore->rpc.data.ack_retry_lock, flags);
+  }
+}
+
+static void m5_rpc_data_ack_retry_queue(struct m5io_hub_core *mcore, u8 tid,
+                                        u8 chn) {
+  struct m5_rpc_data_ack ack = {.tid = tid, .chn = chn};
+  unsigned long flags;
+  bool queue = false;
+
+  spin_lock_irqsave(&mcore->rpc.data.ack_retry_lock, flags);
+  if (test_and_set_bit(chn * M5IO_HUB_RPC_TID_NR + tid,
+                       mcore->rpc.data.ack_retry_pending)) {
+    spin_unlock_irqrestore(&mcore->rpc.data.ack_retry_lock, flags);
+    return;
+  }
+  if (!kfifo_put(&mcore->rpc.data.ack_retry_fifo, ack)) {
+    clear_bit(chn * M5IO_HUB_RPC_TID_NR + tid,
+              mcore->rpc.data.ack_retry_pending);
+    spin_unlock_irqrestore(&mcore->rpc.data.ack_retry_lock, flags);
+    dev_warn_ratelimited(mcore->hub.dev,
+                         "DATA ACK retry queue full: tid=%u chn=%u\n", tid,
+                         chn);
+    return;
+  }
+  if (!mcore->data_ack_retry_work_scheduled) {
+    mcore->data_ack_retry_work_scheduled = true;
+    queue = true;
+  }
+  spin_unlock_irqrestore(&mcore->rpc.data.ack_retry_lock, flags);
+
+  if (queue)
+    queue_delayed_work(system_wq, &mcore->data_ack_retry_work, 0);
 }
 
 /**
@@ -755,12 +850,19 @@ static void m5_rpc_data_rx_worker(struct work_struct *work) {
     handler = mcore->rpc.data.handler[chn];
     handler_data = mcore->rpc.data.handler_data[chn];
     if (handler)
+      atomic_inc(&mcore->rpc.data.handler_inflight[chn]);
+    mutex_unlock(&mcore->rpc.data.handler_lock);
+
+    if (handler) {
       handler(handler_data, frame->data, payload_len);
-    else
+
+      if (atomic_dec_and_test(&mcore->rpc.data.handler_inflight[chn]))
+        wake_up_all(&mcore->rpc.data.handler_wq[chn]);
+    } else {
       dev_dbg_ratelimited(mcore->hub.dev,
                           "drop data for unregistered channel %u\n",
                           chn);
-    mutex_unlock(&mcore->rpc.data.handler_lock);
+    }
   }
 }
 
@@ -958,10 +1060,13 @@ static unsigned int m5_rpc_rx_stream_feed(struct m5io_hub_core *mcore,
                                            stream->expect_len,
                                            &queue_data_work)) {
         ret = m5_rpc_data_ack_send(mcore, data_tid, chn);
-        if (ret)
+        if (ret) {
           dev_warn_ratelimited(mcore->hub.dev,
-                               "failed to send data ack: tid=%u chn=%u: %d\n",
+                               "failed to send data ack, retrying: tid=%u "
+                               "chn=%u: %d\n",
                                data_tid, chn, ret);
+          m5_rpc_data_ack_retry_queue(mcore, data_tid, chn);
+        }
         if (queue_data_work)
           queue_work(system_unbound_wq, &mcore->data_rx_work);
       }
@@ -1258,8 +1363,10 @@ static int m5io_hub_rpc_transaction(struct m5io_hub_core *mcore) {
     ret = spi_sync_transfer(mcore->hub.spi, &transfer, 1);
     if (i2c_token)
       m5io_dbg("m5io-hub-core: SPI I2C TOKEN transfer ret=%d\n", ret);
-    if (ret)
+    if (ret) {
+      m5_rpc_rx_stream_reset(mcore);
       break;
+    }
 
     dev_dbg(mcore->hub.dev, "rpc tx=%*ph rx=%*ph\n",
             (int)xfer_len, tx_buf, (int)xfer_len, rx_buf);
@@ -1410,7 +1517,9 @@ EXPORT_SYMBOL_GPL(m5io_hub_SendChnData);
  * @data: 传给 @handler 的私有数据
  *
  * 每个通道只允许一个处理函数。处理函数在可睡眠的工作队列上下文调用，
- * @buf 只在本次回调期间有效。
+ * @buf 只在本次回调期间有效。处理函数在内部 handler 锁之外调用，可以
+ * 睡眠；处理函数不得从 DATA 回调上下文调用
+ * m5io_hub_unregister_chn_data_handler()。
  */
 int m5io_hub_register_chn_data_handler(
     struct m5io_hub *hub, unsigned int chn,
@@ -1446,12 +1555,14 @@ EXPORT_SYMBOL_GPL(m5io_hub_register_chn_data_handler);
  * @handler: 注册时使用的处理函数
  * @data: 注册时使用的私有数据
  *
- * 返回时已经没有该处理函数正在执行。
+ * 返回时已经没有该处理函数正在执行。不得从 DATA 回调上下文调用本函数，
+ * 因为注销会同步等待已经开始的回调结束。
  */
 void m5io_hub_unregister_chn_data_handler(
     struct m5io_hub *hub, unsigned int chn,
     m5io_hub_chn_data_handler_t handler, void *data) {
   struct m5io_hub_core *mcore;
+  bool detached = false;
 
   if (!hub || !chn || chn > M5IO_HUB_CHN_MAX)
     return;
@@ -1462,8 +1573,19 @@ void m5io_hub_unregister_chn_data_handler(
       mcore->rpc.data.handler_data[chn] == data) {
     mcore->rpc.data.handler[chn] = NULL;
     mcore->rpc.data.handler_data[chn] = NULL;
+    detached = true;
   }
   mutex_unlock(&mcore->rpc.data.handler_lock);
+
+  /*
+   * The handler is detached before waiting, so no new callback can become
+   * active for this registration.  Keep this wait outside handler_lock: the
+   * callback decrements the in-flight count after it returns; it does not
+   * need handler_lock to do so.
+   */
+  if (detached)
+    wait_event(mcore->rpc.data.handler_wq[chn],
+               !atomic_read(&mcore->rpc.data.handler_inflight[chn]));
 }
 EXPORT_SYMBOL_GPL(m5io_hub_unregister_chn_data_handler);
 
@@ -1966,9 +2088,13 @@ EXPORT_SYMBOL_GPL(m5io_hub_unregister_gpio_irq_handler);
 static void m5io_hub_cancel_works(void *data) {
   struct m5io_hub_core *mcore = data;
 
+  cancel_delayed_work_sync(&mcore->data_ack_retry_work);
   cancel_work_sync(&mcore->rpc_work);
+  /* rpc_work may have queued an ACK while the first cancellation was active. */
+  cancel_delayed_work_sync(&mcore->data_ack_retry_work);
   cancel_work_sync(&mcore->data_rx_work);
   cancel_work_sync(&mcore->gpio_irq_work);
+  m5_rpc_rx_stream_reset(mcore);
 }
 
 /**
@@ -2023,6 +2149,8 @@ static int m5io_hub_probe(struct spi_device *spi) {
     int i;
 
     INIT_WORK(&mcore->rpc_work, m5io_hub_rpc_worker);
+    INIT_DELAYED_WORK(&mcore->data_ack_retry_work,
+                      m5_rpc_data_ack_retry_work);
     INIT_WORK(&mcore->data_rx_work, m5_rpc_data_rx_worker);
     INIT_WORK(&mcore->gpio_irq_work, m5io_hub_gpio_irq_worker);
     mutex_init(&mcore->spi_lock);
@@ -2031,8 +2159,14 @@ static int m5io_hub_probe(struct spi_device *spi) {
     spin_lock_init(&mcore->gpio_irq_pending_lock);
     INIT_KFIFO(mcore->gpio_irq_fifo);
     spin_lock_init(&mcore->rpc.data.tx_window_lock);
+    spin_lock_init(&mcore->rpc.data.ack_retry_lock);
+    INIT_KFIFO(mcore->rpc.data.ack_retry_fifo);
     spin_lock_init(&mcore->rpc.token.state_lock);
     atomic_set(&mcore->active_reqs, 0);
+    for (i = 0; i < ARRAY_SIZE(mcore->rpc.data.handler_wq); i++) {
+      init_waitqueue_head(&mcore->rpc.data.handler_wq[i]);
+      atomic_set(&mcore->rpc.data.handler_inflight[i], 0);
+    }
     for (i = 0; i < ARRAY_SIZE(mcore->rpc.token.tid_lock); i++) {
       mutex_init(&mcore->rpc.token.tid_lock[i]);
       init_completion(&mcore->rpc.token.done[i]);

@@ -89,6 +89,11 @@ struct m5io_hub {
 };
 
 typedef void (*m5io_hub_gpio_irq_handler_t)(void *data, unsigned int pin);
+/*
+ * DATA handlers run in process context and may sleep.  They must not call
+ * m5io_hub_unregister_chn_data_handler() from a DATA callback: that API
+ * waits synchronously for in-flight callbacks to finish.
+ */
 typedef void (*m5io_hub_chn_data_handler_t)(void *data, const u8 *buf,
                                             unsigned int len);
 
