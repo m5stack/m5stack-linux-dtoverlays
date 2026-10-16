@@ -319,7 +319,7 @@
                         #address-cells = <1>;
                         #size-cells = <0>;
                         clock-frequency = <100000>;
-                        status = "disabled";
+                        status = "okay";
                     };
                 };
 
@@ -327,7 +327,7 @@
                     compatible = "m5stack,m5io-hub-spi";
                     #address-cells = <1>;
                     #size-cells = <0>;
-                    status = "disabled";
+                    status = "okay";
                 };
             };
 

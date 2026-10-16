@@ -52,7 +52,7 @@ KERNEL_ARGS := $(if $(KERNEL_OUT),O=$(KERNEL_OUT)) M=$(CURDIR) \
 	KBUILD_MODPOST_WARN=$(KBUILD_MODPOST_WARN)
 
 .PHONY: all module modules dtbs install install-module install-dtbs \
-	install-rules install-dtb install-tca8418 clean clean-dtbs help check-kernel
+	install-rules install-uapi install-dtb install-tca8418 clean clean-dtbs help check-kernel
 
 all: module dtbs
 
@@ -91,6 +91,10 @@ install-dtbs: dtbs
 install-rules:
 	install -D -m 0644 "$(RULES)" "$(ROOTFSPATH)/etc/udev/rules.d/$(RULES)"
 
+UAPI_INSTALL_DIR ?= $(ROOTFSPATH)/usr/include/linux
+install-uapi:
+	install -D -m 0644 m5io-hub-uapi.h "$(UAPI_INSTALL_DIR)/m5io-hub-uapi.h"
+
 install-tca8418:
 	@test -d "$(TCA8418_DIR)" || { \
 		echo "TCA8418 module directory not found: $(TCA8418_DIR)" >&2; \
@@ -117,7 +121,7 @@ install-dtb:
 	@test -n "$(DTB_INSTALL_PATH)" || { echo "Set DTB_INSTALL_PATH=/boot/efi/dtb/qcom/board.dtb" >&2; exit 1; }
 	install -D -m 0644 "$(DTB)" "$(ROOTFSPATH)$(DTB_INSTALL_PATH)"
 
-install: all install-module install-dtbs install-rules install-tca8418
+install: all install-module install-dtbs install-rules install-uapi install-tca8418
 
 clean:
 	@if [ -f "$(KERNELDIR)/Makefile" ]; then \
@@ -136,6 +140,7 @@ help:
 	@echo "  install         Install modules, overlays and udev rules"
 	@echo "  install-tca8418 Install the sibling TCA8418 keyboard module"
 	@echo "  install-dtb     Install a supplied, already merged complete DTB"
+	@echo "  install-uapi    Install the userspace OTA ioctl header"
 	@echo "  clean           Remove generated files"
 	@echo ""
 	@echo "Variables:"

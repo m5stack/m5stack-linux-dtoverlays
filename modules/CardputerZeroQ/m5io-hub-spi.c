@@ -16,6 +16,10 @@
 #define M5IO_SPI_DISABLE        6
 #define M5IO_SPI_MIN_HZ         250000
 #define M5IO_SPI_MAX_HZ         20000000
+/* The MCU answers SPI CONFIG with BUSY while its exchange queue is draining,
+ * so the request is retried instead of failing the transfer. */
+#define M5IO_SPI_CFG_BUSY_TRIES 6
+#define M5IO_SPI_CFG_BUSY_DELAY_US 20000
 
 struct m5io_hub_spi {
     struct m5io_hub *hub;
@@ -88,16 +92,55 @@ static int m5io_hub_spi_configure(struct m5io_hub_spi *ms,
         .payload = payload,
         .payload_len = sizeof(payload),
     };
+    unsigned int attempt;
     int ret;
 
     /* Firmware rounds down to a hardware prescaler. Never round Hz up. */
     put_unaligned_le16(t->speed_hz / 1000, payload + 2);
-    ret = m5io_hub_exec(ms->hub, &req);
-    if (ret)
-        return ret;
-    if (req.status != 0)
+
+    /*
+     * BUSY means the MCU still has exchanges queued for this port.  It is a
+     * retry, not a failure: the queue drains on its own.  CONFIG runs per
+     * message and per chip-select group, so back-to-back transfers can hit it
+     * even when the port is healthy.
+     */
+    for (attempt = 0; attempt < M5IO_SPI_CFG_BUSY_TRIES; attempt++) {
+        req.status = 0xff;
+        ret = m5io_hub_exec(ms->hub, &req);
+        /*
+         * The MCU answers CONFIG with status 4 when its exchange queue is not
+         * empty, and the transport surfaces that BUSY as -EBUSY from
+         * m5io_hub_exec() as well -- the token callback converts the reply
+         * status into the completion's errno.  Only req.status tells it apart
+         * from "the data line is held by an upgrade", so it must be tested
+         * *before* the error return.  Testing ret first made this loop retry
+         * zero times on BUSY, which is exactly the case it exists for.
+         */
+        if (req.status == 4) {
+            usleep_range(M5IO_SPI_CFG_BUSY_DELAY_US,
+                         M5IO_SPI_CFG_BUSY_DELAY_US + 2000);
+            continue;
+        }
+        if (ret)
+            return ret;
+        break;
+    }
+    if (req.status != 0) {
+        /*
+         * A persistent BUSY is not transient: the MCU refuses CONFIG while it
+         * still holds exchanges whose MISO payload has not been handed back to
+         * the host yet.  It has no timer that gives up on them, so once that
+         * queue is stuck the port stays unusable until the MCU is reset --
+         * observed as repeated EBUSY from userspace with nothing in the log.
+         * Say so explicitly instead of leaving the caller to guess.
+         */
+        if (req.status == 4)
+            dev_err_ratelimited(ms->hub->dev,
+                                "SPI CONFIG still BUSY after %u attempts: the MCU's exchange queue is stuck; reset the MCU to recover\n",
+                                M5IO_SPI_CFG_BUSY_TRIES);
         return req.status == 4 ? -EBUSY :
                (req.status == 3 ? -EINVAL : -EIO);
+    }
     if (req.reply_len)
         return -EPROTO;
     ms->configured = true;

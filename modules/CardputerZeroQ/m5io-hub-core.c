@@ -9,21 +9,27 @@
 #include <linux/bitops.h>
 #include <linux/completion.h>
 #include <linux/crc-itu-t.h>
+#include <linux/delay.h>
+#include <linux/fs.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/jiffies.h>
 #include <linux/kfifo.h>
 #include "m5io-hub.h"
+#include "m5io-hub-uapi.h"
+#include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/types.h>
+#include <linux/uaccess.h>
 #include <linux/workqueue.h>
 
 #define M5IO_HUB_FIFO_SIZE 4096
@@ -85,6 +91,35 @@
   (M5IO_HUB_RPC_TID_NR * (M5IO_HUB_CHN_MAX + 1))
 #define M5_RPC_DATA_ACK_RETRY_DELAY_MS 20
 #define M5_RPC_TX_OP_NR 16
+
+#define M5IO_HUB_IAP_READ 0x03
+#define M5IO_HUB_IAP_WREN 0x06
+#define M5IO_HUB_IAP_ENTRY 0x5a
+#define M5IO_HUB_IAP_START 0x77
+#define M5IO_HUB_IAP_RESPONSE_SIZE 8
+#define M5IO_HUB_IAP_HEADER_SIZE 8
+#define M5IO_HUB_IAP_DEFAULT_TIMEOUT_MS 2000
+#define M5IO_HUB_IAP_MIN_TIMEOUT_MS 100
+#define M5IO_HUB_IAP_MAX_TIMEOUT_MS 30000
+#define M5IO_HUB_IAP_REARM_DELAY_US 10000
+/*
+ * The APP only runs a requested reset once its transport has clocked the
+ * acknowledgement out, so the master has to keep the bus moving for the reset
+ * to land.  Dummy bytes do that without upsetting the APP's frame parser, and
+ * they are also the way to tell whether the bootloader is up: a bootloader that
+ * is listening rejects them with BAD_COMMAND, whereas the APP simply ignores
+ * them.  The entry loop therefore alternates dummy bytes and a read until the
+ * bootloader answers, and only then sends OPC_IAP.  The bootloader listens for
+ * 300 ms from the reset, so the loop also keeps the window under observation.
+ */
+#define M5IO_HUB_IAP_POKE_DELAY_US 2000
+#define M5IO_HUB_IAP_ENTRY_REPROBE_DELAY_US 6000
+#define M5IO_HUB_IAP_ENTRY_PROBE_TIMEOUT_MS 10
+#define M5IO_HUB_IAP_ENTRY_ATTEMPTS 24
+/* Refresh a pending bootloader reply occasionally rather than every attempt,
+ * so the retry loop spends its time inside the entry window. */
+#define M5IO_HUB_IAP_ENTRY_DRAIN_EVERY 4
+#define M5IO_HUB_IAP_POLL_DELAY_US 1000
 
 #define M5_RPC_TOKEN_TYPE_MASK BIT(0)
 #define M5_RPC_TOKEN_P_MASK BIT(1)
@@ -269,6 +304,19 @@ struct m5io_hub_core {
   struct delayed_work data_ack_retry_work;
   bool data_ack_retry_work_scheduled;
   struct mutex spi_lock;
+  /* Serializes userspace OTA with all normal RPC users. */
+  struct mutex ota_lock;
+  /*
+   * Owner of the m5hub data line, NULL when the line is free.  An upgrade
+   * holds it from its first command until it has finished, so no other
+   * context can put an RPC frame on the bus while the firmware is being
+   * replaced.  Written under tx_lock; read locklessly as a fast-path hint.
+   */
+  struct task_struct *bus_owner;
+  struct completion ota_ready;
+  bool ota_active;
+  struct miscdevice ota_misc;
+  char ota_misc_name[32];
   atomic_t active_reqs;
   struct m5_rpc_rx_stream rx_stream;
 
@@ -499,23 +547,50 @@ static void m5_rpc_data_frame_crc_fill(struct m5_rpc_data_frame *frame) {
  *
  * Return: 0 已入队；-ENOSPC FIFO 空间不足；其余为 m5io_hub_rpc_transfer() 错误码。
  */
+/*
+ * True when another context owns the m5hub data line, i.e. an upgrade is in
+ * progress.  The owning thread itself is let through, so an upgrade can still
+ * issue the APP reset request before it switches to the raw IAP command
+ * stream.
+ */
+static bool m5io_hub_bus_held_by_other(const struct m5io_hub_core *mcore)
+{
+  struct task_struct *owner = READ_ONCE(mcore->bus_owner);
+
+  return owner && owner != current;
+}
+
 static int m5_rpc_frame_put(struct m5io_hub_core *mcore, const u8 *buf,
                             unsigned int len) {
   unsigned long flags;
   unsigned int copied;
+  int ret;
 
   if (!mcore || !buf || !len)
     return -EINVAL;
 
   spin_lock_irqsave(&mcore->tx_lock, flags);
+  /*
+   * Test the data-line owner, enqueue and queue the transfer in one critical
+   * section.  An upgrade takes the line and resets the FIFO under this same
+   * lock, so a frame can neither be slipped in behind its back nor be dropped
+   * after this function already reported the request as accepted.
+   */
+  if (mcore->bus_owner && mcore->bus_owner != current) {
+    spin_unlock_irqrestore(&mcore->tx_lock, flags);
+    return -EBUSY;
+  }
   copied = kfifo_avail(&mcore->tx_fifo) >= len
                ? kfifo_in(&mcore->tx_fifo, buf, len)
                : 0;
-  spin_unlock_irqrestore(&mcore->tx_lock, flags);
-  if (copied != len)
+  if (copied != len) {
+    spin_unlock_irqrestore(&mcore->tx_lock, flags);
     return -ENOSPC;
+  }
+  ret = m5io_hub_rpc_transfer(&mcore->hub);
+  spin_unlock_irqrestore(&mcore->tx_lock, flags);
 
-  return m5io_hub_rpc_transfer(&mcore->hub);
+  return ret;
 }
 
 /* DATA ACK TOKENs are control traffic and do not allocate a TOKEN window. */
@@ -694,6 +769,27 @@ static void m5_rpc_data_state_reset(struct m5io_hub_core *mcore)
   spin_unlock_irqrestore(&mcore->rpc.data.ack_retry_lock, flags);
 }
 
+/*
+ * Cancel a pending DATA ACK retry and clear its bookkeeping.  The retry worker
+ * only clears data_ack_retry_work_scheduled itself when it drains the queue,
+ * so a plain cancel_delayed_work_sync() would leave the flag set and silently
+ * stop every later ACK from being scheduled.  Queued retries are dropped
+ * because the MCU is about to be reset and can no longer consume them.
+ */
+static void m5io_hub_data_ack_retry_cancel(struct m5io_hub_core *mcore)
+{
+  unsigned long flags;
+
+  cancel_delayed_work_sync(&mcore->data_ack_retry_work);
+
+  spin_lock_irqsave(&mcore->rpc.data.ack_retry_lock, flags);
+  kfifo_reset(&mcore->rpc.data.ack_retry_fifo);
+  bitmap_zero(mcore->rpc.data.ack_retry_pending,
+              M5_RPC_DATA_ACK_RETRY_PENDING_BITS);
+  mcore->data_ack_retry_work_scheduled = false;
+  spin_unlock_irqrestore(&mcore->rpc.data.ack_retry_lock, flags);
+}
+
 static int m5_rpc_response_status_to_errno(u8 status) {
   switch (status) {
   case 0x0:
@@ -838,11 +934,21 @@ static void m5_rpc_token_rx_dispatch(struct m5io_hub_core *mcore, const u8 *buf,
       return;
     }
 
+    /*
+     * An ACK that matches no held slot means the two sides disagree about the
+     * DATA window.  The slot map is printed because that disagreement is the
+     * first visible sign of a window leak, which the MCU cannot recover from
+     * on its own.
+     */
     if (ack_kind == M5_RPC_ACK_WINDOW &&
         !m5_rpc_data_window_release(mcore, ack_pid, ack_chn))
-      dev_dbg_ratelimited(mcore->hub.dev,
-                          "drop unmatched data ack: data_pid=%u chn=%u\n",
-                          ack_pid, ack_chn);
+      dev_warn_ratelimited(mcore->hub.dev,
+                           "unmatched data ack: pid=%u chn=%u kind=%u op=%u "
+                           "st=%u tx_windows=%#lx chn_map=%u,%u,%u,%u\n",
+                           ack_pid, ack_chn, ack_kind, ack_op, ack_status,
+                           mcore->rpc.data.tx_windows,
+                           mcore->rpc.data.tx_chn[0], mcore->rpc.data.tx_chn[1],
+                           mcore->rpc.data.tx_chn[2], mcore->rpc.data.tx_chn[3]);
 
     /* WINDOW/BUSY is associated with OP_ID until COMPLETE_ACK arrives. */
     if (ack_kind == M5_RPC_ACK_WINDOW && ack_status == 1 && ack_op) {
@@ -874,9 +980,9 @@ static void m5_rpc_token_rx_dispatch(struct m5io_hub_core *mcore, const u8 *buf,
     return;
   }
 
-  dev_dbg_ratelimited(mcore->hub.dev,
-                      "drop unmatched token: tid=%u func=%u arg=%u len=%u\n",
-                      tid, func, arg, payload_len);
+  dev_warn_ratelimited(mcore->hub.dev,
+                       "unmatched token: tid=%u func=%u arg=%u len=%u\n",
+                       tid, func, arg, payload_len);
 }
 
 static void m5_rpc_data_rx_worker(struct work_struct *work) {
@@ -1145,8 +1251,10 @@ static unsigned int m5_rpc_rx_stream_feed(struct m5io_hub_core *mcore,
           m5_rpc_data_ack_retry_queue(mcore, chn, data_pid, 0,
                                       M5_RPC_ACK_WINDOW, 0);
       } else if (chn == M5_RPC_CHN_SPI) {
-        /* FUNC3 mirrors the MOSI chunks, then sends a terminal TOKEN.
-         * It neither needs nor implements asynchronous DATA ACK windows.
+        /* FUNC3 runs a real exchange on the MCU's SPI2 master and uplinks the
+         * MISO bytes it clocked in; it does not echo MOSI.  The uplink arrives
+         * as ordinary DATA and is completed by the synchronous waiter, so this
+         * channel needs no asynchronous DATA ACK window of its own.
          */
         m5_rpc_spi_data_rx(mcore, data_frame);
         ret = m5_rpc_data_ack_send(mcore, chn, data_pid, 0,
@@ -1154,9 +1262,19 @@ static unsigned int m5_rpc_rx_stream_feed(struct m5io_hub_core *mcore,
         if (ret)
           m5_rpc_data_ack_retry_queue(mcore, chn, data_pid, 0,
                                       M5_RPC_ACK_WINDOW, 0);
-      } else if (m5_rpc_data_rx_frame_put(mcore, stream->frame,
-                                           stream->expect_len,
-                                           &queue_data_work)) {
+      } else {
+        /*
+         * The window is released even when the payload cannot be queued.  The
+         * MCU has no timer that frees a PID, so a single unacknowledged frame
+         * permanently costs it one of four downlink slots -- after four, it
+         * stops sending DATA altogether and the host RX goes quiet while TX
+         * keeps working.  Losing the bytes is survivable; losing the window is
+         * not.  The header CRC already passed here, so the PID is trustworthy.
+         */
+        bool queued = m5_rpc_data_rx_frame_put(mcore, stream->frame,
+                                               stream->expect_len,
+                                               &queue_data_work);
+
         ret = m5_rpc_data_ack_send(mcore, chn, data_pid, 0,
                                    M5_RPC_ACK_WINDOW, 0);
         if (ret) {
@@ -1167,7 +1285,7 @@ static unsigned int m5_rpc_rx_stream_feed(struct m5io_hub_core *mcore,
           m5_rpc_data_ack_retry_queue(mcore, chn, data_pid, 0,
                                       M5_RPC_ACK_WINDOW, 0);
         }
-        if (queue_data_work)
+        if (queued && queue_data_work)
           queue_work(system_unbound_wq, &mcore->data_rx_work);
       }
     }
@@ -1277,6 +1395,12 @@ static int m5_rpc_data_window_alloc(struct m5io_hub_core *mcore, u8 chn) {
   }
   spin_unlock_irqrestore(&mcore->rpc.data.tx_window_lock, flags);
 
+  dev_warn_ratelimited(mcore->hub.dev,
+                       "no free DATA window for chn=%u, tx_windows=%#lx "
+                       "chn_map=%u,%u,%u,%u\n",
+                       chn, mcore->rpc.data.tx_windows,
+                       mcore->rpc.data.tx_chn[0], mcore->rpc.data.tx_chn[1],
+                       mcore->rpc.data.tx_chn[2], mcore->rpc.data.tx_chn[3]);
   return -EAGAIN;
 }
 
@@ -1414,7 +1538,13 @@ static int m5io_hub_rpc_transaction(struct m5io_hub_core *mcore) {
   u8 *rx_buf;
   int ret = 0;
 
+  if (READ_ONCE(mcore->ota_active))
+    return -EBUSY;
   mutex_lock(&mcore->spi_lock);
+  if (READ_ONCE(mcore->ota_active)) {
+    ret = -EBUSY;
+    goto out_unlock;
+  }
   tx_buf = mcore->rpc_xfer_tx_buf;
   rx_buf = mcore->rpc_xfer_rx_buf;
   if (!tx_buf || !rx_buf) {
@@ -1423,6 +1553,19 @@ static int m5io_hub_rpc_transaction(struct m5io_hub_core *mcore) {
   }
 
   for (;;) {
+    /*
+     * An OTA freeze can start while this transaction is still draining, and
+     * the MCU is reset at the beginning of an upgrade.  Without this check the
+     * loop keeps clocking the bus until it fills the whole transaction budget:
+     * a resetting MCU leaves MISO floating, so slave_empty never becomes true.
+     * That costs up to a second of bus traffic, and every millisecond of it is
+     * taken away from the 300 ms window the bootloader listens for OPC_IAP.
+     */
+    if (READ_ONCE(mcore->ota_active)) {
+      ret = -EBUSY;
+      m5_rpc_rx_stream_reset(mcore);
+      break;
+    }
     tx_len = m5io_hub_tx_frame_len(mcore);
     if (tx_len < 0) {
       ret = tx_len;
@@ -1495,7 +1638,8 @@ out_unlock:
  *
  * Context: 可在原子上下文调用。
  *
- * Return: 0 表示请求已排队；-ENODEV 表示 @hub 或 @hub->spi 无效。
+ * Return: 0 表示请求已排队；-ENODEV 表示 @hub 或 @hub->spi 无效；
+ *         -EBUSY 表示裸 IAP 阶段或升级已独占数据线。
  */
 int m5io_hub_rpc_transfer(struct m5io_hub *hub) {
   struct m5io_hub_core *mcore;
@@ -1504,6 +1648,11 @@ int m5io_hub_rpc_transfer(struct m5io_hub *hub) {
     return -ENODEV;
 
   mcore = container_of(hub, struct m5io_hub_core, hub);
+  if (READ_ONCE(mcore->ota_active))
+    return -EBUSY;
+  /* An upgrade owns the data line until it has finished. */
+  if (m5io_hub_bus_held_by_other(mcore))
+    return -EBUSY;
   atomic_inc(&mcore->active_reqs);
   queue_work(system_wq, &mcore->rpc_work);
   return 0;
@@ -1530,6 +1679,8 @@ static void m5io_hub_rpc_worker(struct work_struct *work) {
     ret = m5io_hub_rpc_transaction(mcore);
     if (ret)
       dev_dbg(mcore->hub.dev, "rpc transaction failed: %d\n", ret);
+    if (ret == -EBUSY)
+      break;
   }
 }
 
@@ -1546,6 +1697,11 @@ static void m5io_hub_rpc_worker(struct work_struct *work) {
 static irqreturn_t m5io_hub_irq_thread(int irq, void *data) {
   struct m5io_hub_core *mcore = data;
   int ret;
+
+  if (READ_ONCE(mcore->ota_active)) {
+    complete(&mcore->ota_ready);
+    return IRQ_HANDLED;
+  }
 
   ret = m5io_hub_rpc_transaction(mcore);
   if (ret)
@@ -1885,8 +2041,12 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
       (request->payload_len && !request->payload))
     return -EINVAL;
 
+  mcore = container_of(hub, struct m5io_hub_core, hub);
+  if (READ_ONCE(mcore->ota_active))
+    return -EBUSY;
+
   if (request->func == M5IO_HUB_FUNC_SPI)
-    return m5_rpc_spi_exec(container_of(hub, struct m5io_hub_core, hub), request);
+    return m5_rpc_spi_exec(mcore, request);
 
   is_i2c = request->func == M5IO_HUB_FUNC_I2C;
   is_uart = request->func == M5IO_HUB_FUNC_UART;
@@ -1911,7 +2071,6 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request) {
 
   request->reply_len = 0;
   request->status = 0xff;
-  mcore = container_of(hub, struct m5io_hub_core, hub);
   if (is_i2c) {
     mutex_lock(&mcore->i2c.lock);
   }
@@ -2041,6 +2200,601 @@ int m5io_hub_mcu_reset(struct m5io_hub *hub)
   return m5io_hub_exec(hub, &req);
 }
 EXPORT_SYMBOL_GPL(m5io_hub_mcu_reset);
+
+static int m5io_hub_ota_spi_xfer(struct m5io_hub_core *mcore,
+                                 const void *tx, void *rx, unsigned int len)
+{
+  struct spi_transfer transfer = {
+    .tx_buf = tx,
+    .rx_buf = rx,
+    .len = len,
+  };
+
+  return spi_sync_transfer(mcore->hub.spi, &transfer, 1);
+}
+
+/*
+ * Lock the m5hub data line for a whole upgrade.  From here until
+ * m5io_hub_ota_bus_unlock() every other context is refused with -EBUSY, so
+ * nothing can interleave with the IAP command stream.  Frames that were
+ * already queued are dropped: their requests cannot be completed while the
+ * firmware is being replaced, and letting them through would corrupt the IAP
+ * sequence.  The calling thread stays the owner so that it is still allowed
+ * to issue the APP reset request.
+ */
+static void m5io_hub_ota_bus_lock(struct m5io_hub_core *mcore)
+{
+  unsigned long flags;
+
+  WARN_ON_ONCE(READ_ONCE(mcore->bus_owner));
+
+  spin_lock_irqsave(&mcore->tx_lock, flags);
+  mcore->bus_owner = current;
+  kfifo_reset(&mcore->tx_fifo);
+  spin_unlock_irqrestore(&mcore->tx_lock, flags);
+
+  /* Stop work that may already be running with a frame in hand. */
+  cancel_work_sync(&mcore->rpc_work);
+  m5io_hub_data_ack_retry_cancel(mcore);
+  atomic_set(&mcore->active_reqs, 0);
+}
+
+/* Release the data line so normal m5hub traffic can resume. */
+static void m5io_hub_ota_bus_unlock(struct m5io_hub_core *mcore)
+{
+  unsigned long flags;
+
+  spin_lock_irqsave(&mcore->tx_lock, flags);
+  mcore->bus_owner = NULL;
+  spin_unlock_irqrestore(&mcore->tx_lock, flags);
+}
+
+/*
+ * Take exclusive ownership of the SPI bus for the IAP command stream.
+ * ota_active also tells the shared IRQ thread to stop running RPC
+ * transactions and to treat HOST_READY as the IAP response signal only.
+ */
+static void m5io_hub_ota_begin(struct m5io_hub_core *mcore)
+{
+  WRITE_ONCE(mcore->ota_active, true);
+  cancel_work_sync(&mcore->rpc_work);
+  /* Wait for an IRQ transaction which was already in progress. */
+  mutex_lock(&mcore->spi_lock);
+  /*
+   * Purge pending DATA ACKs only now that the bus is exclusively ours.  An IRQ
+   * transaction that was still running when ota_active was raised could
+   * otherwise queue one more retry behind an earlier purge, and that stale ACK
+   * would then be delivered to the MCU we just reset.  The retry worker never
+   * takes spi_lock, so cancelling it here cannot deadlock.
+   */
+  m5io_hub_data_ack_retry_cancel(mcore);
+  /* An aborted RPC transaction may have left a partial RX frame behind. */
+  m5_rpc_rx_stream_reset(mcore);
+  atomic_set(&mcore->active_reqs, 0);
+}
+
+/*
+ * Leave the raw IAP command stream and hand the SPI bus back.  The m5hub data
+ * line itself stays locked by the caller until m5io_hub_ota_bus_unlock().
+ */
+static void m5io_hub_ota_end(struct m5io_hub_core *mcore)
+{
+  mutex_unlock(&mcore->spi_lock);
+  WRITE_ONCE(mcore->ota_active, false);
+  /* Drop frames queued by normal RPC users before the reset. */
+  spin_lock_irq(&mcore->tx_lock);
+  kfifo_reset(&mcore->tx_fifo);
+  spin_unlock_irq(&mcore->tx_lock);
+}
+
+/*
+ * Clock out a reply left pending by an interrupted upgrade.  The IAP accepts
+ * only an exact eight-byte OPC_READ while a reply is pending and silently
+ * discards every other command, so this must run before OPC_IAP is sent.
+ * A free-running read returns 0xff when nothing was pending and is otherwise
+ * harmless: the IAP re-arms its DMA after each transaction.
+ */
+static int m5io_hub_ota_drain(struct m5io_hub_core *mcore,
+                              struct m5io_hub_ota_request *result)
+{
+  u8 read_command[M5IO_HUB_IAP_RESPONSE_SIZE];
+  u8 response[M5IO_HUB_IAP_RESPONSE_SIZE];
+  int ret;
+
+  memset(read_command, 0xff, sizeof(read_command));
+  read_command[0] = M5IO_HUB_IAP_READ;
+  memset(response, 0xff, sizeof(response));
+
+  ret = m5io_hub_ota_spi_xfer(mcore, read_command, response,
+                              sizeof(response));
+  usleep_range(M5IO_HUB_IAP_REARM_DELAY_US,
+               M5IO_HUB_IAP_REARM_DELAY_US + 2000);
+  if (ret)
+    return ret;
+
+  if (response[0] == 0xff)
+    return 0;
+
+  result->response_command = response[0];
+  result->response_status = response[1];
+  result->response_address = ((u32)response[2] << 24) |
+                             ((u32)response[3] << 16) |
+                             ((u32)response[4] << 8) | response[5];
+  result->response_length = ((u16)response[6] << 8) | response[7];
+  dev_info(mcore->hub.dev,
+           "OTA: drained pending reply cmd=0x%02x status=%u addr=0x%08x\n",
+           result->response_command, result->response_status,
+           result->response_address);
+  return 0;
+}
+
+/*
+ * Clock eight dummy bytes out of the MCU.  The APP consumes them one by one,
+ * which advances the physical TX cursor that its deferred reset waits on, and
+ * it forms no incomplete candidate, so the APP's parser cannot take the early
+ * return that would postpone the reset again.  A bootloader that is listening
+ * treats 0xff as an unknown opcode and queues a BAD_COMMAND reply, which the
+ * following read picks up.
+ */
+static int m5io_hub_ota_poke(struct m5io_hub_core *mcore)
+{
+  u8 dummy[M5IO_HUB_IAP_RESPONSE_SIZE];
+  u8 discard[M5IO_HUB_IAP_RESPONSE_SIZE];
+  int ret;
+
+  memset(dummy, 0xff, sizeof(dummy));
+  memset(discard, 0, sizeof(discard));
+
+  ret = m5io_hub_ota_spi_xfer(mcore, dummy, discard, sizeof(dummy));
+  usleep_range(M5IO_HUB_IAP_POKE_DELAY_US,
+               M5IO_HUB_IAP_POKE_DELAY_US + 500);
+  return ret;
+}
+
+/*
+ * Clock one eight-byte OPC_READ and report whatever the MCU drives back.
+ * The bootloader treats these eight bytes as a valid read and answers with its
+ * pending response, so a non-0xff byte proves the bootloader is listening.
+ * The APP sees an unknown header, resynchronises, and -- importantly -- its TX
+ * wire cursor advances, which is the condition it waits for before running a
+ * reset it has already been asked for.  One probe therefore both inspects the
+ * MCU and releases that deferred reset.
+ */
+static int m5io_hub_ota_probe(struct m5io_hub_core *mcore,
+                              struct m5io_hub_ota_request *result)
+{
+  u8 read_command[M5IO_HUB_IAP_RESPONSE_SIZE];
+  u8 response[M5IO_HUB_IAP_RESPONSE_SIZE];
+  int ret;
+
+  memset(read_command, 0xff, sizeof(read_command));
+  read_command[0] = M5IO_HUB_IAP_READ;
+  memset(response, 0, sizeof(response));
+
+  ret = m5io_hub_ota_spi_xfer(mcore, read_command, response,
+                              sizeof(response));
+  usleep_range(M5IO_HUB_IAP_REARM_DELAY_US,
+               M5IO_HUB_IAP_REARM_DELAY_US + 2000);
+  if (ret)
+    return ret;
+
+  result->response_command = response[0];
+  result->response_status = response[1];
+  result->response_address = ((u32)response[2] << 24) |
+                             ((u32)response[3] << 16) |
+                             ((u32)response[4] << 8) | response[5];
+  result->response_length = ((u16)response[6] << 8) | response[7];
+  return 0;
+}
+
+static int m5io_hub_ota_command(struct m5io_hub_core *mcore,
+                                const u8 *command, unsigned int command_len,
+                                u8 expected_command, u32 expected_address,
+                                u16 expected_length,
+                                unsigned int timeout_ms,
+                                struct m5io_hub_ota_request *result)
+{
+  u8 read_command[M5IO_HUB_IAP_RESPONSE_SIZE];
+  u8 response[M5IO_HUB_IAP_RESPONSE_SIZE];
+  unsigned long timeout;
+  unsigned int poll;
+  bool ready;
+  int ret;
+
+  reinit_completion(&mcore->ota_ready);
+  ret = m5io_hub_ota_spi_xfer(mcore, command, NULL, command_len);
+  if (ret)
+    return ret;
+
+  timeout = wait_for_completion_timeout(&mcore->ota_ready,
+                                        msecs_to_jiffies(timeout_ms));
+  ready = timeout != 0;
+
+  /*
+   * Some board revisions expose HOST_READY as a level IRQ that can be lost
+   * while the normal RPC worker is being stopped for OTA.  If the IRQ did not
+   * arrive, probe the IAP response directly.  During erase/program the IAP
+   * DMA is stopped, so these short reads are ignored; once the response is
+   * published they return the normal eight-byte response.
+   */
+  for (poll = 0; !ready && poll < timeout_ms; poll++) {
+    memset(read_command, 0xff, sizeof(read_command));
+    read_command[0] = M5IO_HUB_IAP_READ;
+    memset(response, 0xff, sizeof(response));
+    ret = m5io_hub_ota_spi_xfer(mcore, read_command, response,
+                                sizeof(read_command));
+    if (ret)
+      return ret;
+    if (response[0] != 0xff) {
+      ready = true;
+      break;
+    }
+    usleep_range(M5IO_HUB_IAP_POLL_DELAY_US,
+                 M5IO_HUB_IAP_POLL_DELAY_US + 500);
+  }
+  if (!ready) {
+    dev_warn(mcore->hub.dev,
+             "OTA command 0x%02x timed out waiting for HOST_READY (irq=%d)\n",
+             expected_command, mcore->hub.irq);
+    return -ETIMEDOUT;
+  }
+
+  if (timeout) {
+    memset(read_command, 0xff, sizeof(read_command));
+    read_command[0] = M5IO_HUB_IAP_READ;
+    memset(response, 0, sizeof(response));
+    ret = m5io_hub_ota_spi_xfer(mcore, read_command, response,
+                                sizeof(read_command));
+    if (ret)
+      return ret;
+  }
+
+  /* Allow the IAP loop to re-arm its DMA before the next NSS assertion. */
+  usleep_range(M5IO_HUB_IAP_REARM_DELAY_US,
+               M5IO_HUB_IAP_REARM_DELAY_US + 2000);
+
+  result->response_command = response[0];
+  result->response_status = response[1];
+  result->response_address = ((u32)response[2] << 24) |
+                             ((u32)response[3] << 16) |
+                             ((u32)response[4] << 8) | response[5];
+  result->response_length = ((u16)response[6] << 8) | response[7];
+
+  if (response[0] != expected_command || response[1] != 0 ||
+      result->response_address != expected_address ||
+      result->response_length != expected_length) {
+    dev_warn(mcore->hub.dev,
+             "OTA response mismatch: got cmd=0x%02x status=%u addr=0x%08x len=%u, "
+             "expected cmd=0x%02x addr=0x%08x len=%u\n",
+             response[0], response[1], result->response_address,
+             result->response_length, expected_command, expected_address,
+             expected_length);
+    return response[1] ? -EIO : -EPROTO;
+  }
+
+  return 0;
+}
+
+/*
+ * Firmware upgrade entry.  Three failures were found and fixed here, all of
+ * which made an upgrade impossible; the measured evidence is in
+ * OTA-BRINGUP-REPORT.md next to this file.
+ *
+ *  1. The bus must be frozen the moment the reset is acknowledged, before any
+ *     settle delay.  The bootloader only listens for 300 ms after the reset and
+ *     never extends that window, and an aborted RPC transaction used to keep
+ *     clocking the bus for up to a second (see m5io_hub_rpc_transaction), which
+ *     spent the whole window.  Measured: OPC_IAP left the driver 1.77 s late.
+ *
+ *  2. Bytes sent after the reset request postpone the reset itself.  The APP
+ *     runs NVIC_SystemReset() only once its reply has been clocked all the way
+ *     out, and its parser takes an early return -- ahead of that code -- while
+ *     an incomplete frame candidate and a newer transaction are both pending.
+ *     So the reset request can be acknowledged and still never happen; the
+ *     probe transaction below is what promotes it, and a burst of retries would
+ *     hold it off forever.
+ *
+ *  3. A dropped command and an absent MCU look identical, because a command the
+ *     bootloader never receives is answered by nobody.  The probe distinguishes
+ *     them by status, not by command: the bootloader replies to an unknown
+ *     opcode with BAD_COMMAND, whose response command byte is also 0xff, so
+ *     testing the command byte would never match.  Only then is OPC_IAP sent.
+ *
+ * Measured on a healthy board: reset acknowledged at 4 ms, bootloader detected
+ * at 24 ms, OPC_IAP on the wire at 44 ms -- inside the 300 ms window.  A board
+ * whose MCU accepted the reset request but never executed it failed all of this
+ * and needed replacing, so treat "reset acknowledged, probes all silent" as a
+ * hardware suspect rather than a timing bug.
+ */
+static int m5io_hub_ota_update(struct m5io_hub_core *mcore,
+                               struct m5io_hub_ota_request *request)
+{
+  u8 *image = NULL;
+  u8 *packet = NULL;
+  u32 page;
+  unsigned int timeout_ms;
+  unsigned long entry_start;
+  u8 hello_payload[15];
+  int reset_ret = -1;
+  unsigned int attempt;
+  unsigned int sample;
+  int hello_ret;
+  int ret;
+
+  if (request->image_len != M5IO_HUB_OTA_IMAGE_SIZE ||
+      (request->image_len % M5IO_HUB_OTA_PAGE_SIZE) != 0 ||
+      !request->image_ptr)
+    return -EINVAL;
+
+  timeout_ms = request->timeout_ms;
+  if (!timeout_ms)
+    timeout_ms = M5IO_HUB_IAP_DEFAULT_TIMEOUT_MS;
+  if (timeout_ms < M5IO_HUB_IAP_MIN_TIMEOUT_MS ||
+      timeout_ms > M5IO_HUB_IAP_MAX_TIMEOUT_MS)
+    return -EINVAL;
+
+  /*
+   * Lock the m5hub data line for the complete upgrade.  Every other m5hub
+   * user is refused with -EBUSY from now until the unlock at the end of this
+   * function, so neither the APP reset request below nor the IAP command
+   * stream that follows can be interleaved with another request.
+   */
+  m5io_hub_ota_bus_lock(mcore);
+
+  /* The image is copied with kmalloc semantics, so kfree() is the matching
+   * release operation.  vfree() on this pointer triggers the kernel warning
+   * seen when the first ioctl fails. */
+  image = memdup_user(u64_to_user_ptr(request->image_ptr),
+                      request->image_len);
+  if (IS_ERR(image)) {
+    ret = PTR_ERR(image);
+    goto out_unlock_bus;
+  }
+
+  packet = kmalloc(M5IO_HUB_IAP_HEADER_SIZE + M5IO_HUB_OTA_PAGE_SIZE,
+                   GFP_KERNEL);
+  if (!packet) {
+    ret = -ENOMEM;
+    goto out_free_image;
+  }
+
+  request->completed_pages = 0;
+  request->response_command = 0;
+  request->response_status = 0xff;
+  request->response_address = 0;
+  request->response_length = 0;
+
+  dev_info(mcore->hub.dev, "OTA start: image=%u bytes timeout=%u ms irq=%d\n",
+           request->image_len, timeout_ms, mcore->hub.irq);
+
+  packet[0] = M5IO_HUB_IAP_ENTRY;
+  entry_start = jiffies;
+
+  /*
+   * Step 1: ask the running APP to reset into its short IAP entry window.
+   * No raw IAP byte may be sent before this: the APP parses every received
+   * byte as part of its own framed protocol, so IAP traffic issued while the
+   * APP still runs desynchronises that parser and can make the reset request
+   * itself be dropped.
+   */
+  reset_ret = m5io_hub_mcu_reset(&mcore->hub);
+  if (reset_ret)
+    dev_info(mcore->hub.dev,
+             "OTA: APP reset not acknowledged after %ums (%d), probing for a "
+             "bootloader already parked in IAP\n",
+             jiffies_to_msecs(jiffies - entry_start), reset_ret);
+  else
+    dev_info(mcore->hub.dev, "OTA: APP reset acknowledged after %ums\n",
+             jiffies_to_msecs(jiffies - entry_start));
+
+  /*
+   * Step 2: freeze the bus at once.  The bootloader only listens for OPC_IAP
+   * for 300 ms after the reset, so every millisecond spent clocking the bus
+   * between here and the command below is taken away from that window.
+   * Freezing first also aborts the RPC transaction which is still draining
+   * with the resetting MCU on MISO, which would otherwise keep the bus busy
+   * for up to a second.  Step 1 cannot succeed once an upgrade has been
+   * interrupted: the IAP keeps iap_active set until a real reset, so the MCU
+   * stays in the bootloader and no longer answers APP-side RPCs.  The static
+   * command stream below works in both states, which is what makes the
+   * interrupted case recoverable.
+   */
+  m5io_hub_ota_begin(mcore);
+
+  /*
+   * Watch the reset land.  The APP only runs the reset once the master has
+   * clocked its acknowledgement out completely, so a single eight-byte read is
+   * both the observation and the go-ahead; repeating it also catches the
+   * bootloader window if the reset takes a few attempts to be honoured.
+   */
+  /*
+   * Watch for the bootloader while keeping the bus moving, so the APP can
+   * finish the reset it accepted and the bootloader's answer becomes visible.
+   */
+  for (sample = 1; sample <= M5IO_HUB_IAP_ENTRY_ATTEMPTS; sample++) {
+    if (m5io_hub_ota_poke(mcore) || m5io_hub_ota_probe(mcore, request)) {
+      dev_warn(mcore->hub.dev, "OTA probe transfer failed\n");
+      break;
+    }
+    dev_info(mcore->hub.dev,
+             "OTA probe %u/%u: %ums after OTA start, resp cmd=0x%02x "
+             "status=%u addr=0x%08x\n",
+             sample, M5IO_HUB_IAP_ENTRY_ATTEMPTS,
+             jiffies_to_msecs(jiffies - entry_start),
+             request->response_command, request->response_status,
+             request->response_address);
+    /*
+     * Any real answer proves the bootloader is up.  It replies to a dummy
+     * command with BAD_COMMAND, whose response command byte is 0xff, so the
+     * status is what distinguishes "answered" (small status code) from "nobody
+     * on the bus" (0xff).  The read above already drained that reply, so
+     * OPC_IAP goes out with no pending response to be discarded.
+     */
+    if (request->response_status <= 9) {
+      dev_info(mcore->hub.dev,
+               "OTA: bootloader detected (cmd=0x%02x status=%u), entering IAP\n",
+               request->response_command, request->response_status);
+      break;
+    }
+    usleep_range(M5IO_HUB_IAP_ENTRY_REPROBE_DELAY_US,
+                 M5IO_HUB_IAP_ENTRY_REPROBE_DELAY_US + 500);
+  }
+
+  /*
+   * The bootloader only listens for OPC_IAP for 300 ms after the reset, and
+   * that window is absolute: it is armed once and never extended by an arriving
+   * command.  So the command goes out with no bus traffic in front of it.  A
+   * reset MCU leaves no reply pending, which is why no drain runs on the happy
+   * path -- the drain only happens between attempts, where it is needed.
+   *
+   * The bootloader may still be arming its DMA when the first command arrives,
+   * and a dropped command produces no answer at all.  Retrying is therefore the
+   * only way to tell "not listening yet" from "already gone"; each retry drains
+   * first, because a pending reply makes the bootloader discard anything that is
+   * not an exact eight-byte OPC_READ.  A rejection is final and stops the loop.
+   */
+  for (attempt = 1; attempt <= M5IO_HUB_IAP_ENTRY_ATTEMPTS; attempt++) {
+    dev_info(mcore->hub.dev,
+             "OTA: OPC_IAP attempt %u/%u, %ums after OTA start "
+             "(bootloader window is 300 ms)\n",
+             attempt, M5IO_HUB_IAP_ENTRY_ATTEMPTS,
+             jiffies_to_msecs(jiffies - entry_start));
+
+    ret = m5io_hub_ota_command(mcore, packet, 1, M5IO_HUB_IAP_ENTRY,
+                               M5IO_HUB_OTA_START_ADDRESS, 0,
+                               M5IO_HUB_IAP_ENTRY_PROBE_TIMEOUT_MS, request);
+    if (!ret)
+      break;
+    if (ret != -ETIMEDOUT) {
+      dev_warn(mcore->hub.dev,
+               "OTA: IAP entry rejected, reply cmd=0x%02x status=%u "
+               "addr=0x%08x\n",
+               request->response_command, request->response_status,
+               request->response_address);
+      break;
+    }
+    if (((attempt % M5IO_HUB_IAP_ENTRY_DRAIN_EVERY) == 0) &&
+        m5io_hub_ota_drain(mcore, request))
+      break;
+  }
+
+  if (ret) {
+    if (ret == -ETIMEDOUT)
+      dev_warn(mcore->hub.dev,
+               "OTA: OPC_IAP got no answer in %u attempts over %ums; the MCU "
+               "answers neither the APP reset nor the bootloader, power-cycle "
+               "the device to recover\n",
+               M5IO_HUB_IAP_ENTRY_ATTEMPTS,
+               jiffies_to_msecs(jiffies - entry_start));
+    goto out_unlock_ota;
+  }
+
+  dev_info(mcore->hub.dev, "OTA: IAP entered, writing %u pages\n",
+           M5IO_HUB_OTA_PAGE_COUNT);
+
+  for (page = 0; page < M5IO_HUB_OTA_PAGE_COUNT; page++) {
+    u32 address = M5IO_HUB_OTA_START_ADDRESS +
+                  page * M5IO_HUB_OTA_PAGE_SIZE;
+
+    packet[0] = M5IO_HUB_IAP_WREN;
+    packet[1] = address >> 24;
+    packet[2] = address >> 16;
+    packet[3] = address >> 8;
+    packet[4] = address;
+    packet[5] = (u8)(M5IO_HUB_OTA_PAGE_SIZE >> 8);
+    packet[6] = (u8)(M5IO_HUB_OTA_PAGE_SIZE & 0xff);
+    packet[7] = 0;
+    memcpy(packet + M5IO_HUB_IAP_HEADER_SIZE,
+           image + page * M5IO_HUB_OTA_PAGE_SIZE,
+           M5IO_HUB_OTA_PAGE_SIZE);
+
+    ret = m5io_hub_ota_command(mcore, packet,
+                               M5IO_HUB_IAP_HEADER_SIZE +
+                                   M5IO_HUB_OTA_PAGE_SIZE,
+                               M5IO_HUB_IAP_WREN, address,
+                               M5IO_HUB_OTA_PAGE_SIZE, timeout_ms, request);
+    if (ret)
+      goto out_unlock_ota;
+    request->completed_pages = page + 1;
+  }
+
+  packet[0] = M5IO_HUB_IAP_START;
+  ret = m5io_hub_ota_command(mcore, packet, 1, M5IO_HUB_IAP_START,
+                             M5IO_HUB_OTA_START_ADDRESS, 0, timeout_ms,
+                             request);
+
+out_unlock_ota:
+  m5io_hub_ota_end(mcore);
+  kfree(packet);
+out_free_image:
+  kfree(image);
+out_unlock_bus:
+  m5io_hub_ota_bus_unlock(mcore);
+
+  /*
+   * Diagnostic for a failed entry whose reset was acknowledged: measure how
+   * long the MCU stops answering the APP protocol.  A bootloader that is
+   * present holds the bus for its ~300 ms entry window before falling back to
+   * the APP, so the APP stays silent for about that long; a reset that never
+   * took effect, or a device whose flash carries no bootloader, answers again
+   * almost immediately.  HELLO is read-only and carries no 0x5a, so it cannot
+   * pull the bootloader into upgrade mode.
+   */
+  if (ret && (reset_ret == 0)) {
+    for (sample = 1; sample <= 16; sample++) {
+      msleep(25);
+      hello_ret = m5io_hub_hello(&mcore->hub, hello_payload);
+      dev_info(mcore->hub.dev,
+               "OTA: APP %s at %ums after OTA start (%d)\n",
+               hello_ret ? "silent" : "answers",
+               jiffies_to_msecs(jiffies - entry_start), hello_ret);
+    }
+  }
+  return ret;
+}
+
+static long m5io_hub_misc_ioctl(struct file *file, unsigned int command,
+                                unsigned long argument)
+{
+  struct miscdevice *misc = file->private_data;
+  struct m5io_hub_core *mcore = container_of(misc, struct m5io_hub_core,
+                                              ota_misc);
+  struct m5io_hub_ota_request request;
+  long ret;
+
+  if (command != M5IO_HUB_IOCTL_OTA)
+    return -ENOTTY;
+  if (copy_from_user(&request, (void __user *)argument, sizeof(request)))
+    return -EFAULT;
+
+  mutex_lock(&mcore->ota_lock);
+  if (READ_ONCE(mcore->ota_active)) {
+    ret = -EBUSY;
+  } else {
+    ret = m5io_hub_ota_update(mcore, &request);
+  }
+  mutex_unlock(&mcore->ota_lock);
+
+  if (copy_to_user((void __user *)argument, &request, sizeof(request)))
+    return -EFAULT;
+  return ret;
+}
+
+static const struct file_operations m5io_hub_misc_fops = {
+  .owner = THIS_MODULE,
+  .unlocked_ioctl = m5io_hub_misc_ioctl,
+#ifdef CONFIG_COMPAT
+  .compat_ioctl = m5io_hub_misc_ioctl,
+#endif
+  .llseek = noop_llseek,
+};
+
+static void m5io_hub_misc_deregister(void *data)
+{
+  struct m5io_hub_core *mcore = data;
+
+  misc_deregister(&mcore->ota_misc);
+}
 
 int m5io_hub_data_status(struct m5io_hub *hub, u8 payload[15])
 {
@@ -2342,6 +3096,9 @@ static int m5io_hub_probe(struct spi_device *spi) {
   init_waitqueue_head(&mcore->spi_rpc.wq);
   mcore->spi_rpc.tid = -1;
   mutex_init(&mcore->exec_tx_lock);
+  mutex_init(&mcore->ota_lock);
+  init_completion(&mcore->ota_ready);
+  mcore->ota_active = false;
 
   mcore->spi_rpc.tx_buf = devm_kmalloc(&spi->dev, M5IO_HUB_SPI_TX_BUF_LEN,
                                        GFP_KERNEL);
@@ -2421,6 +3178,23 @@ static int m5io_hub_probe(struct spi_device *spi) {
     return ret;
 
   spi_set_drvdata(spi, &mcore->hub);
+
+  snprintf(mcore->ota_misc_name, sizeof(mcore->ota_misc_name),
+           "m5io-hub%d", spi_get_chipselect(spi, 0));
+  mcore->ota_misc.minor = MISC_DYNAMIC_MINOR;
+  mcore->ota_misc.name = mcore->ota_misc_name;
+  mcore->ota_misc.fops = &m5io_hub_misc_fops;
+  mcore->ota_misc.parent = &spi->dev;
+  mcore->ota_misc.mode = 0660;
+  ret = misc_register(&mcore->ota_misc);
+  if (ret) {
+    dev_err(&spi->dev, "failed to register OTA device: %d\n", ret);
+    return ret;
+  }
+  ret = devm_add_action_or_reset(&spi->dev, m5io_hub_misc_deregister,
+                                 mcore);
+  if (ret)
+    return ret;
 
   /* Runs after DT child devices and the devm IRQ have been removed. */
   ret = devm_add_action_or_reset(&spi->dev, m5io_hub_cancel_works, mcore);

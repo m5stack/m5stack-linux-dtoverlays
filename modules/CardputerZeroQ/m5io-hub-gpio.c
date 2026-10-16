@@ -32,6 +32,14 @@ struct m5io_hub_gpio {
   unsigned long irq_hw_enabled;
   unsigned int irq_type[M5IO_HUB_NGPIO];
   unsigned int irq_hw_type[M5IO_HUB_NGPIO];
+  /*
+   * Cached line direction.  The protocol has no command that reads a pin's
+   * direction back, so the driver records what it was asked to set.  Zero means
+   * input, which is also the MCU power-on default.  Without the matching
+   * get_direction callback gpiolib hits WARN_ON(!gc->get_direction) on any
+   * direction read -- and reading /sys/kernel/debug/gpio reads every line.
+   */
+  u8 direction[M5IO_HUB_NGPIO];
 };
 
 static void m5io_hub_gpio_irq_bus_lock(struct irq_data *data) {
@@ -165,11 +173,23 @@ static void m5io_hub_gpio_set(struct gpio_chip *gc, unsigned int offset,
 #endif
 }
 
+static int m5io_hub_gpio_get_direction(struct gpio_chip *gc,
+                                       unsigned int offset) {
+  struct m5io_hub_gpio *mg = gpiochip_get_data(gc);
+
+  return mg->direction[offset] ? GPIO_LINE_DIRECTION_OUT
+                               : GPIO_LINE_DIRECTION_IN;
+}
+
 static int m5io_hub_gpio_direction_input(struct gpio_chip *gc,
                                          unsigned int offset) {
   struct m5io_hub_gpio *mg = gpiochip_get_data(gc);
+  int ret;
 
-  return m5io_hub_pinMode(mg->hub, offset, M5IO_HUB_PIN_MODE_INPUT);
+  ret = m5io_hub_pinMode(mg->hub, offset, M5IO_HUB_PIN_MODE_INPUT);
+  if (!ret)
+    mg->direction[offset] = 0;
+  return ret;
 }
 
 static int m5io_hub_gpio_direction_output(struct gpio_chip *gc,
@@ -181,6 +201,7 @@ static int m5io_hub_gpio_direction_output(struct gpio_chip *gc,
   ret = m5io_hub_pinMode(mg->hub, offset, M5IO_HUB_PIN_MODE_OUTPUT);
   if (ret)
     return ret;
+  mg->direction[offset] = 1;
 
   return m5io_hub_digitalWrite(mg->hub, offset, value);
 }
@@ -208,6 +229,7 @@ static int m5io_hub_gpio_probe(struct platform_device *pdev) {
   mg->gc.names = m5io_hub_gpio_names;
   mg->gc.get = m5io_hub_gpio_get;
   mg->gc.set = m5io_hub_gpio_set;
+  mg->gc.get_direction = m5io_hub_gpio_get_direction;
   mg->gc.direction_input = m5io_hub_gpio_direction_input;
   mg->gc.direction_output = m5io_hub_gpio_direction_output;
   mg->gc.can_sleep = true;

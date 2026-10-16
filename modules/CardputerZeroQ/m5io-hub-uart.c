@@ -31,6 +31,10 @@
 #define M5IO_HUB_UART_MAX_BAUD      1000000
 #define M5IO_HUB_UART_CONFIG_LEN    8
 #define M5IO_HUB_UART_ARG_CONFIG    1
+/* The MCU answers UART_CONFIG with BUSY while it still owns RX data, so the
+ * request is retried instead of being treated as a hard failure. */
+#define M5IO_HUB_UART_CFG_BUSY_TRIES 6
+#define M5IO_HUB_UART_CFG_BUSY_DELAY_US 20000
 #define M5IO_HUB_UART_ARG_TX        2
 #define M5IO_HUB_UART_ARG_DISABLE   6
 
@@ -101,10 +105,23 @@ static void m5io_hub_uart_rx_data(void *data, const u8 *buf, unsigned int len)
     struct tty_port *tty_port;
     int copied;
 
-    if (!up || !buf || !len || !up->configured ||
-        !atomic_read(&up->rx_enabled) ||
-        !up->port.state)
+    if (!up || !buf || !len)
         return;
+
+    /*
+     * Dropping here without a word is what made a gated-off RX look like a dead
+     * link while writes kept working.  Say why, once.
+     */
+    if (!up->configured || !atomic_read(&up->rx_enabled) || !up->port.state) {
+        dev_warn_ratelimited(up->port.dev,
+                             "UART%u: dropping %u RX bytes (configured=%d "
+                             "rx_enabled=%d state=%d)\n",
+                             up->channel - M5IO_HUB_CHN_UART1 + 1, len,
+                             up->configured ? 1 : 0,
+                             atomic_read(&up->rx_enabled),
+                             up->port.state ? 1 : 0);
+        return;
+    }
 
     tty_port = &up->port.state->port;
     copied = tty_insert_flip_string(tty_port, buf, len);
@@ -187,6 +204,13 @@ static void m5io_hub_uart_start_tx(struct uart_port *port)
         container_of(port, struct m5io_hub_uart_port, port);
 
     atomic_set(&up->tx_enabled, 1);
+    /*
+     * TX recovers on the first write, so RX must recover too.  Without this a
+     * single configuration attempt that came back BUSY strands RX at zero
+     * while writes keep succeeding.
+     */
+    if (up->configured)
+        atomic_set(&up->rx_enabled, 1);
     atomic_set(&up->tx_pending, 1);
     mod_delayed_work(system_wq, &up->tx_work, 0);
 }
@@ -247,6 +271,7 @@ static int m5io_hub_uart_configure(struct m5io_hub_uart_port *up,
     struct m5io_hub_request request = {0};
     u8 payload[M5IO_HUB_UART_CONFIG_LEN];
     u8 port_number = up->channel == M5IO_HUB_CHN_UART2 ? 2 : 1;
+    unsigned int attempt;
     int ret;
 
     payload[0] = port_number;
@@ -263,12 +288,45 @@ static int m5io_hub_uart_configure(struct m5io_hub_uart_port *up,
     request.arg = M5IO_HUB_UART_ARG_CONFIG;
     request.payload = payload;
     request.payload_len = sizeof(payload);
-    ret = m5io_hub_exec(up->mu->hub, &request);
-    if (ret)
-        return ret;
-    if (request.status != 0)
+
+    /*
+     * BUSY means the MCU is not idle yet: it refuses UART_CONFIG while it still
+     * owns RX data for this port, because reconfiguring resets its RX ring.
+     * That backlog drains by itself -- the transport keeps acknowledging the
+     * uplink frames whether or not they reach the tty -- so BUSY is a retry,
+     * not a failure.  Treating it as final left rx_enabled at zero with no way
+     * back, and only TX recovered, because start_tx() sets tx_enabled
+     * unconditionally.  From the outside that reads as "writes work, reads
+     * never do".
+     */
+    for (attempt = 0; attempt < M5IO_HUB_UART_CFG_BUSY_TRIES; attempt++) {
+        request.status = 0xff;
+        ret = m5io_hub_exec(up->mu->hub, &request);
+        /*
+         * The MCU answers UART_CONFIG with status 4 when it is not idle yet,
+         * and the transport surfaces that BUSY as -EBUSY from m5io_hub_exec()
+         * as well -- the token callback converts the reply status into the
+         * completion's errno.  Only request.status tells it apart from "the
+         * data line is held by an upgrade", so it must be tested *before* the
+         * error return.  Testing ret first made this loop retry zero times on
+         * BUSY, which is exactly the case it exists for.
+         */
+        if (request.status == 4) {
+            usleep_range(M5IO_HUB_UART_CFG_BUSY_DELAY_US,
+                         M5IO_HUB_UART_CFG_BUSY_DELAY_US + 2000);
+            continue;
+        }
+        if (ret)
+            return ret;
+        break;
+    }
+    if (request.status != 0) {
+        dev_warn(up->port.dev,
+                 "UART%u: MCU refused configuration, status=%u after %u tries\n",
+                 port_number, request.status, attempt + 1);
         return request.status == 4 ? -EBUSY :
                (request.status == 3 ? -EINVAL : -EIO);
+    }
     if (request.reply_len != sizeof(payload) ||
         request.reply[0] != port_number)
         return -EPROTO;
