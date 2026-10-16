@@ -52,6 +52,10 @@
 #define M5_RPC_ARG_DATA_STATUS 0x5
 #define M5_RPC_ACK_WINDOW 0x0
 #define M5_RPC_ACK_COMPLETE 0x1
+/* Current MCU->SoC DATA paths complete synchronously with READY.  The APP
+ * still requires a non-zero OP_ID in every DATA_ACK, even when no
+ * COMPLETE_ACK will follow. */
+#define M5_RPC_UPLINK_READY_OP_ID 1
 #define M5_RPC_ARG_GPIO_INTERRUPT_EVENT 0x7
 #define M5_RPC_ARG_GPIO_PINMODE 0x1
 #define M5_RPC_ARG_GPIO_DIGITALWRITE 0x2
@@ -1245,10 +1249,12 @@ static unsigned int m5_rpc_rx_stream_feed(struct m5io_hub_core *mcore,
       } else if (chn == M5_RPC_CHN_IIC1 || chn == M5_RPC_CHN_IIC2) {
         /* FUNC=2 has a completion TOKEN; this firmware has no DATA ACK. */
         m5_rpc_i2c_data_rx(mcore, data_frame);
-        ret = m5_rpc_data_ack_send(mcore, chn, data_pid, 0,
+        ret = m5_rpc_data_ack_send(mcore, chn, data_pid,
+                                   M5_RPC_UPLINK_READY_OP_ID,
                                    M5_RPC_ACK_WINDOW, 0);
         if (ret)
-          m5_rpc_data_ack_retry_queue(mcore, chn, data_pid, 0,
+          m5_rpc_data_ack_retry_queue(mcore, chn, data_pid,
+                                      M5_RPC_UPLINK_READY_OP_ID,
                                       M5_RPC_ACK_WINDOW, 0);
       } else if (chn == M5_RPC_CHN_SPI) {
         /* FUNC3 runs a real exchange on the MCU's SPI2 master and uplinks the
@@ -1257,10 +1263,12 @@ static unsigned int m5_rpc_rx_stream_feed(struct m5io_hub_core *mcore,
          * channel needs no asynchronous DATA ACK window of its own.
          */
         m5_rpc_spi_data_rx(mcore, data_frame);
-        ret = m5_rpc_data_ack_send(mcore, chn, data_pid, 0,
+        ret = m5_rpc_data_ack_send(mcore, chn, data_pid,
+                                   M5_RPC_UPLINK_READY_OP_ID,
                                    M5_RPC_ACK_WINDOW, 0);
         if (ret)
-          m5_rpc_data_ack_retry_queue(mcore, chn, data_pid, 0,
+          m5_rpc_data_ack_retry_queue(mcore, chn, data_pid,
+                                      M5_RPC_UPLINK_READY_OP_ID,
                                       M5_RPC_ACK_WINDOW, 0);
       } else {
         /*
@@ -1275,14 +1283,16 @@ static unsigned int m5_rpc_rx_stream_feed(struct m5io_hub_core *mcore,
                                                stream->expect_len,
                                                &queue_data_work);
 
-        ret = m5_rpc_data_ack_send(mcore, chn, data_pid, 0,
+        ret = m5_rpc_data_ack_send(mcore, chn, data_pid,
+                                   M5_RPC_UPLINK_READY_OP_ID,
                                    M5_RPC_ACK_WINDOW, 0);
         if (ret) {
           dev_warn_ratelimited(mcore->hub.dev,
                                "failed to send data ack, retrying: pid=%u "
                                "chn=%u: %d\n",
                                data_pid, chn, ret);
-          m5_rpc_data_ack_retry_queue(mcore, chn, data_pid, 0,
+          m5_rpc_data_ack_retry_queue(mcore, chn, data_pid,
+                                      M5_RPC_UPLINK_READY_OP_ID,
                                       M5_RPC_ACK_WINDOW, 0);
         }
         if (queued && queue_data_work)
