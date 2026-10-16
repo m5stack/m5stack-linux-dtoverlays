@@ -11,3 +11,5 @@
 *.symvers
 *.tmp
 .slave
+modules/CardputerZeroQ/docs/utils
+modules/CardputerZeroQ/tests

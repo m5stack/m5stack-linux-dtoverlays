@@ -163,7 +163,7 @@ if ! grep -Fq 'status = "disabled";' "$BUILD_DIR/qup0-i2c.dts"; then
 fi
 
 cp "$JD9852_DIR/panel-elida-jd9852a.ko" "$BUILD_DIR/"
-for module in m5io-hub-core m5io-hub-gpio m5hub-gpio-leds m5io-hub-i2c; do
+for module in m5io-hub-core m5io-hub-gpio m5hub-gpio-leds m5io-hub-i2c m5io-hub-uart; do
 	cp "$CARDPUTER_DIR/$module.ko" "$BUILD_DIR/"
 done
 cp "$TCA8418_DIR/tca8418_keypad_m5stack.ko" "$BUILD_DIR/"
@@ -180,6 +180,7 @@ for artifact in \
 	m5io-hub-gpio.ko \
 	m5hub-gpio-leds.ko \
 	m5io-hub-i2c.ko \
+	m5io-hub-uart.ko \
 	tca8418_keypad_m5stack.ko \
 	99-cardputerzeroq-keyboard.rules \
 	tca8418_keypad_m5stack_keymap.map; do
@@ -205,6 +206,7 @@ for module in \
     m5io-hub-gpio \
     m5hub-gpio-leds \
     m5io-hub-i2c \
+    m5io-hub-uart \
     tca8418_keypad_m5stack; do
     install -m 0644 "$REMOTE_TMP/\$module.ko" "\$MODULE_DIR/\$module.ko"
 done
