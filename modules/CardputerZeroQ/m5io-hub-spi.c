@@ -13,8 +13,7 @@
 #include "m5io-hub.h"
 
 #define M5IO_SPI_CONFIG         1
-#define M5IO_SPI_FULL_DUPLEX    2
-#define M5IO_SPI_SHORT_LEN      13
+#define M5IO_SPI_DISABLE        6
 #define M5IO_SPI_MIN_HZ         250000
 #define M5IO_SPI_MAX_HZ         20000000
 
@@ -22,6 +21,7 @@ struct m5io_hub_spi {
     struct m5io_hub *hub;
     u8 tx[M5IO_HUB_SPI_MAX_LEN];
     u8 rx[M5IO_HUB_SPI_MAX_LEN];
+    bool configured;
 };
 
 static int m5io_hub_spi_setup(struct spi_device *spi)
@@ -39,7 +39,9 @@ static int m5io_hub_spi_setup(struct spi_device *spi)
 
 static size_t m5io_hub_spi_max_transfer_size(struct spi_device *spi)
 {
-    return M5IO_HUB_SPI_MAX_LEN;
+    /* A wire DATA frame carries at most 255 bytes.  SPI core may split a
+     * larger transfer while retaining chip-select across the chunks. */
+    return M5IO_HUB_SPI_CHUNK_LEN;
 }
 
 /* Validate the whole message, including later CS groups, before CONFIG. */
@@ -67,7 +69,7 @@ static int m5io_hub_spi_validate(struct spi_message *msg)
         speed = t->speed_hz;
         bits = t->bits_per_word;
         len += t->len;
-        if (len > M5IO_HUB_SPI_MAX_LEN)
+        if (len > M5IO_HUB_SPI_CHUNK_LEN)
             return -EMSGSIZE;
         if (t->cs_change)
             len = 0;
@@ -93,39 +95,39 @@ static int m5io_hub_spi_configure(struct m5io_hub_spi *ms,
     ret = m5io_hub_exec(ms->hub, &req);
     if (ret)
         return ret;
-    return req.reply_len ? -EPROTO : 0;
+    if (req.status != 0)
+        return req.status == 4 ? -EBUSY :
+               (req.status == 3 ? -EINVAL : -EIO);
+    if (req.reply_len)
+        return -EPROTO;
+    ms->configured = true;
+    return 0;
 }
 
 static int m5io_hub_spi_exchange(struct m5io_hub_spi *ms, unsigned int len)
 {
-    u8 payload[M5IO_HUB_TOKEN_PAYLOAD_MAX];
+    if (!ms->configured)
+        return -EPIPE;
+    /* Every SPI transfer is a DATA frame on CH=3, including short transfers.
+     * The legacy FULL_DUPLEX TOKEN (ARG=2) is intentionally gone. */
+    return m5io_hub_send_data_sync(ms->hub, M5IO_HUB_CHN_SPI,
+                                   ms->tx, ms->rx, len);
+}
+
+static int m5io_hub_spi_disable(struct m5io_hub_spi *ms)
+{
     struct m5io_hub_request req = {
         .func = M5IO_HUB_FUNC_SPI,
-        .arg = M5IO_SPI_FULL_DUPLEX,
-        .payload = payload,
-        .payload_len = 2,
+        .arg = M5IO_SPI_DISABLE,
     };
     int ret;
 
-    put_unaligned_le16(len, payload);
-    if (len <= M5IO_SPI_SHORT_LEN) {
-        memcpy(payload + 2, ms->tx, len);
-        req.payload_len += len;
-    } else {
-        req.data_chn = M5IO_HUB_CHN_SPI;
-        req.data_tx = ms->tx;
-        req.data_rx = ms->rx;
-        req.data_len = len;
-    }
+    if (!ms->configured)
+        return 0;
     ret = m5io_hub_exec(ms->hub, &req);
-    if (ret)
-        return ret;
-    if (len <= M5IO_SPI_SHORT_LEN) {
-        if (req.reply_len != len)
-            return -EPROTO;
-        memcpy(ms->rx, req.reply, len);
-    }
-    return 0;
+    if (!ret && req.status == 0)
+        ms->configured = false;
+    return ret;
 }
 
 static void m5io_hub_spi_pack(u8 *dst, const struct spi_transfer *t)
@@ -231,6 +233,17 @@ static int m5io_hub_spi_probe(struct platform_device *pdev)
     return devm_spi_register_controller(&pdev->dev, ctlr);
 }
 
+static void m5io_hub_spi_remove(struct platform_device *pdev)
+{
+    struct spi_controller *ctlr = platform_get_drvdata(pdev);
+    struct m5io_hub_spi *ms;
+
+    if (!ctlr)
+        return;
+    ms = spi_controller_get_devdata(ctlr);
+    (void)m5io_hub_spi_disable(ms);
+}
+
 static const struct of_device_id m5io_hub_spi_of_match[] = {
     { .compatible = "m5stack,m5io-hub-spi" },
     { }
@@ -243,6 +256,7 @@ static struct platform_driver m5io_hub_spi_driver = {
         .of_match_table = m5io_hub_spi_of_match,
     },
     .probe = m5io_hub_spi_probe,
+    .remove = m5io_hub_spi_remove,
 };
 module_platform_driver(m5io_hub_spi_driver);
 

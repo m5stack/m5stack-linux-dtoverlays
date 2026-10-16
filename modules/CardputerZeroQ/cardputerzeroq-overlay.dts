@@ -121,6 +121,11 @@
                     };
                 };
 
+                m5io_hub_ir: infrared {
+                    compatible = "m5stack,m5io-hub-ir";
+                    status = "disabled";
+                };
+
                 m5io_hub_i2c: i2c {
                     compatible = "m5stack,m5io-hub-i2c";
                     #address-cells = <1>;

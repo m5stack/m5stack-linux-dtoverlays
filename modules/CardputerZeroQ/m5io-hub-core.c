@@ -41,7 +41,11 @@
 #define M5_RPC_TYPE_TOKEN 0
 #define M5_RPC_FUNC_PROTOCOL_CONTROL 0x0
 #define M5_RPC_FUNC_GPIO 0x1
-#define M5_RPC_FUNC_DATA_ACK 0xb
+#define M5_RPC_FUNC_DATA_ACK M5_RPC_FUNC_PROTOCOL_CONTROL
+#define M5_RPC_ARG_DATA_ACK 0x4
+#define M5_RPC_ARG_DATA_STATUS 0x5
+#define M5_RPC_ACK_WINDOW 0x0
+#define M5_RPC_ACK_COMPLETE 0x1
 #define M5_RPC_ARG_GPIO_INTERRUPT_EVENT 0x7
 #define M5_RPC_ARG_GPIO_PINMODE 0x1
 #define M5_RPC_ARG_GPIO_DIGITALWRITE 0x2
@@ -74,13 +78,13 @@
 #define M5_RPC_EXEC_TX_BUF_LEN \
   (M5_RPC_TOKEN_MAX_LEN + M5_RPC_UART_DATA_FRAME_COUNT * M5_RPC_DATA_MAX_LEN)
 #define M5_RPC_MAX_FRAME_LEN M5_RPC_DATA_MAX_LEN
-#define M5_RPC_DATA_ACK_TID_MASK 0x03
-#define M5_RPC_DATA_ACK_CHN_SHIFT 2
-#define M5_RPC_DATA_ACK_RESERVED_MASK BIT(7)
+#define M5_RPC_DATA_ACK_PID_MASK 0x03
+#define M5_RPC_DATA_ACK_CHN_MAX M5IO_HUB_CHN_MAX
 #define M5_RPC_DATA_ACK_RETRY_FIFO_SIZE 128
 #define M5_RPC_DATA_ACK_RETRY_PENDING_BITS \
   (M5IO_HUB_RPC_TID_NR * (M5IO_HUB_CHN_MAX + 1))
 #define M5_RPC_DATA_ACK_RETRY_DELAY_MS 20
+#define M5_RPC_TX_OP_NR 16
 
 #define M5_RPC_TOKEN_TYPE_MASK BIT(0)
 #define M5_RPC_TOKEN_P_MASK BIT(1)
@@ -158,14 +162,25 @@ struct m5io_hub_core;
 typedef void (*m5_rpc_cb_t)(struct m5io_hub_core *mcore, int tid, int status);
 
 struct m5_rpc_data_ack {
-  u8 tid;
+  u8 pid;
   u8 chn;
+  u16 op_id;
+  u8 ack_kind;
+  u8 status;
 };
 
 struct m5_rpc_data {
   spinlock_t tx_window_lock;
   unsigned long tx_windows;
   u8 tx_chn[M5IO_HUB_RPC_TID_NR];
+  /* OP_ID records for accepted asynchronous DATA operations. */
+  struct {
+    bool valid;
+    u8 chn;
+    u8 pid;
+    u16 op_id;
+  } tx_ops[M5_RPC_TX_OP_NR];
+  u16 next_op_id;
   spinlock_t ack_retry_lock;
   DECLARE_KFIFO(ack_retry_fifo, struct m5_rpc_data_ack,
                 M5_RPC_DATA_ACK_RETRY_FIFO_SIZE);
@@ -233,6 +248,7 @@ struct m5_rpc_spi {
   u8 next_pid;
   u8 rx[M5IO_HUB_SPI_MAX_LEN];
   int error;
+  wait_queue_head_t wq;
 };
 
 struct m5io_hub_core {
@@ -503,16 +519,24 @@ static int m5_rpc_frame_put(struct m5io_hub_core *mcore, const u8 *buf,
 }
 
 /* DATA ACK TOKENs are control traffic and do not allocate a TOKEN window. */
-static int m5_rpc_data_ack_send(struct m5io_hub_core *mcore, u8 tid, u8 chn) {
+static int m5_rpc_data_ack_send(struct m5io_hub_core *mcore, u8 chn, u8 pid,
+                                u16 op_id, u8 ack_kind, u8 status) {
   struct m5_rpc_token_frame *frame;
-  u8 tx_buf[M5_RPC_TOKEN_HDR_LEN + 1 + M5_RPC_CRC_LEN];
-  u8 payload;
+  u8 tx_buf[M5_RPC_TOKEN_HDR_LEN + 6 + M5_RPC_CRC_LEN];
+  u8 payload[6];
 
-  payload = (chn << M5_RPC_DATA_ACK_CHN_SHIFT) |
-            (tid & M5_RPC_DATA_ACK_TID_MASK);
+  if (!chn || chn > M5IO_HUB_CHN_MAX || pid > 3 || ack_kind > M5_RPC_ACK_COMPLETE)
+    return -EINVAL;
+  payload[0] = chn;
+  payload[1] = pid;
+  payload[2] = op_id & 0xff;
+  payload[3] = op_id >> 8;
+  payload[4] = ack_kind;
+  payload[5] = status;
   frame = (struct m5_rpc_token_frame *)tx_buf;
   m5_rpc_token_frame_fill(frame, M5_RPC_TYPE_TOKEN, 1, 0,
-                          M5_RPC_FUNC_DATA_ACK, 1, 0, &payload);
+                          M5_RPC_FUNC_DATA_ACK, sizeof(payload),
+                          M5_RPC_ARG_DATA_ACK, payload);
   m5_rpc_token_frame_crc_fill(frame);
 
   return m5_rpc_frame_put(mcore, tx_buf, sizeof(tx_buf));
@@ -543,7 +567,8 @@ static void m5_rpc_data_ack_retry_work(struct work_struct *work) {
     }
     spin_unlock_irqrestore(&mcore->rpc.data.ack_retry_lock, flags);
 
-    ret = m5_rpc_data_ack_send(mcore, ack.tid, ack.chn);
+    ret = m5_rpc_data_ack_send(mcore, ack.chn, ack.pid, ack.op_id,
+                               ack.ack_kind, ack.status);
     if (ret) {
       mod_delayed_work(system_wq, &mcore->data_ack_retry_work,
                        max_t(unsigned long, 1,
@@ -553,30 +578,32 @@ static void m5_rpc_data_ack_retry_work(struct work_struct *work) {
 
     spin_lock_irqsave(&mcore->rpc.data.ack_retry_lock, flags);
     kfifo_skip(&mcore->rpc.data.ack_retry_fifo);
-    clear_bit(ack.chn * M5IO_HUB_RPC_TID_NR + ack.tid,
+    clear_bit(ack.chn * M5IO_HUB_RPC_TID_NR + ack.pid,
               mcore->rpc.data.ack_retry_pending);
     spin_unlock_irqrestore(&mcore->rpc.data.ack_retry_lock, flags);
   }
 }
 
-static void m5_rpc_data_ack_retry_queue(struct m5io_hub_core *mcore, u8 tid,
-                                        u8 chn) {
-  struct m5_rpc_data_ack ack = {.tid = tid, .chn = chn};
+static void m5_rpc_data_ack_retry_queue(struct m5io_hub_core *mcore, u8 chn,
+                                        u8 pid, u16 op_id, u8 ack_kind,
+                                        u8 status) {
+  struct m5_rpc_data_ack ack = {.pid = pid, .chn = chn, .op_id = op_id,
+                                .ack_kind = ack_kind, .status = status};
   unsigned long flags;
   bool queue = false;
 
   spin_lock_irqsave(&mcore->rpc.data.ack_retry_lock, flags);
-  if (test_and_set_bit(chn * M5IO_HUB_RPC_TID_NR + tid,
+  if (test_and_set_bit(chn * M5IO_HUB_RPC_TID_NR + pid,
                        mcore->rpc.data.ack_retry_pending)) {
     spin_unlock_irqrestore(&mcore->rpc.data.ack_retry_lock, flags);
     return;
   }
   if (!kfifo_put(&mcore->rpc.data.ack_retry_fifo, ack)) {
-    clear_bit(chn * M5IO_HUB_RPC_TID_NR + tid,
+    clear_bit(chn * M5IO_HUB_RPC_TID_NR + pid,
               mcore->rpc.data.ack_retry_pending);
     spin_unlock_irqrestore(&mcore->rpc.data.ack_retry_lock, flags);
     dev_warn_ratelimited(mcore->hub.dev,
-                         "DATA ACK retry queue full: tid=%u chn=%u\n", tid,
+                         "DATA ACK retry queue full: pid=%u chn=%u\n", pid,
                          chn);
     return;
   }
@@ -646,6 +673,27 @@ static bool m5_rpc_data_window_release(struct m5io_hub_core *mcore, u8 tid,
   return matched;
 }
 
+/* Reset all transport-owned DATA state after a broken SPI session or MCU
+ * reset.  No stale PID/ACK/OP_ID may survive into the next HELLO session. */
+static void m5_rpc_data_state_reset(struct m5io_hub_core *mcore)
+{
+  unsigned long flags;
+
+  spin_lock_irqsave(&mcore->rpc.data.tx_window_lock, flags);
+  mcore->rpc.data.tx_windows = 0;
+  memset(mcore->rpc.data.tx_chn, 0, sizeof(mcore->rpc.data.tx_chn));
+  memset(mcore->rpc.data.tx_ops, 0, sizeof(mcore->rpc.data.tx_ops));
+  mcore->rpc.data.next_op_id = 1;
+  spin_unlock_irqrestore(&mcore->rpc.data.tx_window_lock, flags);
+
+  spin_lock_irqsave(&mcore->rpc.data.ack_retry_lock, flags);
+  kfifo_reset(&mcore->rpc.data.ack_retry_fifo);
+  bitmap_zero(mcore->rpc.data.ack_retry_pending,
+              M5_RPC_DATA_ACK_RETRY_PENDING_BITS);
+  mcore->data_ack_retry_work_scheduled = false;
+  spin_unlock_irqrestore(&mcore->rpc.data.ack_retry_lock, flags);
+}
+
 static int m5_rpc_response_status_to_errno(u8 status) {
   switch (status) {
   case 0x0:
@@ -689,7 +737,10 @@ static void m5_rpc_token_rx_dispatch(struct m5io_hub_core *mcore, const u8 *buf,
   bool matched = false;
   bool pending = false;
   u8 ack_chn;
-  u8 ack_tid;
+  u8 ack_pid;
+  u16 ack_op;
+  u8 ack_kind;
+  u8 ack_status;
   u8 arg;
   u8 func;
   u8 payload_len;
@@ -733,7 +784,9 @@ static void m5_rpc_token_rx_dispatch(struct m5io_hub_core *mcore, const u8 *buf,
 
   spin_lock_irqsave(&mcore->rpc.token.state_lock, flags);
   if (mcore->rpc.token.waiting[tid] &&
-      mcore->rpc.token.expected_func[tid] == func) {
+      mcore->rpc.token.expected_func[tid] == func &&
+      !(func == M5_RPC_FUNC_PROTOCOL_CONTROL &&
+        arg == M5_RPC_ARG_DATA_ACK)) {
     status = func == M5_RPC_FUNC_PROTOCOL_CONTROL
                  ? 0
                  : m5_rpc_response_status_to_errno(arg);
@@ -763,27 +816,61 @@ static void m5_rpc_token_rx_dispatch(struct m5io_hub_core *mcore, const u8 *buf,
   }
 
   if (func == M5_RPC_FUNC_DATA_ACK) {
-    if (arg != 0 || payload_len != 1) {
+    if (arg != M5_RPC_ARG_DATA_ACK || payload_len != 6 || tid != 0) {
       dev_dbg_ratelimited(mcore->hub.dev,
                           "drop invalid data ack: token_tid=%u arg=%u len=%u\n",
                           tid, arg, payload_len);
       return;
     }
 
-    ack_tid = frame->data[0] & M5_RPC_DATA_ACK_TID_MASK;
-    ack_chn = frame->data[0] >> M5_RPC_DATA_ACK_CHN_SHIFT;
-    if (frame->data[0] & M5_RPC_DATA_ACK_RESERVED_MASK || !ack_chn ||
-        ack_chn > M5IO_HUB_CHN_MAX) {
+    ack_chn = frame->data[0];
+    ack_pid = frame->data[1];
+    ack_op = frame->data[2] | ((u16)frame->data[3] << 8);
+    ack_kind = frame->data[4];
+    ack_status = frame->data[5];
+    if (!ack_chn || ack_chn > M5IO_HUB_CHN_MAX || ack_pid > 3 ||
+        ack_kind > M5_RPC_ACK_COMPLETE || ack_status > 7 ||
+        (ack_kind == M5_RPC_ACK_WINDOW && ack_op == 0 &&
+         ack_status == 1)) {
       dev_dbg_ratelimited(mcore->hub.dev,
                           "drop invalid data ack payload: token_tid=%u data=%#x\n",
                           tid, frame->data[0]);
       return;
     }
 
-    if (!m5_rpc_data_window_release(mcore, ack_tid, ack_chn))
+    if (ack_kind == M5_RPC_ACK_WINDOW &&
+        !m5_rpc_data_window_release(mcore, ack_pid, ack_chn))
       dev_dbg_ratelimited(mcore->hub.dev,
-                          "drop unmatched data ack: data_tid=%u chn=%u\n",
-                          ack_tid, ack_chn);
+                          "drop unmatched data ack: data_pid=%u chn=%u\n",
+                          ack_pid, ack_chn);
+
+    /* WINDOW/BUSY is associated with OP_ID until COMPLETE_ACK arrives. */
+    if (ack_kind == M5_RPC_ACK_WINDOW && ack_status == 1 && ack_op) {
+      unsigned long op_flags;
+      unsigned int i;
+      spin_lock_irqsave(&mcore->rpc.data.tx_window_lock, op_flags);
+      for (i = 0; i < M5_RPC_TX_OP_NR; i++)
+        if (!mcore->rpc.data.tx_ops[i].valid) {
+          mcore->rpc.data.tx_ops[i].valid = true;
+          mcore->rpc.data.tx_ops[i].chn = ack_chn;
+          mcore->rpc.data.tx_ops[i].pid = ack_pid;
+          mcore->rpc.data.tx_ops[i].op_id = ack_op;
+          break;
+        }
+      spin_unlock_irqrestore(&mcore->rpc.data.tx_window_lock, op_flags);
+    } else if (ack_kind == M5_RPC_ACK_COMPLETE) {
+      unsigned long op_flags;
+      unsigned int i;
+      spin_lock_irqsave(&mcore->rpc.data.tx_window_lock, op_flags);
+      for (i = 0; i < M5_RPC_TX_OP_NR; i++)
+        if (mcore->rpc.data.tx_ops[i].valid &&
+            mcore->rpc.data.tx_ops[i].chn == ack_chn &&
+            mcore->rpc.data.tx_ops[i].op_id == ack_op) {
+          mcore->rpc.data.tx_ops[i].valid = false;
+          break;
+        }
+      spin_unlock_irqrestore(&mcore->rpc.data.tx_window_lock, op_flags);
+    }
     return;
   }
 
@@ -948,15 +1035,16 @@ static void m5_rpc_spi_data_rx(struct m5io_hub_core *mcore,
 
   spin_lock_irqsave(&mcore->rpc.token.state_lock, flags);
   if (rpc->tid >= 0 && mcore->rpc.token.waiting[rpc->tid] && !rpc->error) {
-    len = min_t(unsigned int, M5IO_HUB_SPI_CHUNK_LEN,
-                rpc->expected_len - rpc->rx_len);
-    if (!len || m5_rpc_data_len(frame) != len ||
-        m5_rpc_data_tid(frame) != rpc->next_pid) {
+    len = m5_rpc_data_len(frame);
+    /* Upstream PID is allocated from the independent MCU->SoC window; it
+     * need not mirror the downstream PID sequence.  Ordering is provided by
+     * the SPI channel queue, so accept any legal PID here. */
+    if (!len || len > rpc->expected_len - rpc->rx_len) {
       rpc->error = -EPROTO;
     } else {
       memcpy(rpc->rx + rpc->rx_len, frame->data, len);
       rpc->rx_len += len;
-      rpc->next_pid = (rpc->next_pid + 1) & 3;
+      wake_up(&rpc->wq);
     }
   }
   spin_unlock_irqrestore(&mcore->rpc.token.state_lock, flags);
@@ -987,7 +1075,7 @@ static unsigned int m5_rpc_rx_stream_feed(struct m5io_hub_core *mcore,
   bool queue_data_work;
   int ret;
   u8 chn;
-  u8 data_tid;
+  u8 data_pid;
   u8 payload_len;
   u8 type;
 
@@ -1037,13 +1125,13 @@ static unsigned int m5_rpc_rx_stream_feed(struct m5io_hub_core *mcore,
       m5_rpc_token_rx_dispatch(mcore, stream->frame, stream->expect_len);
     } else {
       data_frame = (const struct m5_rpc_data_frame *)stream->frame;
-      data_tid = m5_rpc_data_tid(data_frame);
+      data_pid = m5_rpc_data_tid(data_frame);
       chn = m5_rpc_data_chn(data_frame);
       payload_len = m5_rpc_data_len(data_frame);
       if (m5_rpc_data_frame_crc_check(stream->frame, stream->expect_len)) {
         dev_dbg_ratelimited(mcore->hub.dev,
                             "drop invalid data frame: tid=%u chn=%u len=%u\n",
-                            data_tid, chn, payload_len);
+                            data_pid, chn, payload_len);
       } else if (!chn || chn > M5IO_HUB_CHN_MAX) {
         dev_dbg_ratelimited(mcore->hub.dev,
                             "drop data frame for invalid channel %u\n",
@@ -1051,21 +1139,33 @@ static unsigned int m5_rpc_rx_stream_feed(struct m5io_hub_core *mcore,
       } else if (chn == M5_RPC_CHN_IIC1 || chn == M5_RPC_CHN_IIC2) {
         /* FUNC=2 has a completion TOKEN; this firmware has no DATA ACK. */
         m5_rpc_i2c_data_rx(mcore, data_frame);
+        ret = m5_rpc_data_ack_send(mcore, chn, data_pid, 0,
+                                   M5_RPC_ACK_WINDOW, 0);
+        if (ret)
+          m5_rpc_data_ack_retry_queue(mcore, chn, data_pid, 0,
+                                      M5_RPC_ACK_WINDOW, 0);
       } else if (chn == M5_RPC_CHN_SPI) {
         /* FUNC3 mirrors the MOSI chunks, then sends a terminal TOKEN.
          * It neither needs nor implements asynchronous DATA ACK windows.
          */
         m5_rpc_spi_data_rx(mcore, data_frame);
+        ret = m5_rpc_data_ack_send(mcore, chn, data_pid, 0,
+                                   M5_RPC_ACK_WINDOW, 0);
+        if (ret)
+          m5_rpc_data_ack_retry_queue(mcore, chn, data_pid, 0,
+                                      M5_RPC_ACK_WINDOW, 0);
       } else if (m5_rpc_data_rx_frame_put(mcore, stream->frame,
                                            stream->expect_len,
                                            &queue_data_work)) {
-        ret = m5_rpc_data_ack_send(mcore, data_tid, chn);
+        ret = m5_rpc_data_ack_send(mcore, chn, data_pid, 0,
+                                   M5_RPC_ACK_WINDOW, 0);
         if (ret) {
           dev_warn_ratelimited(mcore->hub.dev,
-                               "failed to send data ack, retrying: tid=%u "
+                               "failed to send data ack, retrying: pid=%u "
                                "chn=%u: %d\n",
-                               data_tid, chn, ret);
-          m5_rpc_data_ack_retry_queue(mcore, data_tid, chn);
+                               data_pid, chn, ret);
+          m5_rpc_data_ack_retry_queue(mcore, chn, data_pid, 0,
+                                      M5_RPC_ACK_WINDOW, 0);
         }
         if (queue_data_work)
           queue_work(system_unbound_wq, &mcore->data_rx_work);
@@ -1483,13 +1583,9 @@ int m5io_hub_SendChnData(struct m5io_hub *hub, unsigned int chn,
   if (!hub || !hub->spi)
     return -ENODEV;
 
-  if (!chn || chn > M5IO_HUB_CHN_MAX || len > M5_RPC_DATA_MAX_PLEN ||
-      (len && !data))
+  if (!chn || chn > M5IO_HUB_CHN_MAX || !len ||
+      len > M5_RPC_DATA_MAX_PLEN || !data)
     return -EINVAL;
-
-  if (chn == M5_RPC_CHN_IIC1 || chn == M5_RPC_CHN_IIC2 ||
-      chn == M5_RPC_CHN_SPI)
-    return -EOPNOTSUPP;
 
   mcore = container_of(hub, struct m5io_hub_core, hub);
 
@@ -1508,6 +1604,73 @@ int m5io_hub_SendChnData(struct m5io_hub *hub, unsigned int chn,
   return ret;
 }
 EXPORT_SYMBOL_GPL(m5io_hub_SendChnData);
+
+int m5io_hub_send_data_async(struct m5io_hub *hub, unsigned int chn,
+                             const u8 *data, unsigned int len)
+{
+  return m5io_hub_SendChnData(hub, chn, data, len);
+}
+EXPORT_SYMBOL_GPL(m5io_hub_send_data_async);
+
+int m5io_hub_send_data_sync(struct m5io_hub *hub, unsigned int chn,
+                            const u8 *tx, u8 *rx, unsigned int len)
+{
+  struct m5io_hub_core *mcore;
+  struct m5_rpc_spi *rpc;
+  struct mutex *tid_lock;
+  unsigned long flags;
+  unsigned int off = 0;
+  int tid, ret = 0;
+
+  if (!hub || !hub->spi)
+    return -ENODEV;
+  if (chn != M5_RPC_CHN_SPI || !tx || !rx || !len ||
+      len > M5IO_HUB_SPI_MAX_LEN)
+    return -EINVAL;
+  mcore = container_of(hub, struct m5io_hub_core, hub);
+  rpc = &mcore->spi_rpc;
+  mutex_lock(&rpc->lock);
+  tid_lock = token_tid_alloc(mcore, NULL, M5IO_HUB_FUNC_SPI);
+  tid = tid_lock - mcore->rpc.token.tid_lock;
+  spin_lock_irqsave(&mcore->rpc.token.state_lock, flags);
+  rpc->tid = tid;
+  rpc->expected_len = len;
+  rpc->rx_len = 0;
+  rpc->next_pid = 0;
+  rpc->error = 0;
+  spin_unlock_irqrestore(&mcore->rpc.token.state_lock, flags);
+
+  while (off < len) {
+    unsigned int chunk = min_t(unsigned int, M5_RPC_DATA_MAX_PLEN, len - off);
+    do {
+      ret = m5io_hub_SendChnData(hub, chn, tx + off, chunk);
+      if (ret == -EAGAIN)
+        msleep(1);
+    } while (ret == -EAGAIN);
+    if (ret)
+      break;
+    if (!wait_event_timeout(rpc->wq,
+          READ_ONCE(rpc->rx_len) >= off + chunk || READ_ONCE(rpc->error),
+          msecs_to_jiffies(M5_RPC_UART_TOKEN_TIMEOUT_MS))) {
+      ret = -ETIMEDOUT;
+      break;
+    }
+    if (rpc->error) {
+      ret = rpc->error;
+      break;
+    }
+    off += chunk;
+  }
+  if (!ret && off == len)
+    memcpy(rx, rpc->rx, len);
+  spin_lock_irqsave(&mcore->rpc.token.state_lock, flags);
+  rpc->tid = -1;
+  spin_unlock_irqrestore(&mcore->rpc.token.state_lock, flags);
+  token_tid_free(mcore, tid_lock);
+  mutex_unlock(&rpc->lock);
+  return ret;
+}
+EXPORT_SYMBOL_GPL(m5io_hub_send_data_sync);
 
 /**
  * m5io_hub_register_chn_data_handler - 注册通道 DATA 接收处理函数
@@ -1529,10 +1692,6 @@ int m5io_hub_register_chn_data_handler(
 
   if (!hub || !hub->spi || !handler || !chn || chn > M5IO_HUB_CHN_MAX)
     return -EINVAL;
-
-  if (chn == M5_RPC_CHN_IIC1 || chn == M5_RPC_CHN_IIC2 ||
-      chn == M5_RPC_CHN_SPI)
-    return -EOPNOTSUPP;
 
   mcore = container_of(hub, struct m5io_hub_core, hub);
   mutex_lock(&mcore->rpc.data.handler_lock);
@@ -1852,6 +2011,57 @@ out_free:
 }
 EXPORT_SYMBOL_GPL(m5io_hub_exec);
 
+int m5io_hub_hello(struct m5io_hub *hub, u8 payload[15])
+{
+  struct m5io_hub_request req = {
+    .func = M5_RPC_FUNC_PROTOCOL_CONTROL,
+    .arg = 1,
+  };
+  int ret;
+
+  if (!hub || !payload)
+    return -EINVAL;
+  ret = m5io_hub_exec(hub, &req);
+  if (ret)
+    return ret;
+  if (req.reply_len != 15)
+    return -EPROTO;
+  memcpy(payload, req.reply, 15);
+  return 0;
+}
+EXPORT_SYMBOL_GPL(m5io_hub_hello);
+
+int m5io_hub_mcu_reset(struct m5io_hub *hub)
+{
+  struct m5io_hub_request req = {
+    .func = M5_RPC_FUNC_PROTOCOL_CONTROL,
+    .arg = 3,
+  };
+
+  return m5io_hub_exec(hub, &req);
+}
+EXPORT_SYMBOL_GPL(m5io_hub_mcu_reset);
+
+int m5io_hub_data_status(struct m5io_hub *hub, u8 payload[15])
+{
+  struct m5io_hub_request req = {
+    .func = M5_RPC_FUNC_PROTOCOL_CONTROL,
+    .arg = M5_RPC_ARG_DATA_STATUS,
+  };
+  int ret;
+
+  if (!hub || !payload)
+    return -EINVAL;
+  ret = m5io_hub_exec(hub, &req);
+  if (ret)
+    return ret;
+  if (req.reply_len != 15)
+    return -EPROTO;
+  memcpy(payload, req.reply, 15);
+  return 0;
+}
+EXPORT_SYMBOL_GPL(m5io_hub_data_status);
+
 static int m5_rpc_token_gpio_exec(struct m5io_hub *hub, u8 subcmd,
                                   const u8 *payload, u8 plen, u8 *rx,
                                   unsigned int *rx_len) {
@@ -2095,6 +2305,7 @@ static void m5io_hub_cancel_works(void *data) {
   cancel_work_sync(&mcore->data_rx_work);
   cancel_work_sync(&mcore->gpio_irq_work);
   m5_rpc_rx_stream_reset(mcore);
+  m5_rpc_data_state_reset(mcore);
 }
 
 /**
@@ -2128,6 +2339,7 @@ static int m5io_hub_probe(struct spi_device *spi) {
   mutex_init(&mcore->i2c.lock);
   mcore->i2c.tid = -1;
   mutex_init(&mcore->spi_rpc.lock);
+  init_waitqueue_head(&mcore->spi_rpc.wq);
   mcore->spi_rpc.tid = -1;
   mutex_init(&mcore->exec_tx_lock);
 
@@ -2159,6 +2371,7 @@ static int m5io_hub_probe(struct spi_device *spi) {
     spin_lock_init(&mcore->gpio_irq_pending_lock);
     INIT_KFIFO(mcore->gpio_irq_fifo);
     spin_lock_init(&mcore->rpc.data.tx_window_lock);
+    mcore->rpc.data.next_op_id = 1;
     spin_lock_init(&mcore->rpc.data.ack_retry_lock);
     INIT_KFIFO(mcore->rpc.data.ack_retry_fifo);
     spin_lock_init(&mcore->rpc.token.state_lock);

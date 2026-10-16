@@ -33,7 +33,8 @@
 #define M5IO_HUB_CHN_SPI        3
 #define M5IO_HUB_CHN_UART1      4
 #define M5IO_HUB_CHN_UART2      5
-#define M5IO_HUB_CHN_MAX        M5IO_HUB_CHN_UART2
+#define M5IO_HUB_CHN_IR         6
+#define M5IO_HUB_CHN_MAX        M5IO_HUB_CHN_IR
 
 #define M5IO_HUB_FUNC_I2C       2
 #define M5IO_HUB_FUNC_SPI       3
@@ -99,9 +100,32 @@ typedef void (*m5io_hub_chn_data_handler_t)(void *data, const u8 *buf,
 
 int m5io_hub_pinMode(struct m5io_hub *hub, unsigned int pin, int mode);
 int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request);
+int m5io_hub_hello(struct m5io_hub *hub, u8 payload[15]);
+int m5io_hub_mcu_reset(struct m5io_hub *hub);
+int m5io_hub_data_status(struct m5io_hub *hub, u8 payload[15]);
+/* FUNC=2/ARG=7; resets one I2C controller and restores last config. */
+int m5io_hub_i2c_reset(struct m5io_hub *hub, unsigned int bus);
 int m5io_hub_rpc_transfer(struct m5io_hub *hub);
 int m5io_hub_SendChnData(struct m5io_hub *hub, unsigned int chn,
                          const u8 *data, unsigned int len);
+/* Protocol DATA transport helpers.  DATA is independent of FUNC TOKENs and
+ * uses the direction-wide PID window.  The synchronous form waits for the
+ * peer WINDOW/COMPLETE acknowledgements and, for bidirectional transfers,
+ * copies the matching DATA payload into @rx. */
+int m5io_hub_send_data_async(struct m5io_hub *hub, unsigned int chn,
+                             const u8 *data, unsigned int len);
+int m5io_hub_send_data_sync(struct m5io_hub *hub, unsigned int chn,
+                            const u8 *tx, u8 *rx, unsigned int len);
+int m5io_hub_ir_config(struct m5io_hub *hub, const u8 payload[15],
+                       u8 actual[15]);
+int m5io_hub_ir_receive(struct m5io_hub *hub, bool enable);
+int m5io_hub_ir_reset(struct m5io_hub *hub);
+int m5io_hub_ir_disable(struct m5io_hub *hub);
+int m5io_hub_ir_send(struct m5io_hub *hub, const u8 *data, unsigned int len);
+int m5io_hub_ir_register_rx(struct m5io_hub *hub,
+                             m5io_hub_chn_data_handler_t handler, void *data);
+void m5io_hub_ir_unregister_rx(struct m5io_hub *hub,
+                               m5io_hub_chn_data_handler_t handler, void *data);
 int m5io_hub_register_chn_data_handler(
     struct m5io_hub *hub, unsigned int chn,
     m5io_hub_chn_data_handler_t handler, void *data);

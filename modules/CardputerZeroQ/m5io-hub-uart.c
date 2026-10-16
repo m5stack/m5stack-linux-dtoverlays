@@ -32,6 +32,7 @@
 #define M5IO_HUB_UART_CONFIG_LEN    8
 #define M5IO_HUB_UART_ARG_CONFIG    1
 #define M5IO_HUB_UART_ARG_TX        2
+#define M5IO_HUB_UART_ARG_DISABLE   6
 
 struct m5io_hub_uart;
 
@@ -47,6 +48,7 @@ struct m5io_hub_uart_port {
     unsigned int channel;
     u8 tx_buf[M5IO_HUB_UART_MAX_TX];
     bool registered;
+    bool configured;
 };
 
 struct m5io_hub_uart {
@@ -99,7 +101,8 @@ static void m5io_hub_uart_rx_data(void *data, const u8 *buf, unsigned int len)
     struct tty_port *tty_port;
     int copied;
 
-    if (!up || !buf || !len || !atomic_read(&up->rx_enabled) ||
+    if (!up || !buf || !len || !up->configured ||
+        !atomic_read(&up->rx_enabled) ||
         !up->port.state)
         return;
 
@@ -120,7 +123,6 @@ static void m5io_hub_uart_tx_work(struct work_struct *work)
     struct uart_port *port = &up->port;
     for (;;) {
         struct tty_port *tty_port;
-        struct m5io_hub_request request = {0};
         unsigned long flags;
         unsigned int count;
         unsigned int pending;
@@ -138,7 +140,7 @@ static void m5io_hub_uart_tx_work(struct work_struct *work)
         }
 
         count = min_t(unsigned int, kfifo_len(&tty_port->xmit_fifo),
-                      M5IO_HUB_UART_MAX_TX);
+                      M5IO_HUB_DATA_PAYLOAD_MAX);
         if (kfifo_out_peek(&tty_port->xmit_fifo, up->tx_buf, count) != count) {
             spin_unlock_irqrestore(&port->lock, flags);
             mod_delayed_work(system_wq, &up->tx_work, msecs_to_jiffies(20));
@@ -147,31 +149,10 @@ static void m5io_hub_uart_tx_work(struct work_struct *work)
         atomic_set(&up->tx_inflight, 1);
         spin_unlock_irqrestore(&port->lock, flags);
 
-        request.func = M5IO_HUB_FUNC_UART;
-        request.arg = M5IO_HUB_UART_ARG_TX;
-        request.data_chn = up->channel;
-        if (count <= M5IO_HUB_TOKEN_PAYLOAD_MAX - 3) {
-            u8 payload[M5IO_HUB_TOKEN_PAYLOAD_MAX];
-
-            payload[0] = up->channel == M5IO_HUB_CHN_UART2 ? 2 : 1;
-            payload[1] = count;
-            payload[2] = count >> 8;
-            memcpy(payload + 3, up->tx_buf, count);
-            request.payload = payload;
-            request.payload_len = 3 + count;
-            ret = m5io_hub_exec(up->mu->hub, &request);
-        } else {
-            u8 payload[3];
-
-            payload[0] = up->channel == M5IO_HUB_CHN_UART2 ? 2 : 1;
-            payload[1] = count;
-            payload[2] = count >> 8;
-            request.payload = payload;
-            request.payload_len = sizeof(payload);
-            request.data_tx = up->tx_buf;
-            request.data_len = count;
-            ret = m5io_hub_exec(up->mu->hub, &request);
-        }
+        /* UART bytes are DATA CH=4/5.  The old FUNC=4 ARG=2 TX TOKEN and
+         * its port/length prefix are intentionally not emitted. */
+        ret = m5io_hub_send_data_async(up->mu->hub, up->channel,
+                                       up->tx_buf, count);
 
         atomic_set(&up->tx_inflight, 0);
         if (ret) {
@@ -231,8 +212,8 @@ static int m5io_hub_uart_startup(struct uart_port *port)
     struct m5io_hub_uart_port *up =
         container_of(port, struct m5io_hub_uart_port, port);
 
-    atomic_set(&up->rx_enabled, 1);
-    atomic_set(&up->tx_enabled, 1);
+    atomic_set(&up->rx_enabled, up->configured);
+    atomic_set(&up->tx_enabled, up->configured);
     return 0;
 }
 
@@ -245,6 +226,18 @@ static void m5io_hub_uart_shutdown(struct uart_port *port)
     atomic_set(&up->tx_enabled, 0);
     atomic_set(&up->tx_pending, 0);
     cancel_delayed_work_sync(&up->tx_work);
+    if (up->configured) {
+        struct m5io_hub_request request = {
+            .func = M5IO_HUB_FUNC_UART,
+            .arg = M5IO_HUB_UART_ARG_DISABLE,
+        };
+        u8 payload = up->channel == M5IO_HUB_CHN_UART2 ? 2 : 1;
+
+        request.payload = &payload;
+        request.payload_len = 1;
+        if (!m5io_hub_exec(up->mu->hub, &request) && request.status == 0)
+            up->configured = false;
+    }
 }
 
 static int m5io_hub_uart_configure(struct m5io_hub_uart_port *up,
@@ -273,9 +266,15 @@ static int m5io_hub_uart_configure(struct m5io_hub_uart_port *up,
     ret = m5io_hub_exec(up->mu->hub, &request);
     if (ret)
         return ret;
+    if (request.status != 0)
+        return request.status == 4 ? -EBUSY :
+               (request.status == 3 ? -EINVAL : -EIO);
     if (request.reply_len != sizeof(payload) ||
         request.reply[0] != port_number)
         return -EPROTO;
+    up->configured = true;
+    atomic_set(&up->rx_enabled, 1);
+    atomic_set(&up->tx_enabled, 1);
     return 0;
 }
 
