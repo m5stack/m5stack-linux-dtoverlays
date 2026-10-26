@@ -29,7 +29,7 @@
 #define M5IO_HUB_UART_MAX_TX        1024
 #define M5IO_HUB_UART_MIN_BAUD      1200
 #define M5IO_HUB_UART_MAX_BAUD      1000000
-#define M5IO_HUB_UART_CONFIG_LEN    8
+#define M5IO_HUB_UART_CONFIG_LEN    10
 #define M5IO_HUB_UART_ARG_CONFIG    1
 /* The MCU answers UART_CONFIG with BUSY while it still owns RX data, so the
  * request is retried instead of being treated as a hard failure. */
@@ -53,6 +53,9 @@ struct m5io_hub_uart_port {
     u8 tx_buf[M5IO_HUB_UART_MAX_TX];
     bool registered;
     bool configured;
+    bool io_failed;
+    tcflag_t confirmed_cflag;
+    unsigned int confirmed_baud;
 };
 
 struct m5io_hub_uart {
@@ -74,8 +77,9 @@ static unsigned int m5io_hub_uart_tx_empty(struct uart_port *port)
     struct m5io_hub_uart_port *up =
         container_of(port, struct m5io_hub_uart_port, port);
 
-    return atomic_read(&up->tx_inflight) || atomic_read(&up->tx_pending) ?
-           0 : TIOCSER_TEMT;
+    return READ_ONCE(up->io_failed) ||
+           atomic_read(&up->tx_inflight) || atomic_read(&up->tx_pending) ||
+           m5io_hub_data_pending(up->mu->hub, up->channel) ? 0 : TIOCSER_TEMT;
 }
 
 static unsigned int m5io_hub_uart_get_mctrl(struct uart_port *port)
@@ -112,7 +116,7 @@ static void m5io_hub_uart_rx_data(void *data, const u8 *buf, unsigned int len)
      * Dropping here without a word is what made a gated-off RX look like a dead
      * link while writes kept working.  Say why, once.
      */
-    if (!up->configured || !atomic_read(&up->rx_enabled) || !up->port.state) {
+    if (!READ_ONCE(up->configured) || !atomic_read(&up->rx_enabled) || !up->port.state) {
         dev_warn_ratelimited(up->port.dev,
                              "UART%u: dropping %u RX bytes (configured=%d "
                              "rx_enabled=%d state=%d)\n",
@@ -132,12 +136,26 @@ static void m5io_hub_uart_rx_data(void *data, const u8 *buf, unsigned int len)
         tty_flip_buffer_push(tty_port);
 }
 
+/* Called with config_lock held. A timeout cannot prove which configuration
+ * is active; only a later successful CONFIG may reopen the DATA path. */
+static void m5io_hub_uart_mark_unknown(struct m5io_hub_uart_port *up)
+{
+    WRITE_ONCE(up->configured, false);
+    WRITE_ONCE(up->io_failed, true);
+    atomic_set(&up->tx_enabled, 0);
+    atomic_set(&up->rx_enabled, 0);
+}
+
 static void m5io_hub_uart_tx_work(struct work_struct *work)
 {
     struct m5io_hub_uart_port *up = container_of(to_delayed_work(work),
                                                   struct m5io_hub_uart_port,
                                                   tx_work);
     struct uart_port *port = &up->port;
+
+    /* Serialize configuration and submission, including the check that the
+     * MCU's actual framing is still known. start_tx itself cannot sleep. */
+    mutex_lock(&up->config_lock);
     for (;;) {
         struct tty_port *tty_port;
         unsigned long flags;
@@ -145,7 +163,7 @@ static void m5io_hub_uart_tx_work(struct work_struct *work)
         unsigned int pending;
         int ret;
 
-        if (!atomic_read(&up->tx_enabled) || !port->state)
+        if (!up->configured || !atomic_read(&up->tx_enabled) || !port->state)
             break;
 
         spin_lock_irqsave(&port->lock, flags);
@@ -173,13 +191,17 @@ static void m5io_hub_uart_tx_work(struct work_struct *work)
 
         atomic_set(&up->tx_inflight, 0);
         if (ret) {
-            dev_warn_ratelimited(port->dev,
-                                 "UART%u TX transaction failed: %d\n",
-                                 up->channel - M5IO_HUB_CHN_UART1 + 1, ret);
-            /* Leave the xmit tail untouched.  A transient RPC/FIFO failure
-             * can be retried without silently dropping tty data. */
-            mod_delayed_work(system_wq, &up->tx_work,
-                             msecs_to_jiffies(20));
+            /* These two failures occur before DATA enters the transport.
+             * Other errors must not be replayed indefinitely as backpressure. */
+            if (ret == -EAGAIN || ret == -ENOSPC) {
+                mod_delayed_work(system_wq, &up->tx_work,
+                                 msecs_to_jiffies(20));
+            } else {
+                m5io_hub_uart_mark_unknown(up);
+                dev_warn_ratelimited(port->dev,
+                                     "UART%u TX stopped: %d; reconfigure required\n",
+                                     up->channel - M5IO_HUB_CHN_UART1 + 1, ret);
+            }
             break;
         }
 
@@ -196,6 +218,7 @@ static void m5io_hub_uart_tx_work(struct work_struct *work)
         if (!pending)
             break;
     }
+    mutex_unlock(&up->config_lock);
 }
 
 static void m5io_hub_uart_start_tx(struct uart_port *port)
@@ -203,15 +226,10 @@ static void m5io_hub_uart_start_tx(struct uart_port *port)
     struct m5io_hub_uart_port *up =
         container_of(port, struct m5io_hub_uart_port, port);
 
-    atomic_set(&up->tx_enabled, 1);
-    /*
-     * TX recovers on the first write, so RX must recover too.  Without this a
-     * single configuration attempt that came back BUSY strands RX at zero
-     * while writes keep succeeding.
-     */
-    if (up->configured)
-        atomic_set(&up->rx_enabled, 1);
     atomic_set(&up->tx_pending, 1);
+    if (!READ_ONCE(up->configured))
+        return;
+    atomic_set(&up->tx_enabled, 1);
     mod_delayed_work(system_wq, &up->tx_work, 0);
 }
 
@@ -236,8 +254,9 @@ static int m5io_hub_uart_startup(struct uart_port *port)
     struct m5io_hub_uart_port *up =
         container_of(port, struct m5io_hub_uart_port, port);
 
-    atomic_set(&up->rx_enabled, up->configured);
-    atomic_set(&up->tx_enabled, up->configured);
+    atomic_set(&up->rx_enabled, READ_ONCE(up->configured) &&
+               (READ_ONCE(up->confirmed_cflag) & CREAD));
+    atomic_set(&up->tx_enabled, READ_ONCE(up->configured));
     return 0;
 }
 
@@ -250,6 +269,7 @@ static void m5io_hub_uart_shutdown(struct uart_port *port)
     atomic_set(&up->tx_enabled, 0);
     atomic_set(&up->tx_pending, 0);
     cancel_delayed_work_sync(&up->tx_work);
+    mutex_lock(&up->config_lock);
     if (up->configured) {
         struct m5io_hub_request request = {
             .func = M5IO_HUB_FUNC_UART,
@@ -259,9 +279,13 @@ static void m5io_hub_uart_shutdown(struct uart_port *port)
 
         request.payload = &payload;
         request.payload_len = 1;
-        if (!m5io_hub_exec(up->mu->hub, &request) && request.status == 0)
-            up->configured = false;
+        if (!m5io_hub_exec(up->mu->hub, &request) &&
+            request.status == 0 && request.reply_len == 0)
+            WRITE_ONCE(up->configured, false);
+        else if (request.status != 4 && request.status != 3)
+            m5io_hub_uart_mark_unknown(up);
     }
+    mutex_unlock(&up->config_lock);
 }
 
 static int m5io_hub_uart_configure(struct m5io_hub_uart_port *up,
@@ -283,22 +307,16 @@ static int m5io_hub_uart_configure(struct m5io_hub_uart_port *up,
     payload[6] = (termios->c_cflag & PARENB) ?
                  ((termios->c_cflag & PARODD) ? 2 : 1) : 0;
     payload[7] = (termios->c_cflag & CSTOPB) ? 2 : 1;
+    payload[8] = 0; /* v2 TX low watermark: 256 bytes, little endian */
+    payload[9] = 1;
 
     request.func = M5IO_HUB_FUNC_UART;
     request.arg = M5IO_HUB_UART_ARG_CONFIG;
     request.payload = payload;
     request.payload_len = sizeof(payload);
 
-    /*
-     * BUSY means the MCU is not idle yet: it refuses UART_CONFIG while it still
-     * owns RX data for this port, because reconfiguring resets its RX ring.
-     * That backlog drains by itself -- the transport keeps acknowledging the
-     * uplink frames whether or not they reach the tty -- so BUSY is a retry,
-     * not a failure.  Treating it as final left rx_enabled at zero with no way
-     * back, and only TX recovered, because start_tx() sets tx_enabled
-     * unconditionally.  From the outside that reads as "writes work, reads
-     * never do".
-     */
+    /* A definite BUSY preserves the confirmed configuration. An uncertain
+     * result below closes the DATA gate until CONFIG succeeds again. */
     for (attempt = 0; attempt < M5IO_HUB_UART_CFG_BUSY_TRIES; attempt++) {
         request.status = 0xff;
         ret = m5io_hub_exec(up->mu->hub, &request);
@@ -316,11 +334,16 @@ static int m5io_hub_uart_configure(struct m5io_hub_uart_port *up,
                          M5IO_HUB_UART_CFG_BUSY_DELAY_US + 2000);
             continue;
         }
-        if (ret)
+        if (ret) {
+            if (request.status != 3)
+                m5io_hub_uart_mark_unknown(up);
             return ret;
+        }
         break;
     }
     if (request.status != 0) {
+        if (request.status != 4 && request.status != 3)
+            m5io_hub_uart_mark_unknown(up);
         dev_warn(up->port.dev,
                  "UART%u: MCU refused configuration, status=%u after %u tries\n",
                  port_number, request.status, attempt + 1);
@@ -328,10 +351,26 @@ static int m5io_hub_uart_configure(struct m5io_hub_uart_port *up,
                (request.status == 3 ? -EINVAL : -EIO);
     }
     if (request.reply_len != sizeof(payload) ||
-        request.reply[0] != port_number)
+        request.reply[0] != port_number ||
+        memcmp(request.reply + 5, payload + 5, sizeof(payload) - 5)) {
+        m5io_hub_uart_mark_unknown(up);
         return -EPROTO;
-    up->configured = true;
-    atomic_set(&up->rx_enabled, 1);
+    }
+    baud = (u32)request.reply[1] | ((u32)request.reply[2] << 8) |
+           ((u32)request.reply[3] << 16) | ((u32)request.reply[4] << 24);
+    if (!baud || baud > M5IO_HUB_UART_MAX_BAUD) {
+        m5io_hub_uart_mark_unknown(up);
+        return -EPROTO;
+    }
+    /* Reflect the MCU's actual baud divider instead of claiming the requested
+     * rate exactly (for example 9599 baud for a 9600 baud request). */
+    tty_termios_encode_baud_rate(termios, baud, baud);
+    uart_update_timeout(&up->port, termios->c_cflag, baud);
+    up->confirmed_cflag = termios->c_cflag;
+    up->confirmed_baud = baud;
+    WRITE_ONCE(up->io_failed, false);
+    WRITE_ONCE(up->configured, true);
+    atomic_set(&up->rx_enabled, (termios->c_cflag & CREAD) != 0);
     atomic_set(&up->tx_enabled, 1);
     return 0;
 }
@@ -347,21 +386,37 @@ static void m5io_hub_uart_set_termios(struct uart_port *port,
 
     baud = uart_get_baud_rate(port, new, old, M5IO_HUB_UART_MIN_BAUD,
                               M5IO_HUB_UART_MAX_BAUD);
-    uart_update_timeout(port, new->c_cflag, baud);
-
+    mutex_lock(&up->config_lock);
     if ((new->c_cflag & CSIZE) != CS7 && (new->c_cflag & CSIZE) != CS8) {
         dev_warn(port->dev, "UART%u supports only CS7 and CS8\n",
                  up->channel - M5IO_HUB_CHN_UART1 + 1);
-        return;
+        ret = -EINVAL;
+        goto restore;
     }
     if (new->c_cflag & CMSPAR) {
         dev_warn(port->dev, "UART%u does not support mark/space parity\n",
                  up->channel - M5IO_HUB_CHN_UART1 + 1);
-        return;
+        ret = -EINVAL;
+        goto restore;
     }
 
-    mutex_lock(&up->config_lock);
     ret = m5io_hub_uart_configure(up, new, baud);
+restore:
+    if (ret) {
+        /* set_termios cannot return errno. Do not publish rejected framing as
+         * actual hardware state; unknown state remains gated regardless. */
+        const tcflag_t mask = CSIZE | PARENB | PARODD | CSTOPB | CMSPAR | CREAD;
+        tcflag_t confirmed = up->confirmed_baud ? up->confirmed_cflag :
+                             (old ? old->c_cflag : (CS8 | CREAD));
+        unsigned int previous_baud = up->confirmed_baud ? up->confirmed_baud :
+                                     (old ? tty_termios_baud_rate(old) : 9600);
+
+        new->c_cflag = (new->c_cflag & ~mask) | (confirmed & mask);
+        tty_termios_encode_baud_rate(new, previous_baud, previous_baud);
+        uart_update_timeout(port, new->c_cflag, previous_baud);
+    }
+    if (up->configured && atomic_read(&up->tx_pending))
+        mod_delayed_work(system_wq, &up->tx_work, 0);
     mutex_unlock(&up->config_lock);
     if (ret)
         dev_warn(port->dev, "UART%u configuration failed: %d\n",

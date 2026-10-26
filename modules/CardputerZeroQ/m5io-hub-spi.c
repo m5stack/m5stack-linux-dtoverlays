@@ -13,6 +13,7 @@
 #include "m5io-hub.h"
 
 #define M5IO_SPI_CONFIG         1
+#define M5IO_SPI_BEGIN          2
 #define M5IO_SPI_DISABLE        6
 #define M5IO_SPI_MIN_HZ         250000
 #define M5IO_SPI_MAX_HZ         20000000
@@ -43,9 +44,7 @@ static int m5io_hub_spi_setup(struct spi_device *spi)
 
 static size_t m5io_hub_spi_max_transfer_size(struct spi_device *spi)
 {
-    /* A wire DATA frame carries at most 255 bytes.  SPI core may split a
-     * larger transfer while retaining chip-select across the chunks. */
-    return M5IO_HUB_SPI_CHUNK_LEN;
+    return M5IO_HUB_SPI_MAX_LEN;
 }
 
 /* Validate the whole message, including later CS groups, before CONFIG. */
@@ -73,7 +72,7 @@ static int m5io_hub_spi_validate(struct spi_message *msg)
         speed = t->speed_hz;
         bits = t->bits_per_word;
         len += t->len;
-        if (len > M5IO_HUB_SPI_CHUNK_LEN)
+        if (len > M5IO_HUB_SPI_MAX_LEN)
             return -EMSGSIZE;
         if (t->cs_change)
             len = 0;
@@ -85,7 +84,8 @@ static int m5io_hub_spi_configure(struct m5io_hub_spi *ms,
                                  struct spi_device *spi,
                                  struct spi_transfer *t)
 {
-    u8 payload[4] = { spi->mode & (SPI_CPOL | SPI_CPHA), t->bits_per_word };
+    u8 payload[6] = { spi->mode & (SPI_CPOL | SPI_CPHA), t->bits_per_word,
+                      0, 0, 0, 1 };
     struct m5io_hub_request req = {
         .func = M5IO_HUB_FUNC_SPI,
         .arg = M5IO_SPI_CONFIG,
@@ -97,6 +97,7 @@ static int m5io_hub_spi_configure(struct m5io_hub_spi *ms,
 
     /* Firmware rounds down to a hardware prescaler. Never round Hz up. */
     put_unaligned_le16(t->speed_hz / 1000, payload + 2);
+    put_unaligned_le16(256, payload + 4);
 
     /*
      * BUSY means the MCU still has exchanges queued for this port.  It is a
@@ -130,14 +131,23 @@ static int m5io_hub_spi_configure(struct m5io_hub_spi *ms,
          * A persistent BUSY is not transient: the MCU refuses CONFIG while it
          * still holds exchanges whose MISO payload has not been handed back to
          * the host yet.  It has no timer that gives up on them, so once that
-         * queue is stuck the port stays unusable until the MCU is reset --
-         * observed as repeated EBUSY from userspace with nothing in the log.
+         * queue is stuck the port stays unusable until an MCU_RESET or
+         * transport reset. MCU_RESET is a maintenance command and does not
+         * reboot Linux; userspace otherwise observes repeated EBUSY with no
+         * progress.
          * Say so explicitly instead of leaving the caller to guess.
          */
-        if (req.status == 4)
+        if (req.status == 4) {
+            /* The MCU keeps a previous exchange BUSY until its DATA window
+             * is acknowledged. If the host lost that ACK, CONFIG alone can
+             * never make progress. SPI_FLUSH is the explicit protocol reset
+             * for this state; issue it before reporting BUSY so a subsequent
+             * transfer can recover without an MCU reset. */
+            int flush_ret = m5io_hub_spi_flush(ms->hub);
             dev_err_ratelimited(ms->hub->dev,
-                                "SPI CONFIG still BUSY after %u attempts: the MCU's exchange queue is stuck; reset the MCU to recover\n",
-                                M5IO_SPI_CFG_BUSY_TRIES);
+                                "SPI CONFIG still BUSY after %u attempts: flush=%d\n",
+                                M5IO_SPI_CFG_BUSY_TRIES, flush_ret);
+        }
         return req.status == 4 ? -EBUSY :
                (req.status == 3 ? -EINVAL : -EIO);
     }
@@ -147,14 +157,14 @@ static int m5io_hub_spi_configure(struct m5io_hub_spi *ms,
     return 0;
 }
 
-static int m5io_hub_spi_exchange(struct m5io_hub_spi *ms, unsigned int len)
+static int m5io_hub_spi_exchange(struct m5io_hub_spi *ms, unsigned int len,
+                                  unsigned int bits)
 {
     if (!ms->configured)
         return -EPIPE;
     /* Every SPI transfer is a DATA frame on CH=3, including short transfers.
      * The legacy FULL_DUPLEX TOKEN (ARG=2) is intentionally gone. */
-    return m5io_hub_send_data_sync(ms->hub, M5IO_HUB_CHN_SPI,
-                                   ms->tx, ms->rx, len);
+    return m5io_hub_send_spi_sync(ms->hub, ms->tx, ms->rx, len, bits);
 }
 
 static int m5io_hub_spi_disable(struct m5io_hub_spi *ms)
@@ -224,7 +234,7 @@ static int m5io_hub_spi_transfer_message(struct spi_controller *ctlr,
         ret = m5io_hub_spi_configure(ms, msg->spi, first);
         if (ret)
             break;
-        ret = m5io_hub_spi_exchange(ms, len);
+        ret = m5io_hub_spi_exchange(ms, len, first->bits_per_word);
         if (ret)
             break;
         offset = 0;

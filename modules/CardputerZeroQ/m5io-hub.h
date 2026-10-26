@@ -26,7 +26,7 @@
 #define m5io_dbg(fmt, ...) no_printk(fmt, ##__VA_ARGS__)
 #endif
 
-#define M5IO_HUB_NGPIO          17
+#define M5IO_HUB_NGPIO          21
 
 #define M5IO_HUB_CHN_IIC1       1
 #define M5IO_HUB_CHN_IIC2       2
@@ -44,7 +44,7 @@
 
 #define M5IO_HUB_FUNC_I2C       2
 #define M5IO_HUB_FUNC_SPI       3
-#define M5IO_HUB_SPI_MAX_LEN    1024
+#define M5IO_HUB_SPI_MAX_LEN    512
 /* Even DATA chunks also work with the MCU's 16-bit SPI mode. */
 #define M5IO_HUB_SPI_CHUNK_LEN  254
 #define M5IO_HUB_FUNC_UART      4
@@ -54,13 +54,11 @@
 #define M5IO_HUB_TOKEN_PAYLOAD_MAX 15
 #define M5IO_HUB_DATA_PAYLOAD_MAX 255
 
-/* Synchronous TOKEN request. Optional I2C or UART DATA follows the TOKEN;
- * I2C uses one PID=0 frame while UART data is split into 255-byte frames.
- * SPI DATA requires both data_tx and data_rx, CH=3, up to 1024 bytes;
- * chunks are 254 bytes (last may be shorter), with PID cycling 0..3.
- * reply/status are the terminal TOKEN payload/ARG, even on firmware errors.
- * data_rx is published only after both DATA and a successful TOKEN arrive.
- */
+/* Synchronous v2 TOKEN request. Four independent immutable slots retain
+ * requests through physical completion; a full/quarantined pool returns BUSY.
+ * status is the terminal response ARG, and reply is its payload, including
+ * firmware errors. Legacy DATA fields are retained for ABI layout only and
+ * must be empty: business DATA uses the channel APIs. */
 struct m5io_hub_request {
     u8 func;
     u8 arg;
@@ -109,19 +107,33 @@ int m5io_hub_exec(struct m5io_hub *hub, struct m5io_hub_request *request);
 int m5io_hub_hello(struct m5io_hub *hub, u8 payload[15]);
 int m5io_hub_mcu_reset(struct m5io_hub *hub);
 int m5io_hub_data_status(struct m5io_hub *hub, u8 payload[15]);
+/* Atomic-context safe: includes DATA still awaiting the MCU's window ACK. */
+bool m5io_hub_data_pending(struct m5io_hub *hub, unsigned int chn);
+/* Abort a broken DATA exchange on one channel and release host-side window
+ * and de-duplication state after a protocol-specific flush. */
+void m5io_hub_data_abort_channel(struct m5io_hub *hub, unsigned int chn);
 /* FUNC=2/ARG=7; resets one I2C controller and restores last config. */
 int m5io_hub_i2c_reset(struct m5io_hub *hub, unsigned int bus);
 int m5io_hub_rpc_transfer(struct m5io_hub *hub);
 int m5io_hub_SendChnData(struct m5io_hub *hub, unsigned int chn,
                          const u8 *data, unsigned int len);
 /* Protocol DATA transport helpers.  DATA is independent of FUNC TOKENs and
- * uses the direction-wide PID window.  The synchronous form waits for the
- * peer WINDOW/COMPLETE acknowledgements and, for bidirectional transfers,
- * copies the matching DATA payload into @rx. */
+ * uses the direction-wide PID window.  WINDOW_ACK carries CH/PID/SEQ/status;
+ * for bidirectional transfers the synchronous form also copies the matching
+ * DATA payload into @rx. */
 int m5io_hub_send_data_async(struct m5io_hub *hub, unsigned int chn,
                              const u8 *data, unsigned int len);
 int m5io_hub_send_data_sync(struct m5io_hub *hub, unsigned int chn,
                             const u8 *tx, u8 *rx, unsigned int len);
+int m5io_hub_send_spi_sync(struct m5io_hub *hub, const u8 *tx, u8 *rx,
+                           unsigned int len, unsigned int word_bits);
+/* FUNC=3/ARG=8; discard the MCU's pending SPI exchange and release the
+ * corresponding host-side DATA window state. */
+int m5io_hub_spi_flush(struct m5io_hub *hub);
+int m5io_hub_i2c_data_sync(struct m5io_hub *hub, unsigned int chn,
+                           const u8 *tx, unsigned int tx_len,
+                           u8 *rx, unsigned int rx_cap,
+                           unsigned int *rx_len);
 int m5io_hub_ir_config(struct m5io_hub *hub, const u8 payload[15],
                        u8 actual[15]);
 int m5io_hub_ir_receive(struct m5io_hub *hub, bool enable);

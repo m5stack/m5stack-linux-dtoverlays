@@ -6,209 +6,130 @@
 #include "m5io-hub.h"
 
 #define M5IO_I2C_CONFIG   1
-#define M5IO_I2C_READ     2
-#define M5IO_I2C_WRITE    3
-#define M5IO_I2C_DETECT   4
-#define M5IO_I2C_MEM_READ 5
-#define M5IO_I2C_MEM_WRITE 6
-#define M5IO_I2C_RESET    7
 #define M5IO_I2C_BUSES    2
 
 struct m5io_hub_i2c_bus {
     struct m5io_hub *hub;
     struct i2c_adapter adap;
     u8 bus;
+    u8 speed;
 };
 
 struct m5io_hub_i2c {
     struct m5io_hub_i2c_bus buses[M5IO_I2C_BUSES];
 };
 
-/* Reset one MCU I2C controller according to FUNC=2/ARG=7.  This helper is
- * intentionally separate from the Linux adapter lifecycle: I2C_RESET clears
- * only the selected controller's transaction state and restores its most
- * recently configured speed on the MCU. */
-int m5io_hub_i2c_reset(struct m5io_hub *hub, unsigned int bus)
-{
-    struct m5io_hub_request request = {
-        .func = M5IO_HUB_FUNC_I2C,
-        .arg = M5IO_I2C_RESET,
-    };
-    u8 payload[1] = { bus };
-    int ret;
-
-    if (!hub || bus < 1 || bus > M5IO_I2C_BUSES)
-        return -EINVAL;
-    request.payload = payload;
-    request.payload_len = sizeof(payload);
-    ret = m5io_hub_exec(hub, &request);
-    if (ret)
-        return ret;
-    return request.status ? -EIO : 0;
-}
-EXPORT_SYMBOL_GPL(m5io_hub_i2c_reset);
-
 static int m5io_hub_i2c_xfer(struct i2c_adapter *adap,
                             struct i2c_msg *msgs, int num)
 {
     struct m5io_hub_i2c_bus *bus = i2c_get_adapdata(adap);
-    struct m5io_hub_request request = { .func = M5IO_HUB_FUNC_I2C };
-    struct i2c_msg *msg;
-    u8 payload[M5IO_HUB_TOKEN_PAYLOAD_MAX];
-    int i, ret;
+    u8 payload[M5IO_HUB_DATA_PAYLOAD_MAX];
+    u8 result[M5IO_HUB_DATA_PAYLOAD_MAX];
+    unsigned int result_len = 0;
+    struct i2c_msg *w = NULL, *r = NULL;
+    unsigned int payload_len;
+    int ret;
 
-    if (!bus || !bus->hub) {
-        m5io_dbg("m5io-hub-i2c: xfer without bus/hub adap=%s num=%d\n",
-                adap ? adap->name : "<null>", num);
+    if (!bus || !bus->hub)
         return -ENODEV;
-    }
-    m5io_dbg("m5io-hub-i2c: xfer start bus=%u num=%d\n", bus->bus, num);
-
-    /* Validate the whole vector before sending. A repeated START is available
-     * only for a 1/2-byte write followed by a read of the same address.
-     */
-    if (!msgs || num < 1 || num > 2) {
-        m5io_dbg("m5io-hub-i2c: reject invalid vector bus=%u msgs=%p num=%d\n",
-                bus->bus, msgs, num);
+    if (!msgs || num < 1 || num > 2)
         return -EOPNOTSUPP;
+
+    /* MCU_RESET clears FUNC=2's configured bits.  The Linux adapter object
+     * survives that maintenance command, so replay CONFIG before every DATA
+     * transaction.  This also makes a transfer self-healing after an OTA or
+     * any other MCU-side transport reset without requiring a Linux reprobe. */
+    {
+        u8 config_payload[2] = { bus->bus, bus->speed };
+        struct m5io_hub_request config = {
+            .func = M5IO_HUB_FUNC_I2C,
+            .arg = M5IO_I2C_CONFIG,
+            .payload = config_payload,
+            .payload_len = sizeof(config_payload),
+        };
+
+        ret = m5io_hub_exec(bus->hub, &config);
+        if (ret)
+            return ret;
+        if (config.status != 0 || config.reply_len)
+            return config.status == 4 ? -EBUSY :
+                   (config.status == 3 ? -EINVAL : -EPROTO);
     }
-    for (i = 0; i < num; i++) {
-        if (msgs[i].flags & ~(I2C_M_RD | I2C_M_DMA_SAFE)) {
-            m5io_dbg("m5io-hub-i2c: reject flags bus=%u msg=%d flags=%#x\n",
-                    bus->bus, i, msgs[i].flags);
-            return -EOPNOTSUPP;
-        }
-        if (msgs[i].addr < 0x08 || msgs[i].addr > 0x77) {
-            m5io_dbg("m5io-hub-i2c: reject address bus=%u msg=%d addr=%#x\n",
-                    bus->bus, i, msgs[i].addr);
+    if (num == 1) {
+        if (msgs[0].addr < 0x08 || msgs[0].addr > 0x77 ||
+            msgs[0].len == 0 || msgs[0].len > 253 ||
+            (msgs[0].flags & ~(I2C_M_RD | I2C_M_DMA_SAFE)) || !msgs[0].buf)
             return -EINVAL;
+        if (msgs[0].flags & I2C_M_RD) {
+            payload[0] = 0xAB;
+            payload[1] = msgs[0].addr;
+            payload[2] = msgs[0].len;
+            payload_len = 3;
+            ret = m5io_hub_i2c_data_sync(bus->hub, bus->bus, payload,
+                                         payload_len, result, msgs[0].len + 2,
+                                         &result_len);
+            if (ret)
+                return ret;
+            if (result_len != msgs[0].len + 2U || result[0] != 0xAB ||
+                result[1] != msgs[0].addr)
+                return -EPROTO;
+            memcpy(msgs[0].buf, &result[2], msgs[0].len);
+        } else {
+            payload[0] = 0xAA;
+            payload[1] = msgs[0].addr;
+            memcpy(&payload[2], msgs[0].buf, msgs[0].len);
+            ret = m5io_hub_i2c_data_sync(bus->hub, bus->bus, payload,
+                                         msgs[0].len + 2, NULL, 0, NULL);
+            if (ret)
+                return ret;
         }
-        if (msgs[i].len > M5IO_HUB_DATA_PAYLOAD_MAX) {
-            m5io_dbg("m5io-hub-i2c: reject length bus=%u msg=%d len=%u\n",
-                    bus->bus, i, msgs[i].len);
-            return -EOPNOTSUPP;
-        }
-        if (msgs[i].len && !msgs[i].buf) {
-            m5io_dbg("m5io-hub-i2c: reject null buffer bus=%u msg=%d len=%u\n",
-                    bus->bus, i, msgs[i].len);
-            return -EINVAL;
-        }
-        if (!msgs[i].len && (msgs[i].flags & I2C_M_RD)) {
-            m5io_dbg("m5io-hub-i2c: reject zero read bus=%u msg=%d\n",
-                    bus->bus, i);
-            return -EOPNOTSUPP;
-        }
+        return 1;
     }
-    if (num == 2 && ((msgs[0].flags & I2C_M_RD) ||
-                    msgs[0].addr != msgs[1].addr ||
-                    msgs[0].len < 1 || msgs[0].len > 2 ||
-                    !msgs[1].len)) {
-        m5io_dbg("m5io-hub-i2c: reject combined transfer bus=%u addr=%#x wlen=%u rlen=%u\n",
-                bus->bus, msgs[0].addr, msgs[0].len, msgs[1].len);
+
+    w = &msgs[0]; r = &msgs[1];
+    if ((w->flags & ~I2C_M_DMA_SAFE) ||
+        !(r->flags & I2C_M_RD) ||
+        (r->flags & ~(I2C_M_RD | I2C_M_DMA_SAFE)) ||
+        w->addr != r->addr || w->addr < 0x08 || w->addr > 0x77 ||
+        !w->len || w->len > 252 || !r->len || r->len > 253 ||
+        !w->buf || !r->buf)
         return -EOPNOTSUPP;
-    }
-
-    msg = &msgs[num - 1];
-    payload[0] = bus->bus;
-    payload[1] = msg->addr;
-    request.payload = payload;
-    request.data_chn = bus->bus;
-    if (num == 2 && (msgs[1].flags & I2C_M_RD)) {
-        request.arg = M5IO_I2C_MEM_READ;
-        request.payload_len = 6;
-        payload[2] = msgs[0].len;
-        /* I2C register bytes are MSB first; RPC encodes the value little-endian. */
-        payload[3] = msgs[0].buf[msgs[0].len - 1];
-        payload[4] = msgs[0].len == 2 ? msgs[0].buf[0] : 0;
-        payload[5] = msg->len;
-    } else if (num == 2) {
-        /* Two writes to one address encode I2C_MEM_WRITE: the first message
-         * is the 8/16-bit register address, the second is the data stream. */
-        request.arg = M5IO_I2C_MEM_WRITE;
-        request.payload_len = 6;
-        payload[2] = msgs[0].len;
-        payload[3] = msgs[0].buf[msgs[0].len - 1];
-        payload[4] = msgs[0].len == 2 ? msgs[0].buf[0] : 0;
-        payload[5] = msg->len;
-    } else if (!msg->len) {
-        request.arg = M5IO_I2C_DETECT;
-        request.payload_len = 2;
-    } else {
-        request.arg = (msg->flags & I2C_M_RD) ? M5IO_I2C_READ : M5IO_I2C_WRITE;
-        request.payload_len = 3;
-        payload[2] = msg->len;
-    }
-
-    if (msg->flags & I2C_M_RD) {
-        if (msg->len > M5IO_HUB_TOKEN_PAYLOAD_MAX) {
-            request.data_rx = msg->buf;
-            request.data_len = msg->len;
-        }
-    } else if ((request.arg == M5IO_I2C_MEM_WRITE && msg->len > 9) ||
-               (request.arg == M5IO_I2C_WRITE && msg->len > 12)) {
-        request.data_tx = msg->buf;
-        request.data_len = msg->len;
-    } else if (msg->len) {
-        memcpy(payload + (request.arg == M5IO_I2C_MEM_WRITE ? 6 : 3),
-               msg->buf, msg->len);
-        request.payload_len += msg->len;
-    }
-
-    m5io_dbg("m5io-hub-i2c: request bus=%u addr=%#x arg=%u num=%d len=%u payload=%u rx=%u tx=%u\n",
-            bus->bus, msg->addr, request.arg, num, msg->len,
-            request.payload_len, !!request.data_rx, !!request.data_tx);
-
-    ret = m5io_hub_exec(bus->hub, &request);
-    m5io_dbg("m5io-hub-i2c: exec done bus=%u addr=%#x arg=%u ret=%d status=%#x reply_len=%u data_len=%u\n",
-            bus->bus, msg->addr, request.arg, ret, request.status,
-            request.reply_len, request.data_len);
+    payload[0] = 0xAB;
+    payload[1] = w->addr;
+    memcpy(&payload[2], w->buf, w->len);
+    payload[2 + w->len] = r->len;
+    payload_len = 3 + w->len;
+    ret = m5io_hub_i2c_data_sync(bus->hub, bus->bus, payload, payload_len,
+                                 result, r->len + 2, &result_len);
     if (ret)
         return ret;
-    if (request.arg == M5IO_I2C_DETECT) {
-        if (request.reply_len != 1 || request.reply[0] > 1) {
-            m5io_dbg("m5io-hub-i2c: detect protocol error bus=%u reply_len=%u value=%#x\n",
-                    bus->bus, request.reply_len,
-                    request.reply_len ? request.reply[0] : 0);
-            return -EPROTO;
-        }
-        if (!request.reply[0]) {
-            m5io_dbg("m5io-hub-i2c: detect no device bus=%u addr=%#x\n",
-                    bus->bus, msg->addr);
-            return -ENXIO;
-        }
-    } else if ((msg->flags & I2C_M_RD) && !request.data_rx) {
-        if (request.reply_len != msg->len) {
-            m5io_dbg("m5io-hub-i2c: read protocol error bus=%u expected=%u got=%u\n",
-                    bus->bus, msg->len, request.reply_len);
-            return -EPROTO;
-        }
-        memcpy(msg->buf, request.reply, msg->len);
-    } else if (request.reply_len) {
-        m5io_dbg("m5io-hub-i2c: unexpected reply bus=%u arg=%u reply_len=%u\n",
-                bus->bus, request.arg, request.reply_len);
+    if (result_len != r->len + 2U || result[0] != 0xAB || result[1] != r->addr)
         return -EPROTO;
-    }
-    m5io_dbg("m5io-hub-i2c: xfer success bus=%u addr=%#x num=%d\n",
-            bus->bus, msg->addr, num);
-    return num;
+    memcpy(r->buf, &result[2], r->len);
+    return 2;
 }
 
 static u32 m5io_hub_i2c_functionality(struct i2c_adapter *adap)
 {
-    return I2C_FUNC_I2C | I2C_FUNC_SMBUS_BYTE | I2C_FUNC_SMBUS_BYTE_DATA |
-           I2C_FUNC_SMBUS_WORD_DATA | I2C_FUNC_SMBUS_WRITE_BLOCK_DATA |
+    /* The I2C core emulates these SMBus operations through master_xfer.
+     * QUICK needs an address-only transaction and SMBus block reads need
+     * I2C_M_RECV_LEN; neither can be represented by this wire revision.
+     * In particular, advertise READ_BYTE so i2cdetect -r can scan normally. */
+    return I2C_FUNC_I2C | I2C_FUNC_SMBUS_BYTE |
+           I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA |
+           I2C_FUNC_SMBUS_PROC_CALL | I2C_FUNC_SMBUS_WRITE_BLOCK_DATA |
            I2C_FUNC_SMBUS_I2C_BLOCK;
 }
 
 static const struct i2c_adapter_quirks m5io_hub_i2c_quirks = {
-    .flags = I2C_AQ_COMB_WRITE_THEN_READ | I2C_AQ_NO_ZERO_LEN_READ,
+    .flags = I2C_AQ_COMB_WRITE_THEN_READ | I2C_AQ_NO_ZERO_LEN,
     .max_num_msgs = 2,
-    /* Linux combined write vectors include the register address message;
-     * the protocol permits 255 data bytes in the following DATA frame. */
-    .max_write_len = M5IO_HUB_DATA_PAYLOAD_MAX,
-    .max_read_len = M5IO_HUB_DATA_PAYLOAD_MAX,
-    .max_comb_1st_msg_len = 2,
-    .max_comb_2nd_msg_len = M5IO_HUB_DATA_PAYLOAD_MAX,
+    /* AA/AB reserve two bytes for opcode/address; combined requests also
+     * carry a final read length. Limits apply before any bus side effects. */
+    .max_write_len = 253,
+    .max_read_len = 253,
+    .max_comb_1st_msg_len = 252,
+    .max_comb_2nd_msg_len = 253,
 };
 
 static const struct i2c_algorithm m5io_hub_i2c_algo = {
@@ -257,6 +178,7 @@ static int m5io_hub_i2c_add_bus(struct platform_device *pdev,
 
     bus->hub = dev_get_drvdata(pdev->dev.parent);
     bus->bus = id;
+    bus->speed = payload[1];
     ret = m5io_hub_exec(bus->hub, &request);
     m5io_dbg("m5io-hub-i2c: bus=%u config exec ret=%d reply_len=%u\n",
             id, ret, request.reply_len);
@@ -272,7 +194,9 @@ static int m5io_hub_i2c_add_bus(struct platform_device *pdev,
     bus->adap.algo = &m5io_hub_i2c_algo;
     bus->adap.quirks = &m5io_hub_i2c_quirks;
     bus->adap.dev.parent = &pdev->dev;
-    bus->adap.timeout = msecs_to_jiffies(2000);
+    /* The protocol's I2C DATA transaction has a 27.5 s outer budget. */
+    bus->adap.timeout = msecs_to_jiffies(27500);
+    bus->adap.retries = 0;
     if (node) {
         ret = devm_add_action_or_reset(&pdev->dev, m5io_hub_i2c_put_node,
                                        of_node_get(node));

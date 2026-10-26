@@ -14,6 +14,13 @@
 #define M5IO_HUB_OTA_PAGE_COUNT \
     (M5IO_HUB_OTA_IMAGE_SIZE / M5IO_HUB_OTA_PAGE_SIZE)
 
+/* APP maintenance never erases the persistent 8 KiB user region. */
+#define M5IO_HUB_OTA_APP_SIZE (0x0801E000U - M5IO_HUB_OTA_START_ADDRESS)
+#define M5IO_HUB_OTA_APP_PAGES (M5IO_HUB_OTA_APP_SIZE / M5IO_HUB_OTA_PAGE_SIZE)
+/* Optional recovery mode: wait up to 60 seconds for an externally-triggered
+ * MCU reset.  Normal OTA leaves this clear and uses FUNC=0/ARG=3 MCU_RESET. */
+#define M5IO_HUB_OTA_WAIT_FOR_IAP 0x01U
+
 #define M5IO_HUB_IOC_MAGIC 'M'
 
 /*
@@ -30,7 +37,8 @@ struct m5io_hub_ota_request {
     __u32 response_address;
     __u16 response_length;
     __u8 response_command;
-    __u8 reserved;
+    /* Zero selects the normal FUNC=0/ARG=3 MCU_RESET path. */
+    __u8 reserved; /* M5IO_HUB_OTA_WAIT_FOR_IAP for explicit recovery only */
 };
 
 #define M5IO_HUB_IOCTL_OTA \
