@@ -23,6 +23,7 @@
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
+#include <linux/proc_fs.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
@@ -74,6 +75,10 @@
 #define M5_RPC_CHN_IIC1 M5IO_HUB_CHN_IIC1
 #define M5_RPC_CHN_IIC2 M5IO_HUB_CHN_IIC2
 #define M5_RPC_CHN_SPI M5IO_HUB_CHN_SPI
+#define M5_RPC_CHN_LOG M5IO_HUB_CHN_LOG
+/* MCU log ring exposed through /proc; large enough for a boot-time burst. */
+#define M5IO_HUB_LOG_BUF_SIZE 8192
+#define M5IO_HUB_LOG_PROC_NAME "m5io-hub-log"
 #define M5_RPC_DATA_HDR_LEN M5_RPC_FRAME_HDR_LEN
 #define M5_RPC_DATA_MAX_PLEN 0xff
 #define M5_RPC_DATA_MAX_LEN                                                        \
@@ -324,6 +329,15 @@ struct m5io_hub_core {
   atomic_t active_reqs;
   struct m5_rpc_rx_stream rx_stream;
 
+  /* MCU -> SoC diagnostic text from CH=M5IO_HUB_CHN_LOG.  A mutex, not a
+   * spinlock: the only writers are the RPC worker and the threaded IRQ, and
+   * the reader copies to userspace while holding it. */
+  struct mutex log_lock;
+  struct proc_dir_entry *log_proc;
+  unsigned int log_len;
+  unsigned int log_dropped;
+  u8 log_buf[M5IO_HUB_LOG_BUF_SIZE];
+
   struct kfifo tx_fifo;
   spinlock_t tx_lock;
   wait_queue_head_t tx_wq;
@@ -340,6 +354,9 @@ struct m5io_hub_core {
   void *gpio_irq_handler_data;
   u32 gpio_irq_handler_generation;
 };
+
+static void m5io_hub_log_rx(struct m5io_hub_core *mcore, const u8 *buf,
+                            unsigned int len);
 
 static void m5_rpc_rx_stream_reset(struct m5io_hub_core *mcore) {
   mcore->rx_stream.len = 0;
@@ -1263,6 +1280,21 @@ static unsigned int m5_rpc_rx_stream_feed(struct m5io_hub_core *mcore,
          * channel needs no asynchronous DATA ACK window of its own.
          */
         m5_rpc_spi_data_rx(mcore, data_frame);
+        ret = m5_rpc_data_ack_send(mcore, chn, data_pid,
+                                   M5_RPC_UPLINK_READY_OP_ID,
+                                   M5_RPC_ACK_WINDOW, 0);
+        if (ret)
+          m5_rpc_data_ack_retry_queue(mcore, chn, data_pid,
+                                      M5_RPC_UPLINK_READY_OP_ID,
+                                      M5_RPC_ACK_WINDOW, 0);
+      } else if (chn == M5_RPC_CHN_LOG) {
+        /*
+         * Diagnostic text from the MCU.  The frame is consumed here and the
+         * PID is released immediately, so a full log buffer can never cost
+         * the MCU one of its four uplink slots -- losing log bytes is fine,
+         * stalling the protocol is not.
+         */
+        m5io_hub_log_rx(mcore, data_frame->data, payload_len);
         ret = m5_rpc_data_ack_send(mcore, chn, data_pid,
                                    M5_RPC_UPLINK_READY_OP_ID,
                                    M5_RPC_ACK_WINDOW, 0);
@@ -3083,6 +3115,93 @@ static void m5io_hub_cancel_works(void *data) {
  * Return: 0 表示成功；负值为错误码（内存分配、spi_setup()、IRQ 申请或
  *         设备树子设备注册失败）。
  */
+/* ------------------------------------------------------------------------ *
+ * MCU diagnostic log channel (CH = M5IO_HUB_CHN_LOG)
+ *
+ * The firmware writes plain text on this uplink-only channel.  The driver
+ * accumulates it and exposes it as /proc/m5io-hub-log.  A read returns what
+ * has accumulated and clears it, so `cat` shows everything logged since the
+ * previous read.  The buffer is deliberately lossy: dropping log bytes is
+ * always better than stalling the SPI transaction that carries them.
+ * ------------------------------------------------------------------------ */
+
+static void m5io_hub_log_rx(struct m5io_hub_core *mcore, const u8 *buf,
+                            unsigned int len) {
+  unsigned int drop;
+
+  if (!len)
+    return;
+
+  mutex_lock(&mcore->log_lock);
+  if (len > M5IO_HUB_LOG_BUF_SIZE) {
+    drop = len - M5IO_HUB_LOG_BUF_SIZE;
+    buf += drop;
+    len = M5IO_HUB_LOG_BUF_SIZE;
+    mcore->log_dropped += drop;
+  }
+  if (mcore->log_len + len > M5IO_HUB_LOG_BUF_SIZE) {
+    drop = mcore->log_len + len - M5IO_HUB_LOG_BUF_SIZE;
+    memmove(mcore->log_buf, mcore->log_buf + drop, mcore->log_len - drop);
+    mcore->log_len -= drop;
+    mcore->log_dropped += drop;
+  }
+  memcpy(mcore->log_buf + mcore->log_len, buf, len);
+  mcore->log_len += len;
+  mutex_unlock(&mcore->log_lock);
+}
+
+static ssize_t m5io_hub_log_proc_read(struct file *file, char __user *ubuf,
+                                      size_t count, loff_t *ppos) {
+  struct m5io_hub_core *mcore = pde_data(file_inode(file));
+  unsigned int n;
+  int ret;
+
+  if (!count)
+    return 0;
+
+  mutex_lock(&mcore->log_lock);
+  n = min_t(unsigned int, count, mcore->log_len);
+  if (n) {
+    if (copy_to_user(ubuf, mcore->log_buf, n)) {
+      ret = -EFAULT;
+    } else {
+      memmove(mcore->log_buf, mcore->log_buf + n, mcore->log_len - n);
+      mcore->log_len -= n;
+      ret = n;
+    }
+  } else if (mcore->log_dropped) {
+    /* Keep truncation visible instead of silently losing lines. */
+    char note[80];
+    int len = scnprintf(note, sizeof(note),
+                        "[m5io-hub-log] dropped %u bytes\n",
+                        mcore->log_dropped);
+
+    mcore->log_dropped = 0;
+    if (len > (int)count || copy_to_user(ubuf, note, len))
+      ret = -EFAULT;
+    else
+      ret = len;
+  } else {
+    ret = 0;
+  }
+  mutex_unlock(&mcore->log_lock);
+  return ret;
+}
+
+static const struct proc_ops m5io_hub_log_proc_ops = {
+  .proc_read = m5io_hub_log_proc_read,
+  .proc_lseek = noop_llseek,
+};
+
+static void m5io_hub_log_proc_remove(void *data) {
+  struct m5io_hub_core *mcore = data;
+
+  if (mcore->log_proc) {
+    proc_remove(mcore->log_proc);
+    mcore->log_proc = NULL;
+  }
+}
+
 static int m5io_hub_probe(struct spi_device *spi) {
   struct m5io_hub_core *mcore;
   void *fifo_buf;
@@ -3107,6 +3226,7 @@ static int m5io_hub_probe(struct spi_device *spi) {
   mcore->spi_rpc.tid = -1;
   mutex_init(&mcore->exec_tx_lock);
   mutex_init(&mcore->ota_lock);
+  mutex_init(&mcore->log_lock);
   init_completion(&mcore->ota_ready);
   mcore->ota_active = false;
 
@@ -3205,6 +3325,18 @@ static int m5io_hub_probe(struct spi_device *spi) {
                                  mcore);
   if (ret)
     return ret;
+
+  mcore->log_proc = proc_create_data(M5IO_HUB_LOG_PROC_NAME, 0444, NULL,
+                                     &m5io_hub_log_proc_ops, mcore);
+  if (!mcore->log_proc) {
+    dev_warn(&spi->dev, "failed to create /proc/%s\n",
+             M5IO_HUB_LOG_PROC_NAME);
+  } else {
+    ret = devm_add_action_or_reset(&spi->dev, m5io_hub_log_proc_remove,
+                                   mcore);
+    if (ret)
+      return ret;
+  }
 
   /* Runs after DT child devices and the devm IRQ have been removed. */
   ret = devm_add_action_or_reset(&spi->dev, m5io_hub_cancel_works, mcore);

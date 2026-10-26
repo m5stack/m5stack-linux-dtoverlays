@@ -34,7 +34,13 @@
 #define M5IO_HUB_CHN_UART1      4
 #define M5IO_HUB_CHN_UART2      5
 #define M5IO_HUB_CHN_IR         6
-#define M5IO_HUB_CHN_MAX        M5IO_HUB_CHN_IR
+/*
+ * MCU -> SoC diagnostic log stream.  Uplink only: the host never sends DATA
+ * on this channel.  The firmware writes plain text here from any main-loop
+ * context; the driver exposes it as /proc/m5io-hub-log.
+ */
+#define M5IO_HUB_CHN_LOG        7
+#define M5IO_HUB_CHN_MAX        M5IO_HUB_CHN_LOG
 
 #define M5IO_HUB_FUNC_I2C       2
 #define M5IO_HUB_FUNC_SPI       3

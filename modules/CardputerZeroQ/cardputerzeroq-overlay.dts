@@ -328,6 +328,33 @@
                     #address-cells = <1>;
                     #size-cells = <0>;
                     status = "okay";
+
+                    /* FUNC3 SPI bridge seen from Linux.  There is no real
+                     * chip on this bus: the CS/SCK/MOSI/MISO lines go to the
+                     * HAT header through the U34 level shifter, so the node
+                     * exists to give userspace a /dev/spidev to exercise the
+                     * whole bridge.
+                     *
+                     * The compatible string matters: spidev's of_device_id
+                     * table has no plain "spidev" entry (only rohm,dh2228fv,
+                     * rohm,bh2228fv and lineartechnology,ltc2488), and its
+                     * spi_device_id table has no "spidev" either, so a node
+                     * named spidev@0 with compatible = "spidev" never binds.
+                     *
+                     * Do NOT add spi-cs-setup-delay-ns / -hold / -inactive:
+                     * m5io_hub_spi_setup() rejects any non-zero CS timing with
+                     * -EOPNOTSUPP because the MCU owns CS timing.
+                     *
+                     * SPI core splits transfers at 254 bytes and M5IO-HUB
+                     * cannot keep CS asserted across RPCs, so a single
+                     * message is limited to 254 bytes.
+                     */
+                    m5io_hub_spidev: spidev@0 {
+                        compatible = "rohm,dh2228fv";
+                        reg = <0>;
+                        spi-max-frequency = <8000000>;
+                        status = "okay";
+                    };
                 };
             };
 
@@ -492,7 +519,7 @@ fragment@7 {
 
             iovcc-supply = <&panel_iovcc>;
             vdd-supply = <&panel_avdd>;
-            backlight = <&m5io_hub_backlight>;
+            // backlight = <&m5io_hub_backlight>;
 
             port {
                 panel_in: endpoint {
