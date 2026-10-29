@@ -61,7 +61,17 @@ enum aw882xx_int_type {
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
 #define AW_KERNEL_VER_OVER_5_4_0
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+#else
 MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+#endif
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#define AW882XX_GPIO_IN_FLAGS GPIOF_IN
+#else
+#define AW882XX_GPIO_IN_FLAGS GPIOF_DIR_IN
 #endif
 
 
