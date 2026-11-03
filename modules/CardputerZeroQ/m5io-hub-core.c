@@ -425,12 +425,10 @@ static int m5io_hub_data_submit(struct m5io_hub *hub, u8 chn,
     u8 seq = hub->data_seq[chn];
     u8 sta;
 
-    /* SoC -> MCU 方向没有首包/引导帧：多帧消息从第一个数据帧开始就是
-     * STA=0（传输包），最后一帧 STA=2，单包消息 STA=3。引导帧（STA=1）只由
-     * MCU 上行发送，见 m5io-hub-api.h 的定义。 */
-    if (frame_count == 1)
-      sta = M5IO_HUB_DATA_STA_START_END;
-    else if (i == frame_count - 1)
+    /* SoC -> MCU 方向没有首包/引导帧，也不区分单包：多帧消息从第一个数据帧
+     * 开始就是 STA=0（传输包），最后一帧 STA=2；单包消息直接就是 STA=2。
+     * 引导帧（STA=1）只由 MCU 上行发送，见 m5io-hub-api.h 的定义。 */
+    if (i == frame_count - 1)
       sta = M5IO_HUB_DATA_STA_END;
     else
       sta = M5IO_HUB_DATA_STA_MID;
