@@ -89,6 +89,7 @@
 #define M5IO_HUB_TID_QUARANTINE_MS 2000U
 #define M5IO_HUB_SM_TIMEOUT_MS     100U /* 超时检查周期 */
 #define M5IO_HUB_SM_POLL_MS        20U  /* 无 HOST_READY 中断时的轮询周期 */
+#define M5IO_HUB_STOP_SM_WAIT_TRIES 200U /* 卸载等待 API 退出: 200 * 10ms = 2s */
 #define M5IO_HUB_RX_STREAM_MAX     M5IO_HUB_DATA_FRAME_MAX
 
 /* 分区号 -> DATA 通道号(见 m5io-hub-api.h 的通道分配)。 */
@@ -215,8 +216,9 @@ struct m5io_hub {
     /* MISO 上行流解析:帧可以跨事务,rx_stream 保存半帧 */
     u8 rx_stream[M5IO_HUB_RX_STREAM_MAX];
     u16 rx_stream_len;
-    u8 guide_seq[M5IO_HUB_CHN_MAX + 1];
-    bool guide_seq_valid[M5IO_HUB_CHN_MAX + 1];
+    /* 引导帧 SEQ 独立计数、与通道无关,所以只保留全局最近值。 */
+    u8 guide_seq;
+    bool guide_seq_valid;
     u16 chn_rx_remaining[M5IO_HUB_CHN_MAX + 1];
 
     /* OTA / 维护态:持有期间其它 API 一律 -EBUSY */
@@ -816,14 +818,14 @@ static void m5io_hub_rx_guide(struct m5io_hub *hub, u8 chn, u8 pid, u8 seq,
     if (len >= M5IO_HUB_DATA_GUIDE_LEN)
         count = (u16)(payload[0] | ((u16)payload[1] << 8));
 
-    if (hub->guide_seq_valid[chn] && hub->guide_seq[chn] == seq) {
-        /* 引导帧 SEQ 独立计数;重复说明已绕回 MCU 循环缓冲区头部,忽略计数。 */
+    if (hub->guide_seq_valid && hub->guide_seq == seq) {
+        /* 引导帧 SEQ 独立于通道计数;重复说明已绕回 MCU 循环缓冲区头部,忽略计数。 */
         m5io_hub_ack_enqueue(hub, chn, pid, 0, 0);
         return;
     }
 
-    hub->guide_seq[chn] = seq;
-    hub->guide_seq_valid[chn] = true;
+    hub->guide_seq = seq;
+    hub->guide_seq_valid = true;
     hub->chn_rx_remaining[chn] = count;
     m5io_hub_ack_enqueue(hub, chn, pid, 0, 0);
 }
@@ -1511,7 +1513,7 @@ static void m5io_hub_sm_abort_channel(struct m5io_hub *hub, u8 chn, int error)
     if (hub->data_win[chn].op)
         m5io_hub_data_win_complete(hub, &hub->data_win[chn], error);
     hub->chn_rx_remaining[chn] = 0;
-    hub->guide_seq_valid[chn] = false;
+    /* guide SEQ 是全局独立计数,单通道复位不影响它。 */
     mutex_unlock(&hub->spi_lock);
 
     mutex_lock(&hub->data_lock);
@@ -1544,9 +1546,9 @@ static void m5io_hub_sm_abort(struct m5io_hub *hub, int error)
         if (hub->data_win[chn].op)
             m5io_hub_data_win_complete(hub, &hub->data_win[chn], error);
         hub->chn_rx_remaining[chn] = 0;
-        hub->guide_seq_valid[chn] = false;
     }
     hub->rx_stream_len = 0;
+    hub->guide_seq_valid = false;
 
     list_splice_init(&hub->ack_queue, &acks);
     hub->ack_count = 0;
@@ -2609,25 +2611,28 @@ static int m5io_hub_ota_spi_xfer(struct m5io_hub *hub,
     };
     int ret;
 
-    if (len <= M5IO_HUB_IO_BUF_SIZE) {
-        if (tx) {
-            memcpy(hub->io_tx_buf, tx, len);
-            transfer.tx_buf = hub->io_tx_buf;
-        }
-        if (rx) {
-            memset(hub->io_rx_buf, 0, len);
-            transfer.rx_buf = hub->io_rx_buf;
-        }
-        ret = spi_sync_transfer(hub->spi, &transfer, 1);
-        if (!ret && rx)
-            memcpy(rx, hub->io_rx_buf, len);
-        return ret;
+    if (len > M5IO_HUB_IO_BUF_SIZE) {
+        /*
+         * 所有 raw IAP 传输都必须走 DMA 安全的 io 缓冲区;栈/未对齐指针
+         * 绝不能直接交给 spi_sync_transfer。当前最大帧 264 B,不会到这里。
+         */
+        WARN_ONCE(1, "m5io-hub: OTA xfer length %u exceeds DMA-safe buffer\n",
+              len);
+        return -EINVAL;
     }
 
-    /* 大块传输(如 kmalloc 分配的 packet)本身位于堆内存,可直接用于 DMA */
-    transfer.tx_buf = tx;
-    transfer.rx_buf = rx;
-    return spi_sync_transfer(hub->spi, &transfer, 1);
+    if (tx) {
+        memcpy(hub->io_tx_buf, tx, len);
+        transfer.tx_buf = hub->io_tx_buf;
+    }
+    if (rx) {
+        memset(hub->io_rx_buf, 0, len);
+        transfer.rx_buf = hub->io_rx_buf;
+    }
+    ret = spi_sync_transfer(hub->spi, &transfer, 1);
+    if (!ret && rx)
+        memcpy(rx, hub->io_rx_buf, len);
+    return ret;
 }
 
 static int m5io_hub_ota_drain(struct m5io_hub *hub,
@@ -3138,6 +3143,8 @@ static void m5io_hub_stop_sm(void *data)
     if (!hub)
         return;
 
+    unsigned int tries;
+
     WRITE_ONCE(hub->removing, true);
     WRITE_ONCE(hub->poll_enabled, false);
     cancel_delayed_work_sync(&hub->poll_work);
@@ -3145,12 +3152,22 @@ static void m5io_hub_stop_sm(void *data)
     m5io_hub_queues_abort(hub, -ENODEV);
     cancel_work_sync(&hub->io_work);
 
-    while (atomic_read(&hub->active_apis) > 0) {
+    /*
+     * 等已进入的 API 退出。正常路径下 queues_abort/sm_abort 会立刻唤醒它们;
+     * 这里仍有上限,避免某个调用者异常时 unbind 永久卡在模块卸载里。
+     */
+    for (tries = 0; tries < M5IO_HUB_STOP_SM_WAIT_TRIES; tries++) {
+        if (!atomic_read(&hub->active_apis))
+            break;
         m5io_hub_queues_abort(hub, -ENODEV);
         wait_event_timeout(hub->api_wait,
                    !atomic_read(&hub->active_apis),
                    msecs_to_jiffies(10));
     }
+    WARN_ONCE(atomic_read(&hub->active_apis),
+          "m5io-hub: %u API user(s) still active after %u ms\n",
+          atomic_read(&hub->active_apis),
+          M5IO_HUB_STOP_SM_WAIT_TRIES * 10U);
 }
 
 /* =====================================================================
