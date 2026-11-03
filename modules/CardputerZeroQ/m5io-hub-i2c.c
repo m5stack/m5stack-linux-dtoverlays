@@ -2,22 +2,15 @@
 /*
  * M5Stack M5IO-HUB I2C bridge driver
  *
- * 新 API 把 FUNC=2 的 TOKEN（配置/复位）与 DATA 通道（0xAA 写、0xAB 读/合并
- * 写读、0xAC Quick）都收进了 core：驱动只交 Linux i2c_msg 数组和总线号，
- * 不再自己拼 payload、选 DATA 通道或校验应答。
+ * FUNC=2 的 TOKEN（配置/复位）与 DATA 通道（0xAA 写、0xAB 读/合并写读、
+ * 0xAC Quick）都封装在 core：驱动只交 Linux i2c_msg 数组和总线号，不拼
+ * payload、不选 DATA 通道、不校验应答。
  *
- * 与旧接口的差异（迁移要点）：
- *   m5io_hub_exec(FUNC=2, ARG=CONFIG)      -> m5io_hub_i2c_config()
- *   m5io_hub_i2c_data_sync(chn, ...)       -> m5io_hub_i2c_transfer(hub, bus, msgs, num)
- *   （新 API 增加了 bus 参数，两路适配器不再靠“最近一次配置”猜总线）
- *   新增 m5io_hub_i2c_quick()/quick_write()/quick_read()：协议这次真的支持
- *   SMBus Quick，适配器可以 advertise I2C_FUNC_SMBUS_QUICK，i2cdetect 默认的
- *   地址探测走 0xAC 而不是 0 字节写。
+ * 协议支持 SMBus Quick，适配器 advertise I2C_FUNC_SMBUS_QUICK：i2cdetect
+ * 默认的地址探测走 0xAC；普通 SMBus 操作由 i2c 核心用 master_xfer 模拟。
  *
- * 每次传输前重放一次 CONFIG 是旧驱动就有的自愈手段：MCU_RESET/OTA 会清掉
- * FUNC=2 的 configured 位，而 Linux 适配器对象不会随之重建；重放 CONFIG
- * 能让总线在 MCU 复位后无需重新 probe 即可恢复。CONFIG 只作用于自己的
- * 总线，两路适配器并发时不会互相干扰。
+ * 总线速率只在 probe 时通过 m5io_hub_i2c_config() 配置一次，运行期不再
+ * 重复下发；需要重新配置时由重新 probe 或 MCU 复位后的重新初始化流程负责。
  */
 
 #include <linux/i2c.h>
@@ -28,24 +21,18 @@
 #include "m5io-hub.h"
 
 #define M5IO_I2C_BUS_COUNT 2U
-/* 协议 DATA 事务的外层预算，沿用旧驱动的宽松取值。 */
+/* 协议 DATA 事务的外层超时预算（宽松上限）。 */
 #define M5IO_I2C_ADAPTER_TIMEOUT_MS 27500U
 
 struct m5io_hub_i2c_bus {
   struct m5io_hub *hub;
   struct i2c_adapter adap;
   u8 bus;
-  u8 speed;
 };
 
 struct m5io_hub_i2c {
   struct m5io_hub_i2c_bus buses[M5IO_I2C_BUS_COUNT];
 };
-
-static int m5io_hub_i2c_replay_config(struct m5io_hub_i2c_bus *bus)
-{
-  return m5io_hub_i2c_config(bus->hub, bus->bus, bus->speed);
-}
 
 /* SMBus Quick：i2c 核心会用一条零长度消息把它模拟到 master_xfer。 */
 static int m5io_hub_i2c_quick_msg(struct m5io_hub_i2c_bus *bus,
@@ -58,10 +45,6 @@ static int m5io_hub_i2c_quick_msg(struct m5io_hub_i2c_bus *bus,
     return -EOPNOTSUPP;
   if (msg->addr < 0x08 || msg->addr > 0x77)
     return -EINVAL;
-
-  ret = m5io_hub_i2c_replay_config(bus);
-  if (ret)
-    return ret;
 
   /* 0 = 从机 ACK；-ENXIO = NAK/无应答（i2cdetect 需要的语义）。 */
   ret = m5io_hub_i2c_quick(bus->hub, bus->bus, msg->addr, read);
@@ -106,11 +89,6 @@ static int m5io_hub_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
     return m5io_hub_i2c_quick_msg(bus, &msgs[0]);
 
   ret = m5io_hub_i2c_validate(msgs, num);
-  if (ret)
-    return ret;
-
-  /* 先把本总线重新配置一次：既保证速率正确，也覆盖 MCU 复位后的掉配置。 */
-  ret = m5io_hub_i2c_replay_config(bus);
   if (ret)
     return ret;
 
@@ -175,8 +153,6 @@ static int m5io_hub_i2c_bus_setup(struct platform_device *pdev,
     return dev_err_probe(dev, -EINVAL,
                          "I2C%u supports only 100/400 kHz, got %u Hz\n", id,
                          frequency);
-  bus->speed = speed;
-
   ret = m5io_hub_i2c_config(bus->hub, bus->bus, speed);
   if (ret)
     return dev_err_probe(dev, ret, "I2C%u configuration failed\n", id);
@@ -246,7 +222,7 @@ static int m5io_hub_i2c_probe(struct platform_device *pdev)
     if (!registered)
       return -ENODEV;
   } else {
-    /* 兼容旧 overlay：没有子节点时把两路都按 100 kHz 暴露出来。 */
+    /* 节点下没有总线子节点（扁平平铺形式）时，把两路都按 100 kHz 注册。 */
     for (id = 1; id <= M5IO_I2C_BUS_COUNT; id++) {
       ret = m5io_hub_i2c_bus_setup(pdev, &mi->buses[id - 1], id, NULL);
       if (ret)

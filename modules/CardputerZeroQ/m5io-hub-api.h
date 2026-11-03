@@ -184,6 +184,10 @@ enum {
  * 注意载荷里的 port（1/2）与通道号不是同一套编号。 */
 enum {
     M5IO_HUB_UART_config = 1,
+    M5IO_HUB_UART_is_tx_empty  = 2,
+    M5IO_HUB_UART_stop_tx = 3,
+    M5IO_HUB_UART_start_tx = 4,
+    M5IO_HUB_UART_stop_rx = 5,
     M5IO_HUB_UART_reset  = 6,
     M5IO_HUB_UART_CH1    = 7,
     M5IO_HUB_UART_CH2    = 8
@@ -466,6 +470,57 @@ int m5io_hub_uart_register_rx(struct m5io_hub *hub, u8 bus, m5io_hub_chn_data_ha
  * 无线上帧；同步等待在飞回调结束，不可在回调内调用。
  */
 void m5io_hub_uart_unregister_rx(struct m5io_hub *hub, u8 bus);
+
+/**
+ * m5io_hub_uart_tx_empty - 查询 UART 发送窗口是否为空
+ * @hub: hub 句柄
+ * @bus: 端口号 1 或 2
+ *
+ * 分区：FUNC=M5IO_HUB_UART_FUN (UART)，数据通道 DATA CH=M5IO_HUB_UART_CH1/CH2
+ * 请求：FUNC=M5IO_HUB_UART_FUN ARG=M5IO_HUB_UART_txEmpty LEN=1 payload[1]={u8 port}
+ * 应答：FUNC=M5IO_HUB_UART_FUN ARG=status LEN=1 payload[1]={u8 empty}，empty=1 表示发送窗口为空
+ */
+int m5io_hub_uart_tx_empty(struct m5io_hub *hub, u8 bus);
+
+/**
+ * m5io_hub_uart_stop_tx - 停止 UART 发送，丢弃 MCU 侧尚未发出的队列数据
+ * @hub: hub 句柄
+ * @bus: 端口号 1 或 2
+ *
+ * 分区：FUNC=M5IO_HUB_UART_FUN (UART)，数据通道 DATA CH=M5IO_HUB_UART_CH1/CH2
+ * 请求：FUNC=M5IO_HUB_UART_FUN ARG=M5IO_HUB_UART_stop_tx LEN=1 payload[1]={u8 port}
+ * 应答：FUNC=M5IO_HUB_UART_FUN ARG=status LEN=0
+ * DATA：无载荷数据；只丢弃尚未发出的字节，配置保留，之后仍可继续
+ *       m5io_hub_uart_send_data()。
+ */
+int m5io_hub_uart_stop_tx(struct m5io_hub *hub, u8 bus);
+
+/**
+ * m5io_hub_uart_start_tx - 恢复 UART 发送
+ * @hub: hub 句柄
+ * @bus: 端口号 1 或 2
+ *
+ * 分区：FUNC=M5IO_HUB_UART_FUN (UART)，数据通道 DATA CH=M5IO_HUB_UART_CH1/CH2
+ * 请求：FUNC=M5IO_HUB_UART_FUN ARG=M5IO_HUB_UART_start_tx LEN=1 payload[1]={u8 port}
+ * 应答：FUNC=M5IO_HUB_UART_FUN ARG=status LEN=0
+ * DATA：无载荷数据；与 m5io_hub_uart_stop_tx() 配对，恢复后继续接受
+ *       m5io_hub_uart_send_data() 的 DATA。配置保持不变。
+ */
+int m5io_hub_uart_start_tx(struct m5io_hub *hub, u8 bus);
+
+/**
+ * m5io_hub_uart_stop_rx - 停止 UART 接收
+ * @hub: hub 句柄
+ * @bus: 端口号 1 或 2
+ *
+ * 分区：FUNC=M5IO_HUB_UART_FUN (UART)，数据通道 DATA CH=M5IO_HUB_UART_CH1/CH2
+ * 请求：FUNC=M5IO_HUB_UART_FUN ARG=M5IO_HUB_UART_stop_rx LEN=1 payload[1]={u8 port}
+ * 应答：FUNC=M5IO_HUB_UART_FUN ARG=status LEN=0
+ * DATA：无载荷数据；MCU 停止向上报告该端口的 RX DATA，配置保持不变。
+ *       恢复接收由重新 config 或后续恢复命令负责。
+ */
+int m5io_hub_uart_stop_rx(struct m5io_hub *hub, u8 bus);
+
 
 /**
  * m5io_hub_spi_config - 配置指定 SPI 总线

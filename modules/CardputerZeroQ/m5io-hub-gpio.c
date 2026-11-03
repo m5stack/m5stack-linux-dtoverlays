@@ -3,16 +3,11 @@
  * M5Stack M5IO-HUB GPIO child driver
  *
  * 全部硬件访问都走 m5io-hub-api.h 暴露的 m5io_hub_gpio_* 接口：这些接口是
- * FUNC=M5IO_HUB_GPIO_FUN 的 TOKEN 子命令封装（无 DATA 通道），本驱动不再关心
+ * FUNC=M5IO_HUB_GPIO_FUN 的 TOKEN 子命令封装（无 DATA 通道），本驱动不涉及
  * 帧格式、TID、CRC 与 SPI 传输。
  *
- * 与旧接口的差异（迁移要点）：
- *   m5io_hub_pinMode/digitalWrite/digitalRead -> m5io_hub_gpio_* 同名后缀
- *   m5io_hub_attachInterrupt(hub, pin, linux_type)
- *     -> m5io_hub_gpio_attachInterrupt(hub, pin, wire_type, handler, priv)
- *        ① 触发类型要传线上值 0=下降/1=上升/2=双边，不是 IRQ_TYPE_* 的位值；
- *        ② 每位引脚自带回调，核心侧不再有全局 handler，必须逐脚注册/注销。
- *   m5io_hub_register/unregister_gpio_irq_handler -> 删除，回调随 attach/detach 生效。
+ * 中断按引脚注册：m5io_hub_gpio_attachInterrupt() 负责“设边沿 + 绑回调”，
+ * detach 时一并注销；触发类型使用协议线上值 0=下降/1=上升/2=双边。
  */
 
 #include <linux/bitops.h>
@@ -80,7 +75,7 @@ static void m5io_hub_gpio_irq_unmask(struct irq_data *data) {
 }
 
 /*
- * 新的 attach 接口只接受线上编码，这里把 Linux 类型翻译成 0/1/2；
+ * attach 接口只接受线上编码，这里把 Linux 类型翻译成 0/1/2；
  * 返回负值表示该类型不受 MCU 支持（电平触发、IRQ_TYPE_NONE 等）。
  */
 static int m5io_hub_gpio_wire_type(unsigned int type) {
@@ -259,8 +254,8 @@ static int m5io_hub_gpio_probe(struct platform_device *pdev) {
   int ret;
 
   /*
-   * struct m5io_hub 现在是新 API 里的不透明句柄，驱动不再检查 hub->spi，
-   * 只等父设备把句柄挂上 drvdata；底层未就绪时各接口自身返回 -ENODEV。
+   * struct m5io_hub 是不透明句柄：驱动只等父设备把句柄挂上 drvdata，
+   * 底层未就绪时各接口自身返回 -ENODEV。
    */
   if (!pdev->dev.parent)
     return -EPROBE_DEFER;
@@ -294,8 +289,8 @@ static int m5io_hub_gpio_probe(struct platform_device *pdev) {
   girq->threaded = true;
 
   /*
-   * 新接口按脚注册回调，probe 阶段没有引脚需要 attach，因此这里不再像旧版
-   * 那样调用 m5io_hub_register_gpio_irq_handler() 注册全局 handler。
+   * 中断回调随 attachInterrupt() 按引脚注册，probe 阶段没有引脚需要绑定，
+   * 这里直接注册 gpiochip 即可。
    */
   ret = devm_gpiochip_add_data(&pdev->dev, &mg->gc, mg);
   if (ret) {

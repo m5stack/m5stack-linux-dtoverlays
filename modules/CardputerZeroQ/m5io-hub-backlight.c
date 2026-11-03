@@ -2,15 +2,11 @@
 /*
  * M5IO-HUB LCD backlight driver
  *
- * 新 API 用一条 m5io_hub_pwm_config(freq, brightness) 完成协议里的两步：
+ * core 的 m5io_hub_pwm_config(freq, brightness) 一条调用完成协议里的两步：
  * ① FUNC=5 ARG=CONFIG 下发 PWM 频率 ② FUNC=5 ARG=SET 下发 0..255 亮度。
- * 协议没有读回命令，所以 Linux backlight 类里的值就是权威缓存；驱动只记
- * “最后一次下发成功”的频率和亮度，用它们做幂等判断。
- *
- * 与旧接口的差异（迁移要点）：
- *   m5io_hub_exec(FUNC=5, ARG=CONFIG/SET) -> m5io_hub_pwm_config()
- *   旧驱动自己填 payload、校验回包长度；这些都在 core 里完成，驱动不再
- *   需要 struct m5io_hub_request 或 FUNC/ARG 常量。
+ * 协议没有读回命令，所以 Linux backlight 类是权威缓存；驱动只缓存“最后
+ * 一次下发成功”的亮度用于幂等判断，频率则随每次 pwm_config() 的 CONFIG
+ * 步骤一起重发。
  */
 
 #include <linux/backlight.h>
@@ -110,7 +106,7 @@ static int m5io_hub_backlight_probe(struct platform_device *pdev)
                          M5IO_HUB_BACKLIGHT_MAX_BRIGHTNESS);
 
   /*
-   * DT 显式给出频率时按它配置；否则沿用 MCU 上电默认的 30 kHz。新 API 只有
+   * DT 显式给出频率时按它配置；否则按 MCU 上电默认的 30 kHz 处理。core API 只有
    * “CONFIG + SET” 一条组合接口，没有单独下发亮度的入口，所以无论 DT 是否
    * 给频率，首次亮度都必须经 pwm_config() 下发，频率与 MCU 默认值保持一致。
    */

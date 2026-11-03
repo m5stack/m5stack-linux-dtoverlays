@@ -2,24 +2,16 @@
 /*
  * M5Stack M5IO-HUB SPI host controller driver
  *
- * 新 API 把 FUNC=3 的全部协议细节收进了 core：配置、开窗/收尾、按 DATA 通道
- * 分片、MOSI 补零、MISO 回填、16 bit 模式下的大端拆拼、以及按 cs_change 的
- * CS 分组，都由 m5io_hub_spi_transfer() 一次完成。本驱动只负责 Linux SPI
- * 框架这一侧的接线：
+ * FUNC=3 的全部协议细节在 core：配置、开窗/收尾、按 DATA 通道分片、MOSI
+ * 补零、MISO 回填、16 bit 模式下的大端拆拼、以及按 cs_change 的 CS 分组，
+ * 都由 m5io_hub_spi_transfer() 一次完成。本驱动只负责 Linux SPI 框架这一
+ * 侧的接线：
  *   - 每路 SPI 总线（bus 0..3）一个 platform_device + 一个 spi_controller；
  *   - 在 setup 阶段挡掉 MCU 无法实现的能力（CS 时序、非 8/16 位字宽等），
  *     让错误在注册 spi_device 时暴露，而不是等到第一次传输；
  *   - transfer_one_message 直接转调 m5io_hub_spi_transfer()；遇到 -EBUSY
- *     按 API 约定用 m5io_hub_spi_flush() 清掉 MCU 侧未收尾的交换。
- *
- * 与旧接口的差异（迁移要点）：
- *   m5io_hub_exec(FUNC=3, ARG=CONFIG/DISABLE) + m5io_hub_send_spi_sync()
- *     -> m5io_hub_spi_transfer(hub, bus, msg)
- *        m5io_hub_spi_reset(hub, bus)   （旧 DISABLE）
- *        m5io_hub_spi_flush(hub, bus)   （旧 BUSY 恢复路径）
- *   旧驱动里的 m5io_hub_spi_configure/exchange/pack/unpack/validate 全部下移
- *   core；驱动里不再出现 struct m5io_hub_request、通道号或帧格式。
- *   SPI 总线的编号来自 DT（缺省 bus 0），不再假设“只有一路 SPI”。
+ *     按协议约定用 m5io_hub_spi_flush() 清掉 MCU 侧未收尾的交换。
+ * SPI 总线的编号来自 DT（缺省 bus 0），多路总线各自一个控制器节点。
  */
 
 #include <linux/module.h>
@@ -67,6 +59,26 @@ static int m5io_hub_spi_setup(struct spi_device *spi)
   return 0;
 }
 
+/*
+ * SPI 核心的 max_transfer_size 只约束单个 spi_transfer，而协议的上限是
+ * “一次 CS 组”内的总字节数（SPI_BEGIN 的 len ≤ 512）。这里按 cs_change
+ * 分组建模，超限在发起任何 RPC 之前就报 -EMSGSIZE。
+ */
+static int m5io_hub_spi_validate_groups(struct spi_message *msg)
+{
+  struct spi_transfer *t;
+  unsigned int group_len = 0;
+
+  list_for_each_entry(t, &msg->transfers, transfer_list) {
+    if (t->len > M5IO_SPI_MAX_TRANSFER - group_len)
+      return -EMSGSIZE;
+    group_len += t->len;
+    if (t->cs_change)
+      group_len = 0;
+  }
+  return 0;
+}
+
 static int m5io_hub_spi_transfer_message(struct spi_controller *ctlr,
                                         struct spi_message *msg)
 {
@@ -74,9 +86,12 @@ static int m5io_hub_spi_transfer_message(struct spi_controller *ctlr,
   int ret, flush_ret;
 
   msg->actual_length = 0;
+
+  ret = m5io_hub_spi_validate_groups(msg);
+  if (ret)
+    goto done;
+
   ret = m5io_hub_spi_transfer(ms->hub, ms->bus, msg);
-  if (ret < 0 && !msg->status)
-    msg->status = ret;
 
   /*
    * API 约定：BEGIN 时 MCU 还持有上一笔未收尾的交换会回 -EBUSY。
@@ -91,18 +106,23 @@ static int m5io_hub_spi_transfer_message(struct spi_controller *ctlr,
                         ms->bus, flush_ret);
   }
 
+done:
+  if (ret < 0 && !msg->status)
+    msg->status = ret;
   spi_finalize_current_message(ctlr);
   return 0;
 }
 
 /*
- * 总线编号：新协议支持 bus 0..3，一路总线一个控制器节点。DT 里显式写
+ * 总线编号：协议支持 bus 0..3，一路总线一个控制器节点。DT 里显式写
  * m5stack,spi-bus（或节点 reg）时用它，否则按板级现状默认 bus 0 —— 这样
- * 不加新属性也能继续用现有的单总线 overlay。
+ * 不加新属性也能用现有的单总线 overlay。属性存在但格式非法时必须报错，
+ * 不能静默回落到 bus 0。
  */
 static int m5io_hub_spi_of_bus(struct platform_device *pdev, u8 *bus)
 {
   struct device_node *np = pdev->dev.of_node;
+  const char *prop = "m5stack,spi-bus";
   u32 value;
   int ret;
 
@@ -110,15 +130,17 @@ static int m5io_hub_spi_of_bus(struct platform_device *pdev, u8 *bus)
   if (!np)
     return 0;
 
-  ret = of_property_read_u32(np, "m5stack,spi-bus", &value);
-  if (ret == -EINVAL || ret == -ENODATA)
-    ret = of_property_read_u32(np, "reg", &value);
-  if (ret == -EINVAL || ret == -ENODATA)
-    return 0;
+  if (!of_find_property(np, prop, NULL)) {
+    prop = "reg";
+    if (!of_find_property(np, prop, NULL))
+      return 0;
+  }
+
+  ret = of_property_read_u32(np, prop, &value);
   if (ret)
-    return ret;
+    return dev_err_probe(&pdev->dev, ret, "invalid %s property\n", prop);
   if (value >= M5IO_SPI_BUS_COUNT)
-    return -EINVAL;
+    return dev_err_probe(&pdev->dev, -EINVAL, "%s out of range\n", prop);
 
   *bus = (u8)value;
   return 0;
@@ -179,7 +201,7 @@ static void m5io_hub_spi_remove(struct platform_device *pdev)
   if (!ctlr)
     return;
   ms = spi_controller_get_devdata(ctlr);
-  /* 旧 DISABLE：释放 MCU 侧总线状态，避免模块重载后仍留着旧配置。 */
+  /* 释放 MCU 侧总线状态，避免模块重载后仍留着失效配置。 */
   ret = m5io_hub_spi_reset(ms->hub, ms->bus);
   if (ret)
     dev_warn(&pdev->dev, "failed to disable SPI bus %u: %d\n", ms->bus, ret);

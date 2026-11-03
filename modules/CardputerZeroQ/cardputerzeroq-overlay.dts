@@ -52,6 +52,8 @@
             #size-cells = <0>;
             status = "okay";
 
+            
+
             /* The base DT already exposes SE0 CS0 as spidev@0.  Configure
              * that node in place so the overlay cannot create a second
              * device at SPI chip-select 0.
@@ -60,13 +62,15 @@
                 compatible = "m5stack,m5io-hub";
                 reg = <0>;
                 spi-max-frequency = <20000000>;
-                spi-cs-setup-delay-ns = <10000>;
-                spi-cs-inactive-delay-ns = <100000>;
+
+                spi-cs-setup-delay-ns = <50000>;
+                spi-cs-inactive-delay-ns = <50000>;
 
                 pinctrl-names = "default";
                 pinctrl-0 = <&m5io_hub_irq_default_state>;
                 interrupt-parent = <&tlmm>;
                 interrupts = <28 IRQ_TYPE_LEVEL_LOW>;
+
                 status = "okay";
 
                 m5io_hub_gpio: gpio {

@@ -5,19 +5,20 @@
  * UART 引脚在 M5IO-HUB MCU 上，Linux 侧没有寄存器也没有中断线：
  *   - 配置/关闭走 FUNC=4 的 TOKEN（m5io_hub_uart_config / _reset）；
  *   - 收发字节走 DATA 通道（m5io_hub_uart_send_data / register_rx），
- *     协议细节、DATA 窗口与 ACK 都由 core 处理。
- * TX 仍然放在 work item 里做，因为配置与发送都可能睡眠，不能占用
- * uart_port 的 spinlock；RX 回调在 core 的工作队列上下文里直接送 tty
- * flip buffer。
- *
- * 与旧接口的差异（迁移要点）：
- *   m5io_hub_exec(FUNC=4, ARG=CONFIG/DISABLE) -> m5io_hub_uart_config()/_reset()
- *   m5io_hub_send_data_async(chn, ...)        -> m5io_hub_uart_send_data(hub, bus, ...)
- *   m5io_hub_register_chn_data_handler(chn)   -> m5io_hub_uart_register_rx(hub, bus, ...)
- *   端口号/通道号不再由驱动换算：API 里的 bus 就是 USART1/2（1/2）。
- *   RX 的“已配置/已使能”门控移到 core（register_rx 即打开 RX 门），驱动只
- *   保留 CREAD 与 tty 未打开时的本地丢弃，避免把字节送进失效的 tty_port。
- *   新 API 不回读实际生效的波特率，所以 tty 侧按请求值计算 timeout。
+ *     协议细节、DATA 窗口与 ACK 都由 core 处理；
+ *   - 发送窗口是否为空用 m5io_hub_uart_tx_empty() 查询（MCU 侧 FIFO 可能
+ *     还在排空，只靠驱动自己的计数判断不了）；
+ *   - 停止/恢复发送用 m5io_hub_uart_stop_tx()/_start_tx()。uart_ops 的
+ *     stop_tx/start_tx 持有 port->lock 且不可睡眠，所以驱动只记录状态并合并
+ *     请求，由 tx_work 在进程上下文转发；只有真正停过才补 START，正常写路径
+ *     不额外多发 TOKEN；
+ *   - 停止接收用 m5io_hub_uart_stop_rx()，同样由 tx_work 在进程上下文转发
+ *     （uart_ops.stop_rx 也是持 port->lock 的原子上下文）。
+ * TX 放在 work item 里做，因为配置与发送都可能睡眠，不能占用 uart_port
+ * 的 spinlock；RX 回调在 core 的工作队列上下文里直接送 tty flip buffer。
+ * API 里的 bus 就是 USART1/2（1/2）。RX 的“已配置/已使能”门控在 core
+ * （register_rx 即打开 RX 门），驱动只在 CREAD=0 或 tty 未打开时本地丢弃。
+ * API 不回读实际生效的波特率，tty 侧按请求值计算 timeout。
  */
 
 #include <linux/atomic.h>
@@ -47,6 +48,12 @@
 
 struct m5io_hub_uart;
 
+enum m5io_hub_uart_tx_cmd {
+  M5IO_HUB_UART_TX_CMD_NONE = 0,
+  M5IO_HUB_UART_TX_CMD_STOP,
+  M5IO_HUB_UART_TX_CMD_START,
+};
+
 struct m5io_hub_uart_port {
   struct uart_port port;
   struct m5io_hub_uart *mu;
@@ -55,7 +62,16 @@ struct m5io_hub_uart_port {
   atomic_t tx_enabled;
   atomic_t tx_inflight;
   atomic_t tx_pending;
+  /* uart_ops.stop_tx/start_tx 在原子上下文触发，下行命令由 tx_work 转发。 */
+  atomic_t tx_cmd_pending;  /* enum m5io_hub_uart_tx_cmd，后到的命令覆盖先前的 */
+  atomic_t tx_hold;         /* 1 = tty 要求停发（用于判断恢复时是否需要 START） */
+  atomic_t mcu_tx_stopped;  /* 1 = MCU 已收到 STOP、尚未收到 START */
+  /* uart_ops.stop_rx 同样在原子上下文触发；收到的 RX 停止命令由 tx_work 转发。 */
+  atomic_t rx_stop_pending;
+  atomic_t mcu_rx_stopped;  /* 1 = MCU 已收到 RX 停止命令 */
   atomic_t rx_enabled;
+  /* uart_flush_buffer()（TCFLSH）的代号：tx_work 用它判断 peek 的数据是否作废。 */
+  unsigned int xmit_gen;
   u8 bus; /* API 端口号：1=USART1，2=USART2 */
   u8 tx_buf[M5IO_HUB_UART_CHUNK];
   bool registered;    /* uart_add_one_port() 成功 */
@@ -85,18 +101,33 @@ static struct m5io_hub_uart_port *m5io_hub_uart_from_port(struct uart_port *port
   return container_of(port, struct m5io_hub_uart_port, port);
 }
 
-static unsigned int m5io_hub_uart_tx_empty(struct uart_port *port)
+static unsigned int m5io_hub_uart_op_tx_empty(struct uart_port *port)
 {
   struct m5io_hub_uart_port *up = m5io_hub_uart_from_port(port);
+  int ret;
+
+  /* 驱动里还有没提交/正在提交的块：肯定不空，也不必问 MCU。 */
+  if (atomic_read(&up->tx_inflight) || atomic_read(&up->tx_pending))
+    return 0;
+  /* 配置不确定时不能声称发送完成；未配置则本来就没有待发数据。 */
+  if (READ_ONCE(up->io_failed))
+    return 0;
+  if (!READ_ONCE(up->configured))
+    return TIOCSER_TEMT;
 
   /*
-   * 新 API 没有“该通道还有多少在飞 DATA”的查询接口，所以只按驱动自己的
-   * 计数判断。最后一次提交完成、且没有排队数据时才算发送器空。
+   * MCU 侧可能还有它自己 TX FIFO 里的字节，只有它能权威回答是否排空。
+   * uart_ops 的 tx_empty 文档标注“must not sleep”，但内核里仅有的三个调用
+   * 点（uart_wait_until_sent、TIOCSERGETLSR、suspend drain）都在进程上下文
+   * 且不持有 port->lock，所以这里做一次同步查询是安全的。
    */
-  if (READ_ONCE(up->io_failed) || atomic_read(&up->tx_inflight) ||
-      atomic_read(&up->tx_pending))
+  ret = m5io_hub_uart_tx_empty(up->mu->hub, up->bus);
+  if (ret < 0) {
+    dev_dbg_ratelimited(port->dev, "UART%u tx_empty query failed: %d\n",
+                        up->bus, ret);
     return 0;
-  return TIOCSER_TEMT;
+  }
+  return ret ? TIOCSER_TEMT : 0;
 }
 
 static unsigned int m5io_hub_uart_get_mctrl(struct uart_port *port)
@@ -110,12 +141,21 @@ static void m5io_hub_uart_set_mctrl(struct uart_port *port, unsigned int mctrl)
   /* RTS/DTR 不在 FUNC=4 的范围内。 */
 }
 
-static void m5io_hub_uart_stop_tx(struct uart_port *port)
+static void m5io_hub_uart_op_stop_tx(struct uart_port *port)
 {
   struct m5io_hub_uart_port *up = m5io_hub_uart_from_port(port);
 
   atomic_set(&up->tx_enabled, 0);
   atomic_set(&up->tx_pending, 0);
+
+  /*
+   * 这里持有 port->lock 且不可睡眠，只记录状态并把请求合并到 tx_work；
+   * 已经处于 hold 状态就不重复下发 STOP。
+   */
+  if (!READ_ONCE(up->configured) || atomic_xchg(&up->tx_hold, 1))
+    return;
+  atomic_xchg(&up->tx_cmd_pending, M5IO_HUB_UART_TX_CMD_STOP);
+  mod_delayed_work(system_wq, &up->tx_work, 0);
 }
 
 static void m5io_hub_uart_rx_data(void *data, const u8 *buf, unsigned int len)
@@ -152,6 +192,11 @@ static void m5io_hub_uart_mark_unknown(struct m5io_hub_uart_port *up)
   WRITE_ONCE(up->io_failed, true);
   atomic_set(&up->tx_enabled, 0);
   atomic_set(&up->rx_enabled, 0);
+  atomic_set(&up->tx_cmd_pending, M5IO_HUB_UART_TX_CMD_NONE);
+  atomic_set(&up->tx_hold, 0);
+  atomic_set(&up->mcu_tx_stopped, 0);
+  atomic_set(&up->rx_stop_pending, 0);
+  atomic_set(&up->mcu_rx_stopped, 0);
 }
 
 static void m5io_hub_uart_tx_work(struct work_struct *work)
@@ -165,11 +210,54 @@ static void m5io_hub_uart_tx_work(struct work_struct *work)
   for (;;) {
     struct tty_port *tty_port;
     unsigned long flags;
-    unsigned int count, pending;
+    unsigned int count, pending, gen;
     int ret;
 
+    /* 进程上下文里补发 uart_ops.stop_tx/start_tx 在原子上下文做不了的下行命令。 */
+    switch (atomic_xchg(&up->tx_cmd_pending, M5IO_HUB_UART_TX_CMD_NONE)) {
+    case M5IO_HUB_UART_TX_CMD_STOP:
+      /* 先竖“MCU 已停”的标志：并发的 start_tx 看到它才会补 START。 */
+      atomic_set(&up->mcu_tx_stopped, 1);
+      ret = m5io_hub_uart_stop_tx(up->mu->hub, up->bus);
+      if (ret)
+        dev_dbg_ratelimited(port->dev, "UART%u stop_tx failed: %d\n",
+                            up->bus, ret);
+      break;
+    case M5IO_HUB_UART_TX_CMD_START:
+      /* STOP 可能在到达 MCU 之前就被 START 覆盖，这种情况下无需下发。 */
+      if (!atomic_read(&up->mcu_tx_stopped))
+        break;
+      ret = m5io_hub_uart_start_tx(up->mu->hub, up->bus);
+      if (ret) {
+        /*
+         * START 没下成：把 hold 重新竖起，下一次 uart_ops.start_tx 才会
+         * 再补一次；否则本地以为已恢复、MCU 却仍是停发状态，数据会卡死。
+         */
+        atomic_set(&up->tx_hold, 1);
+        dev_dbg_ratelimited(port->dev, "UART%u start_tx failed: %d\n",
+                            up->bus, ret);
+      } else {
+        atomic_set(&up->mcu_tx_stopped, 0);
+      }
+      break;
+    default:
+      break;
+    }
+
+    /* 进程上下文里补发 uart_ops.stop_rx 在原子上下文做不了的下行命令。 */
+    if (atomic_xchg(&up->rx_stop_pending, 0) &&
+        atomic_read(&up->mcu_rx_stopped)) {
+      ret = m5io_hub_uart_stop_rx(up->mu->hub, up->bus);
+      if (ret) {
+        /* 失败就撤销标志，下一次 stop_rx 会重试。 */
+        atomic_set(&up->mcu_rx_stopped, 0);
+        dev_dbg_ratelimited(port->dev, "UART%u stop_rx failed: %d\n",
+                            up->bus, ret);
+      }
+    }
+
     if (!READ_ONCE(up->configured) || !atomic_read(&up->tx_enabled) ||
-        !port->state)
+        !port->state || atomic_read(&up->mcu_tx_stopped))
       break;
 
     spin_lock_irqsave(&port->lock, flags);
@@ -180,6 +268,7 @@ static void m5io_hub_uart_tx_work(struct work_struct *work)
       break;
     }
 
+    gen = up->xmit_gen;
     count = min_t(unsigned int, kfifo_len(&tty_port->xmit_fifo),
                   M5IO_HUB_UART_CHUNK);
     if (kfifo_out_peek(&tty_port->xmit_fifo, up->tx_buf, count) != count) {
@@ -210,6 +299,16 @@ static void m5io_hub_uart_tx_work(struct work_struct *work)
     }
 
     spin_lock_irqsave(&port->lock, flags);
+    if (unlikely(up->xmit_gen != gen)) {
+      /*
+       * 发送期间发生了 TCFLSH：peek 到的字节已经被清掉，tail 不能再前进。
+       * 已经发出去的这部分无法追回（与其它 uart 驱动在 flush 边界上的
+       * 行为一致），后续数据从新 FIFO 头继续发送。
+       */
+      atomic_set(&up->tx_pending, 0);
+      spin_unlock_irqrestore(&port->lock, flags);
+      break;
+    }
     tty_port = &port->state->port;
     uart_xmit_advance(port, count);
     pending = kfifo_len(&tty_port->xmit_fifo);
@@ -225,7 +324,7 @@ static void m5io_hub_uart_tx_work(struct work_struct *work)
   mutex_unlock(&up->config_lock);
 }
 
-static void m5io_hub_uart_start_tx(struct uart_port *port)
+static void m5io_hub_uart_op_start_tx(struct uart_port *port)
 {
   struct m5io_hub_uart_port *up = m5io_hub_uart_from_port(port);
 
@@ -233,14 +332,46 @@ static void m5io_hub_uart_start_tx(struct uart_port *port)
   if (!READ_ONCE(up->configured))
     return;
   atomic_set(&up->tx_enabled, 1);
+
+  /*
+   * 只有真正从“已停”恢复时才需要补 START（例如 XOFF/XON 之后）；正常写
+   * 路径 hold 本来就是 0，不再额外发一条 TOKEN。后到的 START 会覆盖还没
+   * 被 tx_work 取走的 STOP。
+   */
+  if (atomic_xchg(&up->tx_hold, 0))
+    atomic_xchg(&up->tx_cmd_pending, M5IO_HUB_UART_TX_CMD_START);
+
   mod_delayed_work(system_wq, &up->tx_work, 0);
 }
 
-static void m5io_hub_uart_stop_rx(struct uart_port *port)
+static void m5io_hub_uart_op_stop_rx(struct uart_port *port)
 {
   struct m5io_hub_uart_port *up = m5io_hub_uart_from_port(port);
 
   atomic_set(&up->rx_enabled, 0);
+
+  /*
+   * 原子上下文只记录并合并请求；已经停过就不重复下发。配置未知时不发
+   * 命令，等重新配置成功后由 configure 清掉 mcu_rx_stopped。
+   */
+  if (!READ_ONCE(up->configured) || atomic_xchg(&up->mcu_rx_stopped, 1))
+    return;
+  atomic_set(&up->rx_stop_pending, 1);
+  mod_delayed_work(system_wq, &up->tx_work, 0);
+}
+
+static void m5io_hub_uart_flush_buffer(struct uart_port *port)
+{
+  struct m5io_hub_uart_port *up = m5io_hub_uart_from_port(port);
+
+  /*
+   * uart 核心已经持有 port->lock，并且先 kfifo_reset() 了 xmit_fifo 才调用
+   * 这里。递增代号让正在 RPC 中的 tx_work 知道：它 peek 到的那批字节已被
+   * TCFLSH 丢掉，不能再 uart_xmit_advance()，否则 tail 会越过 head、kfifo
+   * 长度下溢成天文数字并发出垃圾数据。
+   */
+  up->xmit_gen++;
+  atomic_set(&up->tx_pending, 0);
 }
 
 static void m5io_hub_uart_enable_ms(struct uart_port *port) {}
@@ -281,15 +412,32 @@ static void m5io_hub_uart_shutdown(struct uart_port *port)
   atomic_set(&up->rx_enabled, 0);
   atomic_set(&up->tx_enabled, 0);
   atomic_set(&up->tx_pending, 0);
+  atomic_set(&up->tx_cmd_pending, M5IO_HUB_UART_TX_CMD_NONE);
+  atomic_set(&up->tx_hold, 0);
+  atomic_set(&up->mcu_tx_stopped, 0);
   cancel_delayed_work_sync(&up->tx_work);
 
   mutex_lock(&up->config_lock);
+  /*
+   * uart_ops.stop_rx 是原子上下文，请求可能在 tx_work 被取消前来不及转发。
+   * shutdown 在进程上下文，这里同步补发一次：pending 已被 work 消费过就
+   * 不再重复，保证每个 stop_rx 请求恰好下发一次。
+   */
+  if (atomic_xchg(&up->rx_stop_pending, 0) &&
+      atomic_read(&up->mcu_rx_stopped) && READ_ONCE(up->configured)) {
+    ret = m5io_hub_uart_stop_rx(up->mu->hub, up->bus);
+    if (ret)
+      dev_dbg_ratelimited(port->dev, "UART%u stop_rx failed: %d\n",
+                          up->bus, ret);
+  }
+  atomic_set(&up->mcu_rx_stopped, 0);
+
   if (up->rx_registered) {
     m5io_hub_uart_unregister_rx(up->mu->hub, up->bus);
     up->rx_registered = false;
   }
   if (up->configured) {
-    /* 旧 DISABLE：关闭该端口，释放 MCU 侧配置。 */
+    /* 关闭该端口，释放 MCU 侧配置。 */
     ret = m5io_hub_uart_reset(up->mu->hub, up->bus);
     if (!ret)
       WRITE_ONCE(up->configured, false);
@@ -329,14 +477,16 @@ static int m5io_hub_uart_configure(struct m5io_hub_uart_port *up,
   }
 
   /*
-   * 新 API 只返回成功/失败，不回读实际分频；按请求值更新 tty timeout。
-   * （旧实现会用 MCU 回显的波特率纠正 9599 这类分频误差。）
+   * API 只返回成功/失败，不回读实际分频；按请求值更新 tty timeout。
    */
   uart_update_timeout(&up->port, termios->c_cflag, baud);
   up->confirmed_cflag = termios->c_cflag;
   up->confirmed_baud = baud;
   WRITE_ONCE(up->io_failed, false);
   WRITE_ONCE(up->configured, true);
+  /* CONFIG 会重新打开该端口，之前 stop_rx 留下的 MCU 状态已失效。 */
+  atomic_set(&up->mcu_rx_stopped, 0);
+  atomic_set(&up->rx_stop_pending, 0);
   atomic_set(&up->rx_enabled,
              up->rx_registered && (termios->c_cflag & CREAD) != 0);
   atomic_set(&up->tx_enabled, 1);
@@ -424,12 +574,13 @@ static int m5io_hub_uart_verify_port(struct uart_port *port,
 }
 
 static const struct uart_ops m5io_hub_uart_ops = {
-    .tx_empty = m5io_hub_uart_tx_empty,
+    .tx_empty = m5io_hub_uart_op_tx_empty,
     .set_mctrl = m5io_hub_uart_set_mctrl,
     .get_mctrl = m5io_hub_uart_get_mctrl,
-    .stop_tx = m5io_hub_uart_stop_tx,
-    .start_tx = m5io_hub_uart_start_tx,
-    .stop_rx = m5io_hub_uart_stop_rx,
+    .stop_tx = m5io_hub_uart_op_stop_tx,
+    .start_tx = m5io_hub_uart_op_start_tx,
+    .stop_rx = m5io_hub_uart_op_stop_rx,
+    .flush_buffer = m5io_hub_uart_flush_buffer,
     .enable_ms = m5io_hub_uart_enable_ms,
     .break_ctl = m5io_hub_uart_break_ctl,
     .startup = m5io_hub_uart_startup,
@@ -464,6 +615,11 @@ static int m5io_hub_uart_register_port(struct platform_device *pdev,
   atomic_set(&up->tx_enabled, 0);
   atomic_set(&up->tx_inflight, 0);
   atomic_set(&up->tx_pending, 0);
+  atomic_set(&up->tx_cmd_pending, M5IO_HUB_UART_TX_CMD_NONE);
+  atomic_set(&up->tx_hold, 0);
+  atomic_set(&up->mcu_tx_stopped, 0);
+  atomic_set(&up->rx_stop_pending, 0);
+  atomic_set(&up->mcu_rx_stopped, 0);
   atomic_set(&up->rx_enabled, 0);
   up->mu = mu;
   /* DT 的 reg=0/1 对应 API 端口号 1/2（USART1/USART2）。 */
@@ -497,17 +653,21 @@ static int m5io_hub_uart_probe(struct platform_device *pdev)
     return -ENOMEM;
   mu->hub = hub;
 
-  for_each_available_child_of_node(dev->of_node, child) {
-    if (of_property_read_u32(child, "reg", &reg) ||
-        reg >= M5IO_HUB_UART_NR) {
-      dev_warn(dev, "ignoring UART child without valid reg\n");
-      continue;
+  if (of_get_child_count(dev->of_node)) {
+    /*
+     * 有子节点：只注册 status="okay" 的 serial@N；如果 DT 把子节点全部
+     * disable，就不应再凭父节点 reg 造出一个端口。
+     */
+    for_each_available_child_of_node(dev->of_node, child) {
+      if (of_property_read_u32(child, "reg", &reg) ||
+          reg >= M5IO_HUB_UART_NR) {
+        dev_warn(dev, "ignoring UART child without valid reg\n");
+        continue;
+      }
+      seen[reg] = true;
     }
-    seen[reg] = true;
-  }
-
-  /* 兼容旧式扁平节点：没有子节点时按节点 reg（缺省 0）注册一路。 */
-  if (!seen[0] && !seen[1]) {
+  } else {
+    /* 扁平平铺节点（没有总线子节点）时，按节点 reg（缺省 0）注册一路。 */
     if (!of_property_read_u32(dev->of_node, "reg", &reg) &&
         reg < M5IO_HUB_UART_NR)
       seen[reg] = true;

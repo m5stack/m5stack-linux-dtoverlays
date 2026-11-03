@@ -14,14 +14,13 @@
  * 补齐的 leader/bit MARK/SPACE 必须与 M5IO_IR_*_US 一致，否则收发都对不上
  * （IR-Chat / FactoryTest 用的也是同一组数值）。
  *
- * 与旧接口的差异（迁移要点）：
- *   m5io_hub_exec(FUNC=6, ...) + m5io_hub_send_data_async(CHN) + 自定义回调
- *     -> m5io_hub_ir_config/_reset/_start_reace/_stop_reace/_send_data/
- *        _register_rx/_unregister_rx
- *   旧驱动只是给其他内核模块用的适配器，没有用户态接口；新驱动把它接成
- *   标准 rc-core 设备（/sys/class/rc/rcN、evdev input，内核开 CONFIG_LIRC 时
- *   还有 /dev/lircN），用户态协议解析/回放走标准 LIRC API。
- *   MCU 的 IR_TX 与 IR_RX 互斥，所以发送前后由驱动 stop/start 一次接收。
+ * 本驱动把 core 的 IR API 接成标准 rc-core 设备（/sys/class/rc/rcN、
+ * evdev input，内核开 CONFIG_LIRC 时还有 /dev/lircN），用户态协议解析与
+ * 回放走标准 LIRC API。MCU 的 IR_TX 与 IR_RX 互斥，所以发送前后由驱动
+ * stop/start 一次接收；这意味着 m5io_hub_ir_send_data() 必须在波形发送
+ * 结束（而不是仅排队）后才返回，与 rc-core 对 tx_ir 的时序要求一致。
+ * API 目前只有载波频率，占空比由 core 的固定配置决定，因此驱动不
+ * advertise LIRC_SET_SEND_DUTY_CYCLE。
  */
 
 #include <linux/module.h>
@@ -71,7 +70,6 @@ struct m5io_hub_ir {
   /* 串行化“重配载波 / 开关接收 / 发送”三件会互相踩硬件状态的事。 */
   struct mutex lock;
   unsigned int carrier_hz;
-  unsigned int duty_cycle;
   bool rx_running;
   bool rx_registered;
   /* 发送期间丢弃迟到的接收帧，避免把 TX 尾巴当 RX 数据解码。 */
@@ -284,24 +282,6 @@ static int m5io_hub_ir_set_carrier(struct rc_dev *rc, u32 carrier)
   return ret;
 }
 
-static int m5io_hub_ir_set_duty_cycle(struct rc_dev *rc, u32 duty_cycle)
-{
-  struct m5io_hub_ir *ir = rc->priv;
-
-  /*
-   * 新 API 的 ir_config() 只有载波频率，占空比由 core 补齐的 15 B 配置决定；
-   * 这里只记录用户意愿并接受设置，避免 LIRC 应用因为返回失败而放弃。
-   */
-  ir->duty_cycle = duty_cycle;
-  return 0;
-}
-
-static int m5io_hub_ir_set_timeout(struct rc_dev *rc, unsigned int timeout)
-{
-  /* rc-core 自己维护 dev->timeout；MCU 侧没有对应的硬件超时寄存器。 */
-  return 0;
-}
-
 static int m5io_hub_ir_open(struct rc_dev *rc)
 {
   struct m5io_hub_ir *ir = rc->priv;
@@ -385,7 +365,6 @@ static int m5io_hub_ir_probe(struct platform_device *pdev)
     }
   }
   ir->carrier_hz = carrier;
-  ir->duty_cycle = 50;
 
   rc = devm_rc_allocate_device(dev, RC_DRIVER_IR_RAW);
   if (!rc)
@@ -410,8 +389,6 @@ static int m5io_hub_ir_probe(struct platform_device *pdev)
   rc->open = m5io_hub_ir_open;
   rc->close = m5io_hub_ir_close;
   rc->s_tx_carrier = m5io_hub_ir_set_carrier;
-  rc->s_tx_duty_cycle = m5io_hub_ir_set_duty_cycle;
-  rc->s_timeout = m5io_hub_ir_set_timeout;
   rc->tx_ir = m5io_hub_ir_tx;
   ir->rc = rc;
 
