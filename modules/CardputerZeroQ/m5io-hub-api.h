@@ -6,6 +6,8 @@
 #include <linux/kfifo.h>
 #include <linux/serial_core.h>
 #include <linux/printk.h>
+#include <linux/i2c.h>
+#include <linux/spi/spi.h>
 
 /* 不透明句柄与本段原型用到的外部类型的前置声明。
  * 缺了它们，"struct m5io_hub *" 会变成只属于参数表的隐藏 tag，调用方传进来的
@@ -212,8 +214,7 @@ enum {
 /* =====================================================================
  * 以下接口按 M5IO-HUB 协议组织：每条注释给出分区（FUNC / DATA 通道）、
  * 请求模板、应答模板，以及该外设 DATA 载荷的含义。
- * 注意：本段用到 struct i2c_msg / struct spi_message，而本头文件未 include
- * <linux/i2c.h> / <linux/spi/spi.h>。
+ * 注意：本段用到 struct i2c_msg / struct spi_message。
  * ===================================================================== */
 
 /**
@@ -325,6 +326,7 @@ int m5io_hub_i2c_reset(struct m5io_hub *hub, u8 bus);
 /**
  * m5io_hub_i2c_transfer - 执行一次 I2C 消息传输
  * @hub: hub 句柄
+ * @bus: 总线号 1 或 2
  * @msgs: Linux I2C 消息数组（1 或 2 条；2 条须是同地址的写+读）
  * @num: 消息条数 1..2
  *
@@ -337,7 +339,7 @@ int m5io_hub_i2c_reset(struct m5io_hub *hub, u8 bus);
  * DATA：addr 为 7 bit 从地址（0x08..0x77）；单笔数据上限 253 B
  *       （写+读合并时首条写 ≤252、第二条读 ≤253）。
  */
-int m5io_hub_i2c_transfer(struct m5io_hub *hub, struct i2c_msg *msgs, int num);
+int m5io_hub_i2c_transfer(struct m5io_hub *hub, u8 bus, struct i2c_msg *msgs, int num);
 
 /* I2C DATA 通道操作码（payload 首字节）：0xAA 写、0xAB 读/合并写读、
  * 0xAC Quick Command（只有地址阶段，无数据阶段）。 */

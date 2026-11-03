@@ -1,313 +1,202 @@
 // SPDX-License-Identifier: GPL-2.0
-/* SPI2 bridge for CardputerQ FUNC3 (fixed active-low PB12 chip select).
- * The MCU executes one continuous exchange per RPC, releasing CS afterwards.
- * Coalesce transfers up to a CS boundary; never split a CS assertion into
- * several RPCs. Unsupported timing/configuration is rejected before any I/O.
+/*
+ * M5Stack M5IO-HUB SPI host controller driver
+ *
+ * 新 API 把 FUNC=3 的全部协议细节收进了 core：配置、开窗/收尾、按 DATA 通道
+ * 分片、MOSI 补零、MISO 回填、16 bit 模式下的大端拆拼、以及按 cs_change 的
+ * CS 分组，都由 m5io_hub_spi_transfer() 一次完成。本驱动只负责 Linux SPI
+ * 框架这一侧的接线：
+ *   - 每路 SPI 总线（bus 0..3）一个 platform_device + 一个 spi_controller；
+ *   - 在 setup 阶段挡掉 MCU 无法实现的能力（CS 时序、非 8/16 位字宽等），
+ *     让错误在注册 spi_device 时暴露，而不是等到第一次传输；
+ *   - transfer_one_message 直接转调 m5io_hub_spi_transfer()；遇到 -EBUSY
+ *     按 API 约定用 m5io_hub_spi_flush() 清掉 MCU 侧未收尾的交换。
+ *
+ * 与旧接口的差异（迁移要点）：
+ *   m5io_hub_exec(FUNC=3, ARG=CONFIG/DISABLE) + m5io_hub_send_spi_sync()
+ *     -> m5io_hub_spi_transfer(hub, bus, msg)
+ *        m5io_hub_spi_reset(hub, bus)   （旧 DISABLE）
+ *        m5io_hub_spi_flush(hub, bus)   （旧 BUSY 恢复路径）
+ *   旧驱动里的 m5io_hub_spi_configure/exchange/pack/unpack/validate 全部下移
+ *   core；驱动里不再出现 struct m5io_hub_request、通道号或帧格式。
+ *   SPI 总线的编号来自 DT（缺省 bus 0），不再假设“只有一路 SPI”。
  */
+
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/spi/spi.h>
-#include <linux/unaligned.h>
 
 #include "m5io-hub.h"
 
-#define M5IO_SPI_CONFIG         1
-#define M5IO_SPI_BEGIN          2
-#define M5IO_SPI_DISABLE        6
-#define M5IO_SPI_MIN_HZ         250000
-#define M5IO_SPI_MAX_HZ         20000000
-/* The MCU answers SPI CONFIG with BUSY while its exchange queue is draining,
- * so the request is retried instead of failing the transfer. */
-#define M5IO_SPI_CFG_BUSY_TRIES 6
-#define M5IO_SPI_CFG_BUSY_DELAY_US 20000
+#define M5IO_SPI_MIN_HZ       250000U
+#define M5IO_SPI_MAX_HZ       20000000U
+/* 协议单次交换上限：SPI_BEGIN 的 len 最大 512 字节。 */
+#define M5IO_SPI_MAX_TRANSFER 512U
+/* FUNC=3 支持的 SPI 总线数：bus 0..3 依次占用 DATA CH1..CH4。 */
+#define M5IO_SPI_BUS_COUNT    4U
 
 struct m5io_hub_spi {
-    struct m5io_hub *hub;
-    u8 tx[M5IO_HUB_SPI_MAX_LEN];
-    u8 rx[M5IO_HUB_SPI_MAX_LEN];
-    bool configured;
+  struct m5io_hub *hub;
+  u8 bus;
 };
-
-static int m5io_hub_spi_setup(struct spi_device *spi)
-{
-    if (spi_get_chipselect(spi, 0) || (spi->mode & ~(SPI_CPOL | SPI_CPHA)) ||
-        (spi->bits_per_word != 8 && spi->bits_per_word != 16))
-        return -EINVAL;
-    if (spi->max_speed_hz < M5IO_SPI_MIN_HZ)
-        return -EINVAL;
-    if (spi->word_delay.value || spi->cs_setup.value ||
-        spi->cs_hold.value || spi->cs_inactive.value)
-        return -EOPNOTSUPP;
-    return 0;
-}
 
 static size_t m5io_hub_spi_max_transfer_size(struct spi_device *spi)
 {
-    return M5IO_HUB_SPI_MAX_LEN;
+  return M5IO_SPI_MAX_TRANSFER;
 }
 
-/* Validate the whole message, including later CS groups, before CONFIG. */
-static int m5io_hub_spi_validate(struct spi_message *msg)
+/*
+ * 设备级能力校验。协议层还会再校验一次每条 transfer（speed/字宽/CS 时序），
+ * 但在这里提前拒绝可以把错误留在注册设备阶段，且能挡住 core 不认识的
+ * cs_setup/cs_hold/cs_inactive/word_delay —— MCU 自己产生 CS 时序。
+ */
+static int m5io_hub_spi_setup(struct spi_device *spi)
 {
-    struct spi_transfer *t;
-    unsigned int len = 0, speed = 0, bits = 0;
-    int ret;
-
-    ret = m5io_hub_spi_setup(msg->spi);
-    if (ret)
-        return ret;
-    list_for_each_entry(t, &msg->transfers, transfer_list) {
-        if (!t->len || t->len > M5IO_HUB_SPI_MAX_LEN ||
-            (t->bits_per_word != 8 && t->bits_per_word != 16) ||
-            (t->bits_per_word == 16 && (t->len & 1)) ||
-            t->speed_hz < M5IO_SPI_MIN_HZ || t->speed_hz > M5IO_SPI_MAX_HZ)
-            return -EINVAL;
-        if (t->cs_off || t->delay.value || t->word_delay.value ||
-            t->tx_nbits > SPI_NBITS_SINGLE || t->rx_nbits > SPI_NBITS_SINGLE ||
-            (list_is_last(&t->transfer_list, &msg->transfers) && t->cs_change))
-            return -EOPNOTSUPP;
-        if (len && (t->speed_hz != speed || t->bits_per_word != bits))
-            return -EOPNOTSUPP;
-        speed = t->speed_hz;
-        bits = t->bits_per_word;
-        len += t->len;
-        if (len > M5IO_HUB_SPI_MAX_LEN)
-            return -EMSGSIZE;
-        if (t->cs_change)
-            len = 0;
-    }
-    return 0;
-}
-
-static int m5io_hub_spi_configure(struct m5io_hub_spi *ms,
-                                 struct spi_device *spi,
-                                 struct spi_transfer *t)
-{
-    u8 payload[6] = { spi->mode & (SPI_CPOL | SPI_CPHA), t->bits_per_word,
-                      0, 0, 0, 1 };
-    struct m5io_hub_request req = {
-        .func = M5IO_HUB_FUNC_SPI,
-        .arg = M5IO_SPI_CONFIG,
-        .payload = payload,
-        .payload_len = sizeof(payload),
-    };
-    unsigned int attempt;
-    int ret;
-
-    /* Firmware rounds down to a hardware prescaler. Never round Hz up. */
-    put_unaligned_le16(t->speed_hz / 1000, payload + 2);
-    put_unaligned_le16(256, payload + 4);
-
-    /*
-     * BUSY means the MCU still has exchanges queued for this port.  It is a
-     * retry, not a failure: the queue drains on its own.  CONFIG runs per
-     * message and per chip-select group, so back-to-back transfers can hit it
-     * even when the port is healthy.
-     */
-    for (attempt = 0; attempt < M5IO_SPI_CFG_BUSY_TRIES; attempt++) {
-        req.status = 0xff;
-        ret = m5io_hub_exec(ms->hub, &req);
-        /*
-         * The MCU answers CONFIG with status 4 when its exchange queue is not
-         * empty, and the transport surfaces that BUSY as -EBUSY from
-         * m5io_hub_exec() as well -- the token callback converts the reply
-         * status into the completion's errno.  Only req.status tells it apart
-         * from "the data line is held by an upgrade", so it must be tested
-         * *before* the error return.  Testing ret first made this loop retry
-         * zero times on BUSY, which is exactly the case it exists for.
-         */
-        if (req.status == 4) {
-            usleep_range(M5IO_SPI_CFG_BUSY_DELAY_US,
-                         M5IO_SPI_CFG_BUSY_DELAY_US + 2000);
-            continue;
-        }
-        if (ret)
-            return ret;
-        break;
-    }
-    if (req.status != 0) {
-        /*
-         * A persistent BUSY is not transient: the MCU refuses CONFIG while it
-         * still holds exchanges whose MISO payload has not been handed back to
-         * the host yet.  It has no timer that gives up on them, so once that
-         * queue is stuck the port stays unusable until an MCU_RESET or
-         * transport reset. MCU_RESET is a maintenance command and does not
-         * reboot Linux; userspace otherwise observes repeated EBUSY with no
-         * progress.
-         * Say so explicitly instead of leaving the caller to guess.
-         */
-        if (req.status == 4) {
-            /* The MCU keeps a previous exchange BUSY until its DATA window
-             * is acknowledged. If the host lost that ACK, CONFIG alone can
-             * never make progress. SPI_FLUSH is the explicit protocol reset
-             * for this state; issue it before reporting BUSY so a subsequent
-             * transfer can recover without an MCU reset. */
-            int flush_ret = m5io_hub_spi_flush(ms->hub);
-            dev_err_ratelimited(ms->hub->dev,
-                                "SPI CONFIG still BUSY after %u attempts: flush=%d\n",
-                                M5IO_SPI_CFG_BUSY_TRIES, flush_ret);
-        }
-        return req.status == 4 ? -EBUSY :
-               (req.status == 3 ? -EINVAL : -EIO);
-    }
-    if (req.reply_len)
-        return -EPROTO;
-    ms->configured = true;
-    return 0;
-}
-
-static int m5io_hub_spi_exchange(struct m5io_hub_spi *ms, unsigned int len,
-                                  unsigned int bits)
-{
-    if (!ms->configured)
-        return -EPIPE;
-    /* Every SPI transfer is a DATA frame on CH=3, including short transfers.
-     * The legacy FULL_DUPLEX TOKEN (ARG=2) is intentionally gone. */
-    return m5io_hub_send_spi_sync(ms->hub, ms->tx, ms->rx, len, bits);
-}
-
-static int m5io_hub_spi_disable(struct m5io_hub_spi *ms)
-{
-    struct m5io_hub_request req = {
-        .func = M5IO_HUB_FUNC_SPI,
-        .arg = M5IO_SPI_DISABLE,
-    };
-    int ret;
-
-    if (!ms->configured)
-        return 0;
-    ret = m5io_hub_exec(ms->hub, &req);
-    if (!ret && req.status == 0)
-        ms->configured = false;
-    return ret;
-}
-
-static void m5io_hub_spi_pack(u8 *dst, const struct spi_transfer *t)
-{
-    const u8 *src = t->tx_buf;
-    unsigned int i;
-
-    /* Linux SPI specifies zeroes on MOSI for an RX-only transfer. */
-    if (!src)
-        memset(dst, 0, t->len);
-    else if (t->bits_per_word == 8)
-        memcpy(dst, src, t->len);
-    else
-        for (i = 0; i < t->len; i += 2)
-            put_unaligned_be16(get_unaligned((const u16 *)(src + i)), dst + i);
-}
-
-static void m5io_hub_spi_unpack(struct spi_transfer *t, const u8 *src)
-{
-    u8 *dst = t->rx_buf;
-    unsigned int i;
-
-    if (!dst)
-        return;
-    if (t->bits_per_word == 8)
-        memcpy(dst, src, t->len);
-    else
-        for (i = 0; i < t->len; i += 2)
-            put_unaligned(get_unaligned_be16(src + i), (u16 *)(dst + i));
+  if (spi_get_chipselect(spi, 0))
+    return -EINVAL;
+  if (spi->mode & ~(SPI_CPOL | SPI_CPHA))
+    return -EINVAL;
+  if (spi->bits_per_word != 8 && spi->bits_per_word != 16)
+    return -EINVAL;
+  if (spi->max_speed_hz < M5IO_SPI_MIN_HZ)
+    return -EINVAL;
+  if (spi->word_delay.value || spi->cs_setup.value || spi->cs_hold.value ||
+      spi->cs_inactive.value)
+    return -EOPNOTSUPP;
+  return 0;
 }
 
 static int m5io_hub_spi_transfer_message(struct spi_controller *ctlr,
                                         struct spi_message *msg)
 {
-    struct m5io_hub_spi *ms = spi_controller_get_devdata(ctlr);
-    struct spi_transfer *t, *first, *rx;
-    unsigned int len = 0, offset;
-    int ret;
+  struct m5io_hub_spi *ms = spi_controller_get_devdata(ctlr);
+  int ret, flush_ret;
 
-    msg->actual_length = 0;
-    ret = m5io_hub_spi_validate(msg);
-    if (ret)
-        goto done;
-    first = list_first_entry(&msg->transfers, struct spi_transfer, transfer_list);
-    list_for_each_entry(t, &msg->transfers, transfer_list) {
-        m5io_hub_spi_pack(ms->tx + len, t);
-        len += t->len;
-        if (!t->cs_change && !list_is_last(&t->transfer_list, &msg->transfers))
-            continue;
-        /* Reconfigure each CS group, so MCU resets cannot stale a cache. */
-        ret = m5io_hub_spi_configure(ms, msg->spi, first);
-        if (ret)
-            break;
-        ret = m5io_hub_spi_exchange(ms, len, first->bits_per_word);
-        if (ret)
-            break;
-        offset = 0;
-        rx = first;
-        for (;;) {
-            m5io_hub_spi_unpack(rx, ms->rx + offset);
-            offset += rx->len;
-            if (rx == t)
-                break;
-            rx = list_next_entry(rx, transfer_list);
-        }
-        msg->actual_length += len;
-        len = 0;
-        if (t->cs_change) {
-            spi_transfer_cs_change_delay_exec(msg, t);
-            first = list_next_entry(t, transfer_list);
-        }
-    }
-done:
+  msg->actual_length = 0;
+  ret = m5io_hub_spi_transfer(ms->hub, ms->bus, msg);
+  if (ret < 0 && !msg->status)
     msg->status = ret;
-    spi_finalize_current_message(ctlr);
+
+  /*
+   * API 约定：BEGIN 时 MCU 还持有上一笔未收尾的交换会回 -EBUSY。
+   * SPI_FLUSH 是协议里唯一能解掉该状态的命令（不发它就只能等 MCU 复位），
+   * 这里清一次并把原始错误交给上层；不自动重发，避免对可能已经部分
+   * 上线的 MOSI 造成二次副作用。
+   */
+  if (ret == -EBUSY) {
+    flush_ret = m5io_hub_spi_flush(ms->hub, ms->bus);
+    dev_err_ratelimited(&ctlr->dev,
+                        "SPI bus %u transfer is BUSY, flush returned %d\n",
+                        ms->bus, flush_ret);
+  }
+
+  spi_finalize_current_message(ctlr);
+  return 0;
+}
+
+/*
+ * 总线编号：新协议支持 bus 0..3，一路总线一个控制器节点。DT 里显式写
+ * m5stack,spi-bus（或节点 reg）时用它，否则按板级现状默认 bus 0 —— 这样
+ * 不加新属性也能继续用现有的单总线 overlay。
+ */
+static int m5io_hub_spi_of_bus(struct platform_device *pdev, u8 *bus)
+{
+  struct device_node *np = pdev->dev.of_node;
+  u32 value;
+  int ret;
+
+  *bus = 0;
+  if (!np)
     return 0;
+
+  ret = of_property_read_u32(np, "m5stack,spi-bus", &value);
+  if (ret == -EINVAL || ret == -ENODATA)
+    ret = of_property_read_u32(np, "reg", &value);
+  if (ret == -EINVAL || ret == -ENODATA)
+    return 0;
+  if (ret)
+    return ret;
+  if (value >= M5IO_SPI_BUS_COUNT)
+    return -EINVAL;
+
+  *bus = (u8)value;
+  return 0;
 }
 
 static int m5io_hub_spi_probe(struct platform_device *pdev)
 {
-    struct m5io_hub *hub = dev_get_drvdata(pdev->dev.parent);
-    struct spi_controller *ctlr;
-    struct m5io_hub_spi *ms;
+  struct device *dev = &pdev->dev;
+  struct m5io_hub_spi *ms;
+  struct spi_controller *ctlr;
+  struct m5io_hub *hub;
+  u8 bus;
+  int ret;
 
-    if (!hub)
-        return -ENODEV;
-    ctlr = devm_spi_alloc_host(&pdev->dev, sizeof(*ms));
-    if (!ctlr)
-        return -ENOMEM;
-    ms = spi_controller_get_devdata(ctlr);
-    ms->hub = hub;
-    ctlr->dev.of_node = pdev->dev.of_node;
-    ctlr->bus_num = -1;
-    ctlr->num_chipselect = 1;
-    ctlr->mode_bits = SPI_CPOL | SPI_CPHA;
-    ctlr->bits_per_word_mask = SPI_BPW_MASK(8) | SPI_BPW_MASK(16);
-    ctlr->min_speed_hz = M5IO_SPI_MIN_HZ;
-    ctlr->max_speed_hz = M5IO_SPI_MAX_HZ;
-    ctlr->setup = m5io_hub_spi_setup;
-    ctlr->max_transfer_size = m5io_hub_spi_max_transfer_size;
-    ctlr->transfer_one_message = m5io_hub_spi_transfer_message;
-    platform_set_drvdata(pdev, ctlr);
-    return devm_spi_register_controller(&pdev->dev, ctlr);
+  /* struct m5io_hub 是不透明句柄：父设备没挂 drvdata 就说明 core 还没起。 */
+  hub = dev_get_drvdata(dev->parent);
+  if (!hub)
+    return -EPROBE_DEFER;
+
+  ret = m5io_hub_spi_of_bus(pdev, &bus);
+  if (ret)
+    return dev_err_probe(dev, ret, "invalid SPI bus index\n");
+
+  ctlr = devm_spi_alloc_host(dev, sizeof(*ms));
+  if (!ctlr)
+    return -ENOMEM;
+  ms = spi_controller_get_devdata(ctlr);
+  ms->hub = hub;
+  ms->bus = bus;
+
+  ctlr->dev.of_node = dev->of_node;
+  ctlr->bus_num = -1;
+  ctlr->num_chipselect = 1;
+  ctlr->mode_bits = SPI_CPOL | SPI_CPHA;
+  ctlr->bits_per_word_mask = SPI_BPW_MASK(8) | SPI_BPW_MASK(16);
+  ctlr->min_speed_hz = M5IO_SPI_MIN_HZ;
+  ctlr->max_speed_hz = M5IO_SPI_MAX_HZ;
+  ctlr->max_transfer_size = m5io_hub_spi_max_transfer_size;
+  ctlr->setup = m5io_hub_spi_setup;
+  ctlr->transfer_one_message = m5io_hub_spi_transfer_message;
+
+  platform_set_drvdata(pdev, ctlr);
+  ret = devm_spi_register_controller(dev, ctlr);
+  if (ret)
+    return dev_err_probe(dev, ret, "failed to register SPI controller\n");
+
+  dev_info(dev, "M5IO-HUB SPI bus %u registered as spi%u\n", bus,
+           ctlr->bus_num);
+  return 0;
 }
 
 static void m5io_hub_spi_remove(struct platform_device *pdev)
 {
-    struct spi_controller *ctlr = platform_get_drvdata(pdev);
-    struct m5io_hub_spi *ms;
+  struct spi_controller *ctlr = platform_get_drvdata(pdev);
+  struct m5io_hub_spi *ms;
+  int ret;
 
-    if (!ctlr)
-        return;
-    ms = spi_controller_get_devdata(ctlr);
-    (void)m5io_hub_spi_disable(ms);
+  if (!ctlr)
+    return;
+  ms = spi_controller_get_devdata(ctlr);
+  /* 旧 DISABLE：释放 MCU 侧总线状态，避免模块重载后仍留着旧配置。 */
+  ret = m5io_hub_spi_reset(ms->hub, ms->bus);
+  if (ret)
+    dev_warn(&pdev->dev, "failed to disable SPI bus %u: %d\n", ms->bus, ret);
 }
 
 static const struct of_device_id m5io_hub_spi_of_match[] = {
-    { .compatible = "m5stack,m5io-hub-spi" },
-    { }
+    {.compatible = "m5stack,m5io-hub-spi"},
+    {},
 };
 MODULE_DEVICE_TABLE(of, m5io_hub_spi_of_match);
 
 static struct platform_driver m5io_hub_spi_driver = {
-    .driver = {
-        .name = "m5io-hub-spi",
-        .of_match_table = m5io_hub_spi_of_match,
-    },
+    .driver =
+        {
+            .name = "m5io-hub-spi",
+            .of_match_table = m5io_hub_spi_of_match,
+        },
     .probe = m5io_hub_spi_probe,
     .remove = m5io_hub_spi_remove,
 };
