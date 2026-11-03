@@ -10,32 +10,39 @@
  *   3) 操作队列层：token_queue / data_queue 两个先进先出队列。每个对外 API
  *      调用在这里被序列化成“一个 token 操作”或“一个 data 逻辑消息操作”，
  *      入队后阻塞等待完成（带超时）。
- *   4) 收发状态机层（下一步实现）：从两个队列取操作，负责 TID/PID 窗口、
- *      SPI 收发、WINDOW_ACK、重试与超时，并把结果写回操作项、唤醒调用者。
- *      本文件已经提供队列 pop 与 complete 接口，状态机直接接上即可。
+ *   4) 收发状态机层：io_work / HOST_READY 线程从两个队列取操作，负责 TID
+ *      分配与应答匹配、每通道 PID 在飞窗口、逐帧 WINDOW_ACK、引导帧解析、
+ *      超时与 TID quarantine；有中断时由 HOST_READY 驱动读事务，没有中断
+ *      时用 poll_work 轮询。
  *
  * 调用约定：本文件导出的所有 m5io_hub_* API 都可能睡眠（mutex、
  * kzalloc(GFP_KERNEL)、wait_for_completion），必须在可睡眠的进程上下文调用。
  * uart_ops.stop_tx/start_tx/tx_empty 这类可能持有 port->lock 或处于原子上下文的
  * 回调不能直接调这些 API，需由子驱动用 workqueue 中转后转发。
  *
- * 注意：状态机尚未接入时，所有会入队的 API 都会等满各自超时后返回
- * -ETIMEDOUT；这是当前开发阶段的预期行为。
+ * 注意：本机还没有对应的 MCU 固件时，所有会入队的 API 仍会等满各自超时后
+ * 返回 -ETIMEDOUT；有固件后由状态机正常完成。
  */
 
 #include <linux/atomic.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/i2c.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/kernel.h>
 #include <linux/jiffies.h>
 #include <linux/list.h>
+#include <linux/log2.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_irq.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/sched.h>
@@ -75,6 +82,16 @@
 #define M5IO_HUB_TOKEN_TIMEOUT_MS 2000U
 #define M5IO_HUB_DATA_TIMEOUT_MS  30000U
 
+/* SPI 收发状态机 */
+#define M5IO_HUB_IO_BUF_SIZE        512U
+#define M5IO_HUB_IO_READ_MIN        8U   /* 读事务最小/对齐粒度 */
+#define M5IO_HUB_IO_MAX_XFERS       512U
+#define M5IO_HUB_IO_MAX_BYTES       (64U * 1024U)
+#define M5IO_HUB_TID_QUARANTINE_MS  2000U
+#define M5IO_HUB_SM_TIMEOUT_MS      100U /* 超时检查周期 */
+#define M5IO_HUB_SM_POLL_MS         20U  /* 无 HOST_READY 中断时的轮询周期 */
+#define M5IO_HUB_RX_STREAM_MAX      M5IO_HUB_DATA_FRAME_MAX
+
 /* 分区号 -> DATA 通道号（见 m5io-hub-api.h 的通道分配）。 */
 #define M5IO_HUB_I2C_CHN(bus) ((u8)(bus))
 #define M5IO_HUB_SPI_CHN(bus) ((u8)(M5IO_HUB_SPI_CH1 + (bus)))
@@ -88,7 +105,7 @@ struct m5io_hub_data_frame_desc {
   u8 payload_len;  /* 该帧 payload 长度，状态机 set_pid() 改 CRC 时用 */
 };
 
-/* 一个 TOKEN 操作：一个已序列化、可直接上线的帧。 */
+/* 一个 TOKEN 操作：入队时只保存请求；TID 和最终帧由状态机分配/序列化。 */
 struct m5io_hub_token_op {
   struct list_head node;
   u8 frame[M5IO_HUB_TOKEN_FRAME_MAX];
@@ -96,11 +113,32 @@ struct m5io_hub_token_op {
   u8 tid;
   u8 func;
   u8 arg;
+  u8 payload[M5IO_HUB_TOKEN_PAYLOAD_MAX];
+  u8 payload_len;
   u8 reply_cap; /* 期望的应答 payload 上限，0 表示只关心 status */
   u8 reply[M5IO_HUB_TOKEN_PAYLOAD_MAX];
   u8 reply_len;
+  unsigned int timeout_ms;
+  unsigned long deadline; /* 入队时间 + timeout，队列里也要能超时 */
   int status; /* 状态机写回：0 成功，负 errno */
   struct completion done;
+};
+
+/* 状态机用的 WINDOW_ACK 帧（只需要一次性发送，不需要 completion）。 */
+struct m5io_hub_ack_frame {
+  struct list_head node;
+  u8 frame[M5IO_HUB_TOKEN_FRAME_MAX];
+  u8 len;
+};
+
+/* 每个方向、每个通道同时只有一个在飞 DATA 窗口。 */
+struct m5io_hub_data_window {
+  struct m5io_hub_data_op *op;
+  u8 pid;
+  u8 next_frame;
+  bool awaiting_ack;
+  bool tx_ack_ok;
+  unsigned long deadline;
 };
 
 /* 一个 DATA 操作：一条逻辑消息，含 1..N 个已序列化 DATA 帧（CH/SEQ/STA 已定）。
@@ -116,6 +154,9 @@ struct m5io_hub_data_op {
   u16 rx_cap;
   u16 rx_len;
   u8 rx[M5IO_HUB_DATA_OP_MAX_BYTES];
+  bool rx_done; /* 状态机写回：应答数据已收齐 */
+  unsigned int timeout_ms;
+  unsigned long deadline; /* 入队时间 + timeout */
   int status; /* 状态机写回：0 成功，负 errno */
   struct completion done;
 };
@@ -153,6 +194,35 @@ struct m5io_hub {
   m5io_hub_gpio_irq_handler_t gpio_irq_handler[M5IO_HUB_NGPIO];
   void *gpio_irq_data[M5IO_HUB_NGPIO];
 
+  /* SPI 收发状态机 */
+  struct mutex spi_lock; /* 串行化所有 SPI 事务（状态机与 OTA 共用） */
+  struct work_struct io_work;
+  struct delayed_work timeout_work;
+  struct delayed_work poll_work;
+  bool poll_enabled;
+  bool sm_ready;
+  bool removing;
+  atomic_t host_ready;
+  u8 *io_tx_buf;
+  u8 *io_rx_buf;
+  unsigned int io_last_bytes;
+  struct list_head ack_queue;
+  unsigned int ack_count;
+  u16 ack_op_id;
+  struct {
+    struct m5io_hub_token_op *op;
+    unsigned long deadline;
+  } token_slot[M5IO_HUB_TID_NR];
+  unsigned long tid_quarantine_until[M5IO_HUB_TID_NR];
+  struct m5io_hub_data_window data_win[M5IO_HUB_CHN_MAX + 1];
+  u8 data_pid[M5IO_HUB_CHN_MAX + 1];
+  /* MISO 上行流解析：帧可以跨事务，rx_stream 保存半帧 */
+  u8 rx_stream[M5IO_HUB_RX_STREAM_MAX];
+  u16 rx_stream_len;
+  u8 guide_seq;
+  bool guide_seq_valid;
+  u16 chn_rx_remaining[M5IO_HUB_CHN_MAX + 1];
+
   /* OTA / 维护态：持有期间其它 API 一律 -EBUSY */
   struct mutex ota_lock;
   bool ota_active;
@@ -166,6 +236,10 @@ struct m5io_hub {
 /* =====================================================================
  * 帧序列化与 CRC-8/ATM
  * ===================================================================== */
+
+static void m5io_hub_kick_io(struct m5io_hub *hub);
+static void m5io_hub_sm_abort(struct m5io_hub *hub, int error);
+static void m5io_hub_sm_abort_channel(struct m5io_hub *hub, u8 chn, int error);
 
 static u8 m5io_hub_crc8(const u8 *data, unsigned int len)
 {
@@ -181,17 +255,25 @@ static u8 m5io_hub_crc8(const u8 *data, unsigned int len)
   return crc;
 }
 
-static unsigned int m5io_hub_token_frame_build(u8 *frame, u8 tid, u8 func,
-                                               u8 arg, const u8 *payload,
-                                               u8 len)
+static unsigned int m5io_hub_token_frame_build_ex(u8 *frame, u8 tid, u8 func,
+                                                  u8 arg, const u8 *payload,
+                                                  u8 len, bool request)
 {
-  frame[0] = M5IO_HUB_TYPE_TOKEN | M5IO_HUB_TOKEN_P_BIT |
+  frame[0] = M5IO_HUB_TYPE_TOKEN | (request ? M5IO_HUB_TOKEN_P_BIT : 0) |
              ((tid & 0x3U) << 2) | ((func & 0xfU) << 4);
   frame[1] = (len & 0xfU) | ((arg & 0xfU) << 4);
   if (len && payload)
     memcpy(&frame[2], payload, len);
   frame[2 + len] = m5io_hub_crc8(frame, 2 + len);
   return 3 + len;
+}
+
+static unsigned int m5io_hub_token_frame_build(u8 *frame, u8 tid, u8 func,
+                                               u8 arg, const u8 *payload,
+                                               u8 len)
+{
+  return m5io_hub_token_frame_build_ex(frame, tid, func, arg, payload, len,
+                                       true);
 }
 
 static unsigned int m5io_hub_data_frame_build(u8 *frame, u8 chn, u8 seq,
@@ -218,7 +300,7 @@ static inline void m5io_hub_data_frame_set_pid(u8 *frame, u8 payload_len,
 
 /* 协议 status -> errno（api.h：0=OK 1=INPROGRESS 2=EOPNOTSUPP 3=EINVAL
  * 4=BUSY 7=EIO，其余=EPROTO）。 */
-static __maybe_unused int m5io_hub_status_to_errno(u8 status)
+static int m5io_hub_status_to_errno(u8 status)
 {
   switch (status) {
   case 0:
@@ -241,42 +323,6 @@ static __maybe_unused int m5io_hub_status_to_errno(u8 status)
 /* =====================================================================
  * TOKEN TID 池
  * ===================================================================== */
-
-static int m5io_hub_tid_alloc(struct m5io_hub *hub, unsigned int timeout_ms)
-{
-  unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
-
-  for (;;) {
-    int tid;
-
-    mutex_lock(&hub->tid_lock);
-    tid = find_first_zero_bit(&hub->tid_busy, M5IO_HUB_TID_NR);
-    if (tid < (int)M5IO_HUB_TID_NR) {
-      set_bit(tid, &hub->tid_busy);
-      mutex_unlock(&hub->tid_lock);
-      return tid;
-    }
-    mutex_unlock(&hub->tid_lock);
-
-    if (time_after_eq(jiffies, deadline))
-      return -EBUSY;
-    wait_event_timeout(hub->tid_wait,
-                       find_first_zero_bit(&hub->tid_busy,
-                                           M5IO_HUB_TID_NR) <
-                           M5IO_HUB_TID_NR,
-                       msecs_to_jiffies(50));
-  }
-}
-
-static void m5io_hub_tid_free(struct m5io_hub *hub, int tid)
-{
-  if (tid < 0 || tid >= (int)M5IO_HUB_TID_NR)
-    return;
-  mutex_lock(&hub->tid_lock);
-  clear_bit(tid, &hub->tid_busy);
-  mutex_unlock(&hub->tid_lock);
-  wake_up(&hub->tid_wait);
-}
 
 /* =====================================================================
  * 操作队列层
@@ -313,7 +359,8 @@ static bool m5io_hub_data_op_cancel(struct m5io_hub *hub,
   return removed;
 }
 
-/* 提交一个 TOKEN 操作并等待完成。payload/reply 均可为 NULL。 */
+/* 提交一个 TOKEN 操作并等待完成。payload/reply 均可为 NULL。
+ * TID 分配与帧序列化由 SPI 收发状态机在发送前完成。 */
 static int m5io_hub_token_submit(struct m5io_hub *hub, u8 func, u8 arg,
                                  const u8 *payload, u8 len, u8 reply_cap,
                                  u8 *reply, u8 *reply_len,
@@ -321,7 +368,6 @@ static int m5io_hub_token_submit(struct m5io_hub *hub, u8 func, u8 arg,
 {
   struct m5io_hub_token_op *op;
   unsigned long wait;
-  int tid;
   int ret;
 
   if (!hub || !hub->spi)
@@ -331,37 +377,32 @@ static int m5io_hub_token_submit(struct m5io_hub *hub, u8 func, u8 arg,
   if (reply_len)
     *reply_len = 0;
 
-  tid = m5io_hub_tid_alloc(hub, timeout_ms);
-  if (tid < 0)
-    return tid;
-
   op = kzalloc(sizeof(*op), GFP_KERNEL);
-  if (!op) {
-    m5io_hub_tid_free(hub, tid);
+  if (!op)
     return -ENOMEM;
-  }
   init_completion(&op->done);
   INIT_LIST_HEAD(&op->node);
-  op->tid = (u8)tid;
   op->func = func;
   op->arg = arg;
+  op->payload_len = len;
+  if (len)
+    memcpy(op->payload, payload, len);
   op->reply_cap = min_t(u8, reply_cap, M5IO_HUB_TOKEN_PAYLOAD_MAX);
-  op->frame_len =
-      (u8)m5io_hub_token_frame_build(op->frame, (u8)tid, func, arg, payload,
-                                     len);
+  op->timeout_ms = timeout_ms;
+  op->deadline = jiffies + msecs_to_jiffies(timeout_ms);
 
   mutex_lock(&hub->token_lock);
   list_add_tail(&op->node, &hub->token_queue);
   hub->token_count++;
   mutex_unlock(&hub->token_lock);
   wake_up(&hub->token_wait);
+  m5io_hub_kick_io(hub);
 
   wait = wait_for_completion_timeout(&op->done,
                                      msecs_to_jiffies(timeout_ms));
   if (!wait) {
     if (m5io_hub_token_op_cancel(hub, op)) {
       /* 状态机还没取走：直接回收。 */
-      m5io_hub_tid_free(hub, tid);
       kfree(op);
       return -ETIMEDOUT;
     }
@@ -379,7 +420,6 @@ static int m5io_hub_token_submit(struct m5io_hub *hub, u8 func, u8 arg,
       *reply_len = copy_len;
   }
 
-  m5io_hub_tid_free(hub, tid);
   kfree(op);
   return ret;
 }
@@ -415,6 +455,8 @@ static int m5io_hub_data_submit(struct m5io_hub *hub, u8 chn,
   INIT_LIST_HEAD(&op->node);
   op->chn = chn;
   op->rx_cap = min_t(u16, rx_cap, sizeof(op->rx));
+  op->timeout_ms = timeout_ms;
+  op->deadline = jiffies + msecs_to_jiffies(timeout_ms);
 
   mutex_lock(&hub->data_lock);
   op->frame_count = (u8)frame_count;
@@ -445,6 +487,7 @@ static int m5io_hub_data_submit(struct m5io_hub *hub, u8 chn,
   hub->data_count++;
   mutex_unlock(&hub->data_lock);
   wake_up(&hub->data_wait);
+  m5io_hub_kick_io(hub);
 
   wait = wait_for_completion_timeout(&op->done,
                                      msecs_to_jiffies(timeout_ms));
@@ -590,6 +633,946 @@ static void m5io_hub_queues_abort(struct m5io_hub *hub, int error)
     list_del_init(&dop->node);
     m5io_hub_data_op_complete(dop, error, NULL, 0);
   }
+
+  /* 状态机手里（已 pop 出队）的操作也要收尾，否则调用者永远等不到完成。 */
+  m5io_hub_sm_abort(hub, error);
+}
+
+/* =====================================================================
+ * SPI 收发状态机
+ *
+ * 事务模型（与 MCU 固件约定，见 m5io-hub-api.h 的协议简述）：
+ *   - 主机每次 CS 事务只发一个帧；没有待发帧时发 8 字节对齐的 0xff dummy
+ *     做读取事务。MISO 上的帧允许跨事务，rx_stream 保存半帧。
+ *   - 帧边界上的 0xff 是空位填充；读到没有新帧、没有半帧、且 TX 也清空时，
+ *     本次逻辑事务结束。
+ *   - MCU 有待读数据时拉 HOST_READY 中断；没有中断时用 poll_work 轮询。
+ *
+ * TX 调度优先级：WINDOW_ACK > DATA 帧 > TOKEN 请求。
+ *   - TOKEN：最多 4 个并发 TID；超时后 TID 进入 quarantine，等迟到的应答
+ *     或 2 s 后回收。
+ *   - DATA：每通道一个在飞窗口；逐帧发送，等 MCU 的 WINDOW_ACK 后再发下一
+ *     帧；最后收到 kind=COMPLETE 且（无应答数据或应答数据已收齐）才完成。
+ * RX：
+ *   - TOKEN 应答按 TID 匹配；FUNC=PROTOCOL/ARG=dataAck 是 MCU 对主机 DATA
+ *     的确认；FUNC=GPIO/ARG=interruptEvent 是上行中断事件。
+ *   - DATA：STA=1 是引导帧（2 B 包计数、独立 SEQ，重复 SEQ 视为环形缓冲区
+ *     回绕而忽略）；STA=2 是消息末帧；MCU->SoC 的每一帧都要回 WINDOW_ACK。
+ *   - 匹配在飞 data op 的应答帧（同 CH/PID）拼进 op->rx，其余交给通道回调。
+ * ===================================================================== */
+
+struct m5io_hub_token_expect {
+  u8 func;
+  u8 arg;
+  u8 reply_len;
+  bool fixed_arg; /* 应答的 ARG 回填子命令、状态在 payload[0] */
+};
+
+static const struct m5io_hub_token_expect m5io_hub_token_expects[] = {
+    /* 协议控制 */
+    {M5IO_HUB_PROTOCOL_FUN, M5IO_HUB_PROTOCOL_hello, 15, false},
+    {M5IO_HUB_PROTOCOL_FUN, M5IO_HUB_PROTOCOL_mcuReset, 0, false},
+    {M5IO_HUB_PROTOCOL_FUN, M5IO_HUB_PROTOCOL_dataStatus, 15, false},
+    /* GPIO（全部 TOKEN） */
+    {M5IO_HUB_GPIO_FUN, M5IO_HUB_GPIO_pinMode, 0, false},
+    {M5IO_HUB_GPIO_FUN, M5IO_HUB_GPIO_digitalWrite, 0, false},
+    {M5IO_HUB_GPIO_FUN, M5IO_HUB_GPIO_digitalRead, 1, false},
+    {M5IO_HUB_GPIO_FUN, M5IO_HUB_GPIO_attachInterrupt, 0, false},
+    {M5IO_HUB_GPIO_FUN, M5IO_HUB_GPIO_detachInterrupt, 0, false},
+    /* funMode 是固定长度应答：ARG 回填 6，状态在 payload[0]。 */
+    {M5IO_HUB_GPIO_FUN, M5IO_HUB_GPIO_funMode, 3, true},
+    /* I2C */
+    {M5IO_HUB_IIC_FUN, M5IO_HUB_I2C_config, 0, false},
+    {M5IO_HUB_IIC_FUN, M5IO_HUB_I2C_reset, 0, false},
+    /* SPI */
+    {M5IO_HUB_SPI_FUN, M5IO_HUB_SPI_config, 0, false},
+    {M5IO_HUB_SPI_FUN, M5IO_HUB_SPI_begin, 0, false},
+    {M5IO_HUB_SPI_FUN, M5IO_HUB_SPI_end, 0, false},
+    {M5IO_HUB_SPI_FUN, M5IO_HUB_SPI_begin_txonly, 0, false},
+    {M5IO_HUB_SPI_FUN, M5IO_HUB_SPI_reset, 0, false},
+    /* flush 是固定长度应答：ARG 回填 8，状态在 payload[0]。 */
+    {M5IO_HUB_SPI_FUN, M5IO_HUB_SPI_flush, 4, true},
+    /* UART */
+    {M5IO_HUB_UART_FUN, M5IO_HUB_UART_config, 10, false},
+    {M5IO_HUB_UART_FUN, M5IO_HUB_UART_is_tx_empty, 1, false},
+    {M5IO_HUB_UART_FUN, M5IO_HUB_UART_stop_tx, 0, false},
+    {M5IO_HUB_UART_FUN, M5IO_HUB_UART_start_tx, 0, false},
+    {M5IO_HUB_UART_FUN, M5IO_HUB_UART_stop_rx, 0, false},
+    {M5IO_HUB_UART_FUN, M5IO_HUB_UART_reset, 0, false},
+    /* PWM / 背光 */
+    {M5IO_HUB_PWM_FUN, M5IO_HUB_PWM_config, 2, false},
+    {M5IO_HUB_PWM_FUN, M5IO_HUB_PWM_set, 0, false},
+    /* IR */
+    {M5IO_HUB_IR_FUN, M5IO_HUB_IR_config, 15, false},
+    {M5IO_HUB_IR_FUN, M5IO_HUB_IR_receive, 0, false},
+    {M5IO_HUB_IR_FUN, M5IO_HUB_IR_reset, 0, false},
+};
+
+static const struct m5io_hub_token_expect *
+m5io_hub_token_expect_lookup(u8 func, u8 arg) {
+  unsigned int i;
+
+  for (i = 0; i < ARRAY_SIZE(m5io_hub_token_expects); i++) {
+    if (m5io_hub_token_expects[i].func == func &&
+        m5io_hub_token_expects[i].arg == arg)
+      return &m5io_hub_token_expects[i];
+  }
+  return NULL;
+}
+
+/* ---- TOKEN TID 池（非阻塞；quarantine 期间 busy 位保持置位） ---- */
+
+static int m5io_hub_tid_try_alloc(struct m5io_hub *hub) {
+  int tid;
+
+  mutex_lock(&hub->tid_lock);
+  tid = find_first_zero_bit(&hub->tid_busy, M5IO_HUB_TID_NR);
+  if (tid < (int)M5IO_HUB_TID_NR)
+    set_bit(tid, &hub->tid_busy);
+  mutex_unlock(&hub->tid_lock);
+  return tid < (int)M5IO_HUB_TID_NR ? tid : -EBUSY;
+}
+
+static void m5io_hub_tid_release(struct m5io_hub *hub, int tid) {
+  if (tid < 0 || tid >= (int)M5IO_HUB_TID_NR)
+    return;
+  mutex_lock(&hub->tid_lock);
+  clear_bit(tid, &hub->tid_busy);
+  hub->tid_quarantine_until[tid] = 0;
+  mutex_unlock(&hub->tid_lock);
+}
+
+static void m5io_hub_tid_quarantine(struct m5io_hub *hub, int tid) {
+  if (tid < 0 || tid >= (int)M5IO_HUB_TID_NR)
+    return;
+  mutex_lock(&hub->tid_lock);
+  hub->tid_quarantine_until[tid] =
+      jiffies + msecs_to_jiffies(M5IO_HUB_TID_QUARANTINE_MS);
+  mutex_unlock(&hub->tid_lock);
+}
+
+/* ---- DATA 窗口 ---- */
+
+static void m5io_hub_data_win_free(struct m5io_hub_data_window *win) {
+  win->op = NULL;
+  win->next_frame = 0;
+  win->awaiting_ack = false;
+  win->tx_ack_ok = false;
+  win->deadline = 0;
+}
+
+static void m5io_hub_data_win_complete(struct m5io_hub *hub,
+                                       struct m5io_hub_data_window *win,
+                                       int status) {
+  struct m5io_hub_data_op *op = win->op;
+
+  if (!op)
+    return;
+  m5io_hub_data_win_free(win);
+  op->status = status;
+  complete(&op->done);
+}
+
+static void m5io_hub_data_win_try_complete(struct m5io_hub_data_window *win) {
+  struct m5io_hub_data_op *op = win->op;
+
+  if (!op || !win->tx_ack_ok)
+    return;
+  if (op->rx_cap && !op->rx_done)
+    return;
+  m5io_hub_data_win_complete(NULL, win, 0);
+}
+
+/* ---- 上行 WINDOW_ACK 队列（只在 spi_lock 下访问） ---- */
+
+static void m5io_hub_ack_enqueue(struct m5io_hub *hub, u8 chn, u8 pid, u8 kind,
+                                 u8 status) {
+  struct m5io_hub_ack_frame *ack;
+  u8 payload[6];
+
+  ack = kzalloc(sizeof(*ack), GFP_KERNEL);
+  if (!ack) {
+    dev_warn_ratelimited(hub->dev, "no memory for WINDOW_ACK\n");
+    return;
+  }
+
+  hub->ack_op_id++;
+  if (!hub->ack_op_id)
+    hub->ack_op_id = 1;
+  payload[0] = chn;
+  payload[1] = pid;
+  payload[2] = (u8)(hub->ack_op_id & 0xffU);
+  payload[3] = (u8)(hub->ack_op_id >> 8);
+  payload[4] = kind;
+  payload[5] = status;
+  ack->len =
+      (u8)m5io_hub_token_frame_build_ex(ack->frame, 0, M5IO_HUB_PROTOCOL_FUN,
+                                        M5IO_HUB_PROTOCOL_dataAck, payload,
+                                        sizeof(payload), false);
+  list_add_tail(&ack->node, &hub->ack_queue);
+  hub->ack_count++;
+}
+
+/* ---- 上行事件分发 ---- */
+
+static void m5io_hub_rx_gpio_event(struct m5io_hub *hub, u8 pin) {
+  m5io_hub_gpio_irq_handler_t handler = NULL;
+  void *priv = NULL;
+
+  if (pin >= M5IO_HUB_NGPIO)
+    return;
+  mutex_lock(&hub->gpio_irq_lock);
+  handler = hub->gpio_irq_handler[pin];
+  priv = hub->gpio_irq_data[pin];
+  mutex_unlock(&hub->gpio_irq_lock);
+
+  /* gpio.c 的回调内部用 handle_nested_irq()，内核允许在线程上下文执行。 */
+  if (handler)
+    handler(priv, pin);
+}
+
+static void m5io_hub_rx_chn_data(struct m5io_hub *hub, u8 chn,
+                                 const u8 *payload, u8 len) {
+  m5io_hub_chn_data_handler_t handler;
+  void *priv;
+
+  if (chn == M5IO_HUB_CHN_MAX) {
+    /* LOG 通道：仅上行日志，不注册回调。 */
+    dev_dbg(hub->dev, "MCU log: %*ph\n", (int)len, payload);
+    return;
+  }
+
+  mutex_lock(&hub->chn_lock);
+  handler = hub->chn_handler[chn];
+  priv = hub->chn_handler_data[chn];
+  mutex_unlock(&hub->chn_lock);
+  if (handler)
+    handler(priv, payload, len);
+}
+
+/* ---- DATA 帧处理 ---- */
+
+/* MCU 对主机 data op 的应答数据：拼进 op->rx。 */
+static void m5io_hub_rx_response_data(struct m5io_hub_data_window *win,
+                                      const u8 *payload, u8 len, u8 sta) {
+  struct m5io_hub_data_op *op = win->op;
+  u16 room;
+  u16 copy;
+
+  if (!op)
+    return;
+  if (op->rx_len < op->rx_cap) {
+    room = op->rx_cap - op->rx_len;
+    copy = min_t(u16, room, len);
+    if (copy)
+      memcpy(&op->rx[op->rx_len], payload, copy);
+    op->rx_len += copy;
+  }
+  if (sta == M5IO_HUB_DATA_STA_END)
+    op->rx_done = true;
+  m5io_hub_data_win_try_complete(win);
+}
+
+static void m5io_hub_rx_guide(struct m5io_hub *hub, u8 chn, u8 pid, u8 seq,
+                              const u8 *payload, u8 len) {
+  u16 count = 0;
+
+  if (len >= M5IO_HUB_DATA_GUIDE_LEN)
+    count = (u16)(payload[0] | ((u16)payload[1] << 8));
+
+  if (hub->guide_seq_valid && hub->guide_seq == seq) {
+    /* 引导帧 SEQ 独立计数；重复说明已绕回 MCU 循环缓冲区头部，忽略计数。 */
+    m5io_hub_ack_enqueue(hub, chn, pid, 0, 0);
+    return;
+  }
+
+  hub->guide_seq = seq;
+  hub->guide_seq_valid = true;
+  hub->chn_rx_remaining[chn] = count;
+  m5io_hub_ack_enqueue(hub, chn, pid, 0, 0);
+}
+
+static void m5io_hub_rx_data_frame(struct m5io_hub *hub, const u8 *frame,
+                                   u16 frame_len) {
+  u8 b0 = frame[0];
+  u8 b1 = frame[1];
+  u8 chn = (u8)((b0 >> 3) & 0x1fU);
+  u8 pid = (u8)((b0 >> 1) & 0x3U);
+  u8 sta = (u8)((b1 >> M5IO_HUB_DATA_STA_SHIFT) & 0x3U);
+  const u8 *payload = &frame[3];
+  u8 len = frame[2];
+  struct m5io_hub_data_window *win;
+  u16 remaining;
+  bool final;
+
+  if (chn < 1 || chn > M5IO_HUB_CHN_MAX)
+    return;
+
+  if (sta == M5IO_HUB_DATA_STA_GUIDE) {
+    m5io_hub_rx_guide(hub, chn, pid, b1 & M5IO_HUB_DATA_SEQ_MASK, payload,
+                      len);
+    return;
+  }
+  if (sta == 3) /* 保留值 */
+    return;
+
+  win = &hub->data_win[chn];
+  if (win->op && win->pid == pid) {
+    m5io_hub_rx_response_data(win, payload, len, sta);
+    final = (sta == M5IO_HUB_DATA_STA_END);
+    m5io_hub_ack_enqueue(hub, chn, pid, final ? 1 : 0, 0);
+    return;
+  }
+
+  m5io_hub_rx_chn_data(hub, chn, payload, len);
+  remaining = hub->chn_rx_remaining[chn];
+  if (remaining) {
+    remaining--;
+    hub->chn_rx_remaining[chn] = remaining;
+  }
+  final = (sta == M5IO_HUB_DATA_STA_END) || (remaining == 0);
+  m5io_hub_ack_enqueue(hub, chn, pid, final ? 1 : 0, 0);
+}
+
+/* ---- TOKEN 帧处理 ---- */
+
+static void m5io_hub_rx_data_ack(struct m5io_hub *hub, const u8 *payload) {
+  u8 chn = payload[0];
+  u8 pid = payload[1];
+  u8 kind = payload[4];
+  u8 status = payload[5];
+  struct m5io_hub_data_window *win;
+
+  if (chn < 1 || chn > M5IO_HUB_CHN_MAX)
+    return;
+  win = &hub->data_win[chn];
+  if (!win->op || win->pid != pid)
+    return;
+
+  if (status) {
+    m5io_hub_data_win_complete(hub, win, m5io_hub_status_to_errno(status));
+    return;
+  }
+
+  win->awaiting_ack = false;
+  if (kind) { /* COMPLETE：本窗口/消息已确认 */
+    if (win->next_frame < win->op->frame_count) {
+      /* 还有帧没发出去，MCU 却宣称窗口完成：按协议错误收场。 */
+      m5io_hub_data_win_complete(hub, win, -EPROTO);
+      return;
+    }
+    win->tx_ack_ok = true;
+    m5io_hub_data_win_try_complete(win);
+  }
+}
+
+static void m5io_hub_rx_token_frame(struct m5io_hub *hub, const u8 *frame,
+                                    u16 frame_len) {
+  u8 b0 = frame[0];
+  u8 b1 = frame[1];
+  u8 tid = (u8)((b0 >> 2) & 0x3U);
+  u8 func = (u8)((b0 >> 4) & 0xfU);
+  u8 arg = (u8)((b1 >> 4) & 0xfU);
+  u8 len = (u8)(b1 & 0xfU);
+  const u8 *payload = &frame[2];
+  const struct m5io_hub_token_expect *expect;
+  struct m5io_hub_token_op *op;
+  int status;
+
+  if (frame_len != (u16)(3 + len))
+    return;
+
+  if (func == M5IO_HUB_PROTOCOL_FUN && arg == M5IO_HUB_PROTOCOL_dataAck) {
+    if (len == 6)
+      m5io_hub_rx_data_ack(hub, payload);
+    return;
+  }
+  if (func == M5IO_HUB_GPIO_FUN && arg == M5IO_HUB_GPIO_interruptEvent) {
+    if (len >= 1)
+      m5io_hub_rx_gpio_event(hub, payload[0]);
+    return;
+  }
+
+  if (!test_bit(tid, &hub->tid_busy))
+    return;
+
+  op = hub->token_slot[tid].op;
+  if (!op) {
+    /* 超时后被 quarantine 的 TID 收到迟到应答：回收它，不再匹配。 */
+    m5io_hub_tid_release(hub, tid);
+    return;
+  }
+  hub->token_slot[tid].op = NULL;
+  hub->token_slot[tid].deadline = 0;
+
+  if (func != op->func) {
+    status = -EPROTO;
+  } else {
+    expect = m5io_hub_token_expect_lookup(op->func, op->arg);
+    if (expect && expect->fixed_arg) {
+      if (arg != op->arg || !len)
+        status = -EPROTO;
+      else
+        status = m5io_hub_status_to_errno(payload[0]);
+    } else {
+      status = m5io_hub_status_to_errno(arg);
+    }
+    if (expect && expect->reply_len && len != expect->reply_len && !status)
+      status = -EPROTO;
+  }
+
+  op->status = status;
+  op->reply_len = min_t(u8, len, M5IO_HUB_TOKEN_PAYLOAD_MAX);
+  if (op->reply_len)
+    memcpy(op->reply, payload, op->reply_len);
+
+  m5io_hub_tid_release(hub, tid);
+  complete(&op->done);
+}
+
+static void m5io_hub_rx_frame_handle(struct m5io_hub *hub, const u8 *frame,
+                                     u16 frame_len) {
+  if (frame[0] & 1U)
+    m5io_hub_rx_data_frame(hub, frame, frame_len);
+  else
+    m5io_hub_rx_token_frame(hub, frame, frame_len);
+}
+
+/* ---- MISO 字节流解析 ---- */
+
+static void m5io_hub_rx_drop(struct m5io_hub *hub, unsigned int n) {
+  if (!n)
+    return;
+  if (n >= hub->rx_stream_len) {
+    hub->rx_stream_len = 0;
+    return;
+  }
+  memmove(hub->rx_stream, hub->rx_stream + n, hub->rx_stream_len - n);
+  hub->rx_stream_len -= n;
+}
+
+/* 返回当前半帧还差多少字节；0 表示没有半帧。 */
+static unsigned int m5io_hub_rx_need(struct m5io_hub *hub) {
+  u16 total;
+
+  if (!hub->rx_stream_len)
+    return 0;
+  if (hub->rx_stream_len < 3)
+    return M5IO_HUB_IO_READ_MIN;
+  if (hub->rx_stream[0] & 1U)
+    total = (u16)(4U + hub->rx_stream[2]);
+  else
+    total = (u16)(3U + (hub->rx_stream[1] & 0xfU));
+  if (total <= hub->rx_stream_len)
+    return M5IO_HUB_IO_READ_MIN;
+  return (unsigned int)(total - hub->rx_stream_len);
+}
+
+/* 尽量从 rx_stream 里切出完整帧；CRC 错就丢 1 字节重新同步。 */
+static void m5io_hub_rx_try_parse(struct m5io_hub *hub, unsigned int *frames) {
+  for (;;) {
+    u16 total;
+
+    if (!hub->rx_stream_len)
+      return;
+    if (hub->rx_stream[0] == 0xffU) { /* 帧边界空位填充 */
+      m5io_hub_rx_drop(hub, 1);
+      continue;
+    }
+    if (hub->rx_stream_len < 3)
+      return;
+    if (hub->rx_stream[0] & 1U)
+      total = (u16)(4U + hub->rx_stream[2]);
+    else
+      total = (u16)(3U + (hub->rx_stream[1] & 0xfU));
+    if (total > sizeof(hub->rx_stream)) {
+      m5io_hub_rx_drop(hub, 1);
+      continue;
+    }
+    if (hub->rx_stream_len < total)
+      return;
+    if (m5io_hub_crc8(hub->rx_stream, (unsigned int)(total - 1)) ==
+        hub->rx_stream[total - 1]) {
+      m5io_hub_rx_frame_handle(hub, hub->rx_stream, total);
+      (*frames)++;
+      m5io_hub_rx_drop(hub, total);
+    } else {
+      m5io_hub_rx_drop(hub, 1);
+    }
+  }
+}
+
+static void m5io_hub_rx_feed(struct m5io_hub *hub, const u8 *buf,
+                             unsigned int len, unsigned int *frames) {
+  unsigned int i;
+
+  *frames = 0;
+  for (i = 0; i < len; i++) {
+    if (!hub->rx_stream_len && buf[i] == 0xffU)
+      continue; /* 前导空位填充 */
+    if (hub->rx_stream_len >= sizeof(hub->rx_stream))
+      m5io_hub_rx_drop(hub, 1);
+    hub->rx_stream[hub->rx_stream_len++] = buf[i];
+  }
+  m5io_hub_rx_try_parse(hub, frames);
+}
+
+/* ---- SPI 事务 ---- */
+
+/* 发一个主机帧；MISO 同时读回同样长度的字节并送进解析器。 */
+static int m5io_hub_spi_send_frame(struct m5io_hub *hub, const u8 *frame,
+                                   unsigned int len) {
+  struct spi_transfer xfer = {
+      .tx_buf = hub->io_tx_buf,
+      .rx_buf = hub->io_rx_buf,
+      .len = len,
+  };
+  unsigned int frames = 0;
+  int ret;
+
+  if (!len || len > M5IO_HUB_IO_BUF_SIZE)
+    return -EINVAL;
+  memcpy(hub->io_tx_buf, frame, len);
+  memset(hub->io_rx_buf, 0xff, len);
+
+  ret = spi_sync_transfer(hub->spi, &xfer, 1);
+  hub->io_last_bytes = len;
+  if (ret) {
+    hub->rx_stream_len = 0;
+    return ret;
+  }
+
+  m5io_hub_rx_feed(hub, hub->io_rx_buf, len, &frames);
+  return 0;
+}
+
+/* 读事务：MOSI 全 0xff，长度按半帧需求对齐到 8 字节。 */
+static int m5io_hub_spi_read_dummy(struct m5io_hub *hub, bool *slave_empty) {
+  struct spi_transfer xfer = {
+      .tx_buf = hub->io_tx_buf,
+      .rx_buf = hub->io_rx_buf,
+  };
+  unsigned int frames = 0;
+  unsigned int need = m5io_hub_rx_need(hub);
+  unsigned int len = ALIGN(max_t(unsigned int, need, M5IO_HUB_IO_READ_MIN),
+                           M5IO_HUB_IO_READ_MIN);
+  unsigned int i;
+  bool all_ff = true;
+  int ret;
+
+  if (len > M5IO_HUB_IO_BUF_SIZE)
+    len = M5IO_HUB_IO_BUF_SIZE;
+  memset(hub->io_tx_buf, 0xff, len);
+  memset(hub->io_rx_buf, 0xff, len);
+  xfer.len = len;
+
+  ret = spi_sync_transfer(hub->spi, &xfer, 1);
+  hub->io_last_bytes = len;
+  *slave_empty = false;
+  if (ret) {
+    hub->rx_stream_len = 0;
+    return ret;
+  }
+
+  m5io_hub_rx_feed(hub, hub->io_rx_buf, len, &frames);
+  for (i = 0; i < len; i++) {
+    if (hub->io_rx_buf[i] != 0xffU) {
+      all_ff = false;
+      break;
+    }
+  }
+  *slave_empty = all_ff && !frames && !hub->rx_stream_len;
+  return 0;
+}
+
+/* ---- TX：WINDOW_ACK / TOKEN / DATA ---- */
+
+static bool m5io_hub_tx_one_ack(struct m5io_hub *hub) {
+  struct m5io_hub_ack_frame *ack;
+  int ret;
+
+  if (list_empty(&hub->ack_queue))
+    return false;
+  ack = list_first_entry(&hub->ack_queue, struct m5io_hub_ack_frame, node);
+  list_del(&ack->node);
+  hub->ack_count--;
+
+  ret = m5io_hub_spi_send_frame(hub, ack->frame, ack->len);
+  if (ret)
+    dev_err_ratelimited(hub->dev, "WINDOW_ACK send failed: %d\n", ret);
+  kfree(ack);
+  return true;
+}
+
+static bool m5io_hub_tx_one_token(struct m5io_hub *hub) {
+  struct m5io_hub_token_op *op;
+  bool expired;
+  int tid;
+  int ret;
+
+  mutex_lock(&hub->token_lock);
+  if (list_empty(&hub->token_queue)) {
+    mutex_unlock(&hub->token_lock);
+    return false;
+  }
+  op = list_first_entry(&hub->token_queue, struct m5io_hub_token_op, node);
+  expired = time_after(jiffies, op->deadline);
+  if (expired) {
+    list_del_init(&op->node);
+    hub->token_count--;
+  }
+  mutex_unlock(&hub->token_lock);
+
+  if (expired) {
+    op->status = -ETIMEDOUT;
+    complete(&op->done);
+    return true;
+  }
+
+  tid = m5io_hub_tid_try_alloc(hub);
+  if (tid < 0)
+    return false;
+
+  /* 取 TID 期间调用者可能超时把 op 从队列摘走，这里再确认一次。 */
+  mutex_lock(&hub->token_lock);
+  if (list_empty(&hub->token_queue) ||
+      list_first_entry(&hub->token_queue, struct m5io_hub_token_op, node) !=
+          op) {
+    mutex_unlock(&hub->token_lock);
+    m5io_hub_tid_release(hub, tid);
+    return false;
+  }
+  list_del_init(&op->node);
+  hub->token_count--;
+  mutex_unlock(&hub->token_lock);
+
+  op->tid = (u8)tid;
+  op->frame_len = (u8)m5io_hub_token_frame_build(
+      op->frame, (u8)tid, op->func, op->arg, op->payload, op->payload_len);
+  hub->token_slot[tid].op = op;
+  hub->token_slot[tid].deadline = jiffies + msecs_to_jiffies(op->timeout_ms);
+  ret = m5io_hub_spi_send_frame(hub, op->frame, op->frame_len);
+  if (ret) {
+    hub->token_slot[tid].op = NULL;
+    hub->token_slot[tid].deadline = 0;
+    m5io_hub_tid_release(hub, tid);
+    op->status = ret;
+    complete(&op->done);
+    return true;
+  }
+  return true;
+}
+
+/* 队列里挑一个目标通道空闲的 data op；顺带清掉过期的。 */
+static struct m5io_hub_data_op *m5io_hub_data_queue_pick(struct m5io_hub *hub) {
+  struct m5io_hub_data_op *op;
+  struct m5io_hub_data_op *tmp;
+  struct m5io_hub_data_op *pick = NULL;
+
+  mutex_lock(&hub->data_lock);
+  list_for_each_entry_safe(op, tmp, &hub->data_queue, node) {
+    if (hub->data_win[op->chn].op)
+      continue;
+    if (time_after(jiffies, op->deadline)) {
+      list_del_init(&op->node);
+      hub->data_count--;
+      op->status = -ETIMEDOUT;
+      complete(&op->done);
+      continue;
+    }
+    pick = op;
+    list_del_init(&op->node);
+    hub->data_count--;
+    break;
+  }
+  mutex_unlock(&hub->data_lock);
+  return pick;
+}
+
+static bool m5io_hub_tx_one_data(struct m5io_hub *hub) {
+  struct m5io_hub_data_op *op;
+  struct m5io_hub_data_window *win;
+  unsigned int chn;
+
+  /* 1) 已有窗口：发下一帧（等上一帧 ACK 时才继续） */
+  for (chn = 1; chn <= M5IO_HUB_CHN_MAX; chn++) {
+    struct m5io_hub_data_frame_desc *desc;
+    u8 *frame;
+    int ret;
+
+    win = &hub->data_win[chn];
+    if (!win->op || win->awaiting_ack ||
+        win->next_frame >= win->op->frame_count)
+      continue;
+
+    desc = &win->op->frames[win->next_frame];
+    frame = &win->op->buf[desc->offset];
+    m5io_hub_data_frame_set_pid(frame, desc->payload_len, win->pid);
+    win->awaiting_ack = true;
+    win->next_frame++;
+    ret = m5io_hub_spi_send_frame(hub, frame, desc->len);
+    if (ret) {
+      m5io_hub_data_win_complete(hub, win, ret);
+      return true;
+    }
+    return true;
+  }
+
+  /* 2) 打开新窗口 */
+  op = m5io_hub_data_queue_pick(hub);
+  if (!op)
+    return false;
+
+  win = &hub->data_win[op->chn];
+  op->rx_len = 0;
+  op->rx_done = false;
+  win->op = op;
+  win->pid = hub->data_pid[op->chn]++ & 0x3U;
+  win->next_frame = 0;
+  win->awaiting_ack = false;
+  win->tx_ack_ok = false;
+  win->deadline = jiffies + msecs_to_jiffies(op->timeout_ms);
+  return true;
+}
+
+/* ---- 待办判断与状态机主循环 ---- */
+
+static bool m5io_hub_sm_outstanding(struct m5io_hub *hub) {
+  unsigned int tid;
+  unsigned int chn;
+
+  for (tid = 0; tid < M5IO_HUB_TID_NR; tid++)
+    if (hub->token_slot[tid].op)
+      return true;
+  for (chn = 1; chn <= M5IO_HUB_CHN_MAX; chn++)
+    if (hub->data_win[chn].op)
+      return true;
+  if (!list_empty(&hub->ack_queue))
+    return true;
+  return false;
+}
+
+static bool m5io_hub_sm_has_queued_work(struct m5io_hub *hub) {
+  bool queued;
+
+  mutex_lock(&hub->token_lock);
+  queued = !list_empty(&hub->token_queue);
+  mutex_unlock(&hub->token_lock);
+  if (queued)
+    return true;
+  mutex_lock(&hub->data_lock);
+  queued = !list_empty(&hub->data_queue);
+  mutex_unlock(&hub->data_lock);
+  return queued;
+}
+
+static void m5io_hub_io_schedule_timeouts(struct m5io_hub *hub) {
+  if (m5io_hub_sm_outstanding(hub) || m5io_hub_sm_has_queued_work(hub))
+    mod_delayed_work(system_wq, &hub->timeout_work,
+                     msecs_to_jiffies(M5IO_HUB_SM_TIMEOUT_MS));
+}
+
+/* 调用者必须已经持有 spi_lock。 */
+static void m5io_hub_io_run_locked(struct m5io_hub *hub) {
+  unsigned int xfers = 0;
+  unsigned long bytes = 0;
+
+  while (xfers < M5IO_HUB_IO_MAX_XFERS && bytes < M5IO_HUB_IO_MAX_BYTES) {
+    bool slave_empty = false;
+    bool sent = false;
+    int ret;
+
+    if (m5io_hub_tx_one_ack(hub))
+      sent = true;
+    else if (m5io_hub_tx_one_data(hub))
+      sent = true;
+    else if (m5io_hub_tx_one_token(hub))
+      sent = true;
+
+    if (sent) {
+      xfers++;
+      bytes += hub->io_last_bytes;
+      continue;
+    }
+
+    /* 没有待发帧：只在这几种情况下才继续读 MISO */
+    if (!atomic_read(&hub->host_ready) && !hub->rx_stream_len &&
+        !m5io_hub_sm_outstanding(hub) && !m5io_hub_sm_has_queued_work(hub))
+      break;
+
+    ret = m5io_hub_spi_read_dummy(hub, &slave_empty);
+    if (ret) {
+      dev_err_ratelimited(hub->dev, "SPI read failed: %d\n", ret);
+      break;
+    }
+    xfers++;
+    bytes += hub->io_last_bytes;
+
+    if (slave_empty) {
+      atomic_set(&hub->host_ready, 0);
+      if (!hub->rx_stream_len && !m5io_hub_sm_outstanding(hub))
+        break;
+    }
+  }
+}
+
+static void m5io_hub_io_run(struct m5io_hub *hub) {
+  if (READ_ONCE(hub->ota_active) || !READ_ONCE(hub->sm_ready) ||
+      READ_ONCE(hub->removing))
+    return;
+
+  mutex_lock(&hub->spi_lock);
+  m5io_hub_io_run_locked(hub);
+  mutex_unlock(&hub->spi_lock);
+  m5io_hub_io_schedule_timeouts(hub);
+}
+
+static void m5io_hub_kick_io(struct m5io_hub *hub) {
+  if (!hub || !READ_ONCE(hub->sm_ready) || READ_ONCE(hub->removing))
+    return;
+  schedule_work(&hub->io_work);
+}
+
+/* ---- 超时、轮询、中断、卸载 ---- */
+
+static void m5io_hub_timeout_work(struct work_struct *work) {
+  struct m5io_hub *hub =
+      container_of(to_delayed_work(work), struct m5io_hub, timeout_work);
+  unsigned int tid;
+  unsigned int chn;
+  bool more;
+
+  mutex_lock(&hub->spi_lock);
+  if (READ_ONCE(hub->ota_active)) {
+    mutex_unlock(&hub->spi_lock);
+    return;
+  }
+
+  for (tid = 0; tid < M5IO_HUB_TID_NR; tid++) {
+    struct m5io_hub_token_op *op = hub->token_slot[tid].op;
+
+    if (op && time_after(jiffies, hub->token_slot[tid].deadline)) {
+      hub->token_slot[tid].op = NULL;
+      hub->token_slot[tid].deadline = 0;
+      m5io_hub_tid_quarantine(hub, (int)tid);
+      op->status = -ETIMEDOUT;
+      complete(&op->done);
+    }
+    if (test_bit(tid, &hub->tid_busy) && hub->tid_quarantine_until[tid] &&
+        time_after(jiffies, hub->tid_quarantine_until[tid]))
+      m5io_hub_tid_release(hub, (int)tid);
+  }
+
+  for (chn = 1; chn <= M5IO_HUB_CHN_MAX; chn++) {
+    struct m5io_hub_data_window *win = &hub->data_win[chn];
+
+    if (win->op && time_after(jiffies, win->deadline))
+      m5io_hub_data_win_complete(hub, win, -ETIMEDOUT);
+  }
+
+  more = m5io_hub_sm_outstanding(hub) || m5io_hub_sm_has_queued_work(hub);
+  mutex_unlock(&hub->spi_lock);
+
+  if (more)
+    mod_delayed_work(system_wq, &hub->timeout_work,
+                     msecs_to_jiffies(M5IO_HUB_SM_TIMEOUT_MS));
+}
+
+static void m5io_hub_io_work(struct work_struct *work) {
+  m5io_hub_io_run(container_of(work, struct m5io_hub, io_work));
+}
+
+static void m5io_hub_poll_work(struct work_struct *work) {
+  struct m5io_hub *hub =
+      container_of(to_delayed_work(work), struct m5io_hub, poll_work);
+
+  if (!hub->poll_enabled || READ_ONCE(hub->removing))
+    return;
+  atomic_set(&hub->host_ready, 1);
+  m5io_hub_io_run(hub);
+  if (hub->poll_enabled && !READ_ONCE(hub->removing))
+    mod_delayed_work(system_wq, &hub->poll_work,
+                     msecs_to_jiffies(M5IO_HUB_SM_POLL_MS));
+}
+
+static irqreturn_t m5io_hub_irq_thread(int irq, void *data) {
+  struct m5io_hub *hub = data;
+
+  if (READ_ONCE(hub->removing))
+    return IRQ_HANDLED;
+  if (READ_ONCE(hub->ota_active)) {
+    /* OTA 裸 IAP 阶段把 HOST_READY 当作 IAP 应答信号使用。 */
+    complete(&hub->ota_ready);
+    return IRQ_HANDLED;
+  }
+
+  /* IRQ 表示 MCU 有待读数据，io_run 才会去做读事务。 */
+  atomic_set(&hub->host_ready, 1);
+
+  /*
+   * OTA 会在整个裸 IAP 阶段持有 spi_lock；这里用 trylock，拿不到就交给
+   * workqueue，绝不阻塞中断线程（否则 OTA 的应答等待会永远等不到）。
+   */
+  if (!mutex_trylock(&hub->spi_lock)) {
+    schedule_work(&hub->io_work);
+    return IRQ_HANDLED;
+  }
+  m5io_hub_io_run_locked(hub);
+  mutex_unlock(&hub->spi_lock);
+  m5io_hub_io_schedule_timeouts(hub);
+  return IRQ_HANDLED;
+}
+
+/* 复位/FLUSH 成功后清理单个通道的主机侧窗口与解析状态。 */
+static void m5io_hub_sm_abort_channel(struct m5io_hub *hub, u8 chn, int error) {
+  if (!hub || chn < 1 || chn > M5IO_HUB_CHN_MAX)
+    return;
+
+  mutex_lock(&hub->spi_lock);
+  if (hub->data_win[chn].op)
+    m5io_hub_data_win_complete(hub, &hub->data_win[chn], error);
+  hub->chn_rx_remaining[chn] = 0;
+  hub->rx_stream_len = 0; /* MCU 复位后不希望保留半帧 */
+  hub->guide_seq_valid = false;
+  mutex_unlock(&hub->spi_lock);
+
+  mutex_lock(&hub->data_lock);
+  hub->data_seq[chn] = 0;
+  mutex_unlock(&hub->data_lock);
+}
+
+/* 中止所有在飞操作（OTA 接管/卸载时用）；已入队的由 queues_abort 处理。 */
+static void m5io_hub_sm_abort(struct m5io_hub *hub, int error) {
+  struct m5io_hub_ack_frame *ack;
+  struct m5io_hub_ack_frame *tmp_ack;
+  LIST_HEAD(acks);
+  unsigned int tid;
+  unsigned int chn;
+
+  mutex_lock(&hub->spi_lock);
+  for (tid = 0; tid < M5IO_HUB_TID_NR; tid++) {
+    struct m5io_hub_token_op *op = hub->token_slot[tid].op;
+
+    hub->token_slot[tid].op = NULL;
+    hub->token_slot[tid].deadline = 0;
+    m5io_hub_tid_release(hub, (int)tid);
+    if (op) {
+      op->status = error;
+      complete(&op->done);
+    }
+  }
+  for (chn = 1; chn <= M5IO_HUB_CHN_MAX; chn++)
+    if (hub->data_win[chn].op)
+      m5io_hub_data_win_complete(hub, &hub->data_win[chn], error);
+
+  list_splice_init(&hub->ack_queue, &acks);
+  hub->ack_count = 0;
+  mutex_unlock(&hub->spi_lock);
+
+  list_for_each_entry_safe(ack, tmp_ack, &acks, node) {
+    list_del(&ack->node);
+    kfree(ack);
+  }
 }
 
 /* =====================================================================
@@ -599,6 +1582,8 @@ static void m5io_hub_queues_abort(struct m5io_hub *hub, int error)
 static int m5io_hub_api_enter(struct m5io_hub *hub)
 {
   if (!hub || !hub->spi)
+    return -ENODEV;
+  if (READ_ONCE(hub->removing))
     return -ENODEV;
   /* 维护态（OTA）期间只允许持有总线所有权的线程继续下发。 */
   if (READ_ONCE(hub->ota_active) && READ_ONCE(hub->bus_owner) != current)
@@ -778,11 +1763,15 @@ EXPORT_SYMBOL_GPL(m5io_hub_i2c_config);
 int m5io_hub_i2c_reset(struct m5io_hub *hub, u8 bus)
 {
   u8 payload[1] = {bus};
+  int ret;
 
   if (bus < 1 || bus > 2)
     return -EINVAL;
-  return m5io_hub_api_token(hub, M5IO_HUB_IIC_FUN, M5IO_HUB_I2C_reset,
-                            payload, sizeof(payload));
+  ret = m5io_hub_api_token(hub, M5IO_HUB_IIC_FUN, M5IO_HUB_I2C_reset,
+                           payload, sizeof(payload));
+  if (!ret)
+    m5io_hub_sm_abort_channel(hub, M5IO_HUB_I2C_CHN(bus), -ECANCELED);
+  return ret;
 }
 EXPORT_SYMBOL_GPL(m5io_hub_i2c_reset);
 
@@ -937,11 +1926,15 @@ EXPORT_SYMBOL_GPL(m5io_hub_uart_config);
 int m5io_hub_uart_reset(struct m5io_hub *hub, u8 bus)
 {
   u8 payload[1] = {bus};
+  int ret;
 
   if (bus < 1 || bus > 2)
     return -EINVAL;
-  return m5io_hub_api_token(hub, M5IO_HUB_UART_FUN, M5IO_HUB_UART_reset,
-                            payload, sizeof(payload));
+  ret = m5io_hub_api_token(hub, M5IO_HUB_UART_FUN, M5IO_HUB_UART_reset,
+                           payload, sizeof(payload));
+  if (!ret)
+    m5io_hub_sm_abort_channel(hub, M5IO_HUB_UART_CHN(bus), -ECANCELED);
+  return ret;
 }
 EXPORT_SYMBOL_GPL(m5io_hub_uart_reset);
 
@@ -1085,11 +2078,15 @@ EXPORT_SYMBOL_GPL(m5io_hub_spi_config);
 int m5io_hub_spi_reset(struct m5io_hub *hub, u8 bus)
 {
   u8 payload[1] = {bus};
+  int ret;
 
   if (bus >= 4)
     return -EINVAL;
-  return m5io_hub_api_token(hub, M5IO_HUB_SPI_FUN, M5IO_HUB_SPI_reset,
-                            payload, sizeof(payload));
+  ret = m5io_hub_api_token(hub, M5IO_HUB_SPI_FUN, M5IO_HUB_SPI_reset,
+                           payload, sizeof(payload));
+  if (!ret)
+    m5io_hub_sm_abort_channel(hub, M5IO_HUB_SPI_CHN(bus), -ECANCELED);
+  return ret;
 }
 EXPORT_SYMBOL_GPL(m5io_hub_spi_reset);
 
@@ -1128,6 +2125,7 @@ int m5io_hub_spi_flush(struct m5io_hub *hub, u8 bus)
     return ret;
   if (reply_len != sizeof(reply) || reply[0])
     return -EPROTO;
+  m5io_hub_sm_abort_channel(hub, M5IO_HUB_SPI_CHN(bus), -ECANCELED);
   return 0;
 }
 EXPORT_SYMBOL_GPL(m5io_hub_spi_flush);
@@ -1378,27 +2376,32 @@ EXPORT_SYMBOL_GPL(m5io_hub_ir_config);
 
 int m5io_hub_ir_reset(struct m5io_hub *hub)
 {
-  return m5io_hub_api_token(hub, M5IO_HUB_IR_FUN, M5IO_HUB_IR_reset, NULL, 0);
+  int ret;
+
+  ret = m5io_hub_api_token(hub, M5IO_HUB_IR_FUN, M5IO_HUB_IR_reset, NULL, 0);
+  if (!ret)
+    m5io_hub_sm_abort_channel(hub, M5IO_HUB_IR_CHN, -ECANCELED);
+  return ret;
 }
 EXPORT_SYMBOL_GPL(m5io_hub_ir_reset);
 
-int m5io_hub_ir_start_reace(struct m5io_hub *hub)
+int m5io_hub_ir_start_receive(struct m5io_hub *hub)
 {
   u8 payload[1] = {1};
 
   return m5io_hub_api_token(hub, M5IO_HUB_IR_FUN, M5IO_HUB_IR_receive,
                             payload, sizeof(payload));
 }
-EXPORT_SYMBOL_GPL(m5io_hub_ir_start_reace);
+EXPORT_SYMBOL_GPL(m5io_hub_ir_start_receive);
 
-int m5io_hub_ir_stop_reace(struct m5io_hub *hub)
+int m5io_hub_ir_stop_receive(struct m5io_hub *hub)
 {
   u8 payload[1] = {0};
 
   return m5io_hub_api_token(hub, M5IO_HUB_IR_FUN, M5IO_HUB_IR_receive,
                             payload, sizeof(payload));
 }
-EXPORT_SYMBOL_GPL(m5io_hub_ir_stop_reace);
+EXPORT_SYMBOL_GPL(m5io_hub_ir_stop_receive);
 
 int m5io_hub_ir_send_data(struct m5io_hub *hub, const u8 *data,
                           unsigned int len)
@@ -1564,7 +2567,6 @@ static void m5io_hub_ota_bus_lock(struct m5io_hub *hub)
   WARN_ON_ONCE(READ_ONCE(hub->bus_owner));
   mutex_lock(&hub->ota_lock);
   WRITE_ONCE(hub->bus_owner, current);
-  WRITE_ONCE(hub->ota_active, true);
   /*
    * 反复清队列直到不再有活跃 API：已经进入的复合操作（例如 pwm_config 的
    * 第二步、spi_transfer 的下一段）可能在一次 abort 之后又提交了新操作。
@@ -1585,26 +2587,54 @@ static void m5io_hub_ota_bus_unlock(struct m5io_hub *hub)
 }
 
 /* 进入/离开裸 IAP 命令流；普通操作队列在独占开始时已经清空。 */
+/*
+ * 复位应答之后再冻结：先让状态机把 MCU_RESET TOKEN 发出去并收到应答，
+ * 然后才停状态机、独占 SPI 总线（spi_lock 一直持有到 ota_end）。
+ */
 static void m5io_hub_ota_begin(struct m5io_hub *hub)
 {
+  WRITE_ONCE(hub->ota_active, true);
   m5io_hub_queues_abort(hub, -ECANCELED);
+  mutex_lock(&hub->spi_lock);
 }
 
 static void m5io_hub_ota_end(struct m5io_hub *hub)
 {
+  mutex_unlock(&hub->spi_lock);
+  WRITE_ONCE(hub->ota_active, false);
   m5io_hub_queues_abort(hub, -ECANCELED);
 }
 
+/*
+ * OTA 裸 IAP 阶段同样要走 DMA 安全的缓冲区：调用者传进来的常常是栈数组
+ * （DMA 不能直接使用栈内存），而这里已经持有 spi_lock，可以安全复用状态机
+ * 的 io_tx_buf/io_rx_buf，收发都先 memcpy 进出。
+ */
 static int m5io_hub_ota_spi_xfer(struct m5io_hub *hub,
                                  const void *tx, void *rx, unsigned int len)
 {
   struct spi_transfer transfer = {
-    .tx_buf = tx,
-    .rx_buf = rx,
+    .tx_buf = hub->io_tx_buf,
+    .rx_buf = hub->io_rx_buf,
     .len = len,
   };
+  int ret;
 
-  return spi_sync_transfer(hub->spi, &transfer, 1);
+  if (!hub->io_tx_buf || !hub->io_rx_buf || !len ||
+      len > M5IO_HUB_IO_BUF_SIZE)
+    return -EINVAL;
+
+  if (tx)
+    memcpy(hub->io_tx_buf, tx, len);
+  else
+    memset(hub->io_tx_buf, 0xff, len);
+  if (rx)
+    memset(hub->io_rx_buf, 0xff, len);
+
+  ret = spi_sync_transfer(hub->spi, &transfer, 1);
+  if (!ret && rx)
+    memcpy(rx, hub->io_rx_buf, len);
+  return ret;
 }
 
 static int m5io_hub_ota_drain(struct m5io_hub *hub,
@@ -2132,7 +3162,6 @@ static int m5io_hub_probe(struct spi_device *spi)
 
   hub->dev = &spi->dev;
   hub->spi = spi;
-  /* HOST_READY 中断留到收发状态机那一步再接；在此之前 OTA 走轮询路径。 */
   hub->irq = 0;
 
   mutex_init(&hub->token_lock);
@@ -2151,6 +3180,45 @@ static int m5io_hub_probe(struct spi_device *spi)
   WRITE_ONCE(hub->ota_active, false);
   WRITE_ONCE(hub->bus_owner, NULL);
 
+  /* SPI 收发状态机 */
+  mutex_init(&hub->spi_lock);
+  INIT_WORK(&hub->io_work, m5io_hub_io_work);
+  INIT_DELAYED_WORK(&hub->timeout_work, m5io_hub_timeout_work);
+  INIT_DELAYED_WORK(&hub->poll_work, m5io_hub_poll_work);
+  INIT_LIST_HEAD(&hub->ack_queue);
+  atomic_set(&hub->host_ready, 0);
+
+  /*
+   * SPI 控制器的 DMA 可能有对齐要求（ctlr->dma_alignment，缺省用 CPU 的
+   * cache line）。devm_kmalloc 本身在多数内核里 data[] 已按
+   * ARCH_DMA_MINALIGN 对齐，但不同内核/kmalloc 桶的实现不保证这点，而
+   * 控制器要求也可能更严格；这里显式多分配一段再切出对齐区间。
+   * 这两块缓冲区同时用于状态机和 OTA 裸 IAP 的收发，绝不把栈内存交给 DMA。
+   */
+  {
+    unsigned int align = spi->controller->dma_alignment;
+    unsigned int alloc;
+    void *tx_alloc;
+    void *rx_alloc;
+
+    if (!align)
+      align = (unsigned int)dma_get_cache_alignment();
+    if (align < 8)
+      align = 8;
+    if (!is_power_of_2(align))
+      align = roundup_pow_of_two(align);
+    alloc = ALIGN(M5IO_HUB_IO_BUF_SIZE, align) + align;
+
+    tx_alloc = devm_kmalloc(&spi->dev, alloc, GFP_KERNEL);
+    rx_alloc = devm_kmalloc(&spi->dev, alloc, GFP_KERNEL);
+    if (!tx_alloc || !rx_alloc)
+      return -ENOMEM;
+    hub->io_tx_buf =
+        (u8 *)ALIGN((unsigned long)tx_alloc, (unsigned long)align);
+    hub->io_rx_buf =
+        (u8 *)ALIGN((unsigned long)rx_alloc, (unsigned long)align);
+  }
+
   spi->bits_per_word = 8;
   ret = spi_setup(spi);
   if (ret)
@@ -2158,6 +3226,36 @@ static int m5io_hub_probe(struct spi_device *spi)
 
   /* 子驱动从父设备的 drvdata 取 hub 句柄。 */
   dev_set_drvdata(&spi->dev, hub);
+
+  WRITE_ONCE(hub->sm_ready, true);
+
+  /* HOST_READY 中断：没有中断时用 poll_work 轮询。 */
+  {
+    int irq = spi->irq;
+
+    if (irq <= 0 && spi->dev.of_node)
+      irq = of_irq_get(spi->dev.of_node, 0);
+    if (irq == -EPROBE_DEFER)
+      return -EPROBE_DEFER;
+    if (irq <= 0) {
+      hub->poll_enabled = true;
+    } else {
+      unsigned long irqflags = IRQF_ONESHOT;
+      int trigger = irq_get_trigger_type(irq);
+
+      irqflags |= trigger ? (unsigned long)trigger : IRQF_TRIGGER_LOW;
+      ret = devm_request_threaded_irq(&spi->dev, irq, NULL,
+                                      m5io_hub_irq_thread, irqflags,
+                                      "m5io-hub", hub);
+      if (ret)
+        return dev_err_probe(&spi->dev, ret,
+                             "failed to request HOST_READY irq\n");
+      hub->irq = irq;
+    }
+  }
+
+  if (hub->poll_enabled)
+    mod_delayed_work(system_wq, &hub->poll_work, 0);
 
   snprintf(hub->ota_misc_name, sizeof(hub->ota_misc_name), "m5io-hub-ota");
   hub->ota_misc.minor = MISC_DYNAMIC_MINOR;
@@ -2183,7 +3281,25 @@ static int m5io_hub_probe(struct spi_device *spi)
 
 static void m5io_hub_remove(struct spi_device *spi)
 {
-  /* 所有资源都由 devm 管理，子设备由 of_platform_populate 自动解绑。 */
+  struct m5io_hub *hub = dev_get_drvdata(&spi->dev);
+  unsigned int i;
+
+  if (!hub)
+    return;
+
+  /*
+   * 先停状态机再让 devm 释放 hub：阻塞在队列/完成量上的调用者必须被唤醒，
+   * 否则它们会在 hub 释放后继续访问，造成 UAF。
+   */
+  WRITE_ONCE(hub->removing, true);
+  hub->poll_enabled = false;
+  cancel_delayed_work_sync(&hub->poll_work);
+  cancel_delayed_work_sync(&hub->timeout_work);
+  m5io_hub_queues_abort(hub, -ENODEV);
+  cancel_work_sync(&hub->io_work);
+
+  for (i = 0; i < 2000 && atomic_read(&hub->active_apis); i++)
+    msleep(1);
 }
 
 static const struct of_device_id m5io_hub_of_match[] = {

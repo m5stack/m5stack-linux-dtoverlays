@@ -728,7 +728,7 @@ int m5io_hub_ir_config(struct m5io_hub *hub, unsigned int clk);
 int m5io_hub_ir_reset(struct m5io_hub *hub);
 
 /**
- * m5io_hub_ir_start_reace - 开始红外接收
+ * m5io_hub_ir_start_receive - 开始红外接收
  * @hub: hub 句柄
  *
  * 分区：FUNC=M5IO_HUB_IR_FUN (IR)，数据通道 DATA CH=M5IO_HUB_IR_CH
@@ -737,10 +737,10 @@ int m5io_hub_ir_reset(struct m5io_hub *hub);
  * DATA：收到的波形按 DATA CH=M5IO_HUB_IR_CH 上行，一帧=一个逻辑消息（APP 限 1..13 B），
  *       主机需回 WINDOW_ACK。
  */
-int m5io_hub_ir_start_reace(struct m5io_hub *hub);
+int m5io_hub_ir_start_receive(struct m5io_hub *hub);
 
 /**
- * m5io_hub_ir_stop_reace - 停止红外接收
+ * m5io_hub_ir_stop_receive - 停止红外接收
  * @hub: hub 句柄
  *
  * 分区：FUNC=M5IO_HUB_IR_FUN (IR)，数据通道 DATA CH=M5IO_HUB_IR_CH
@@ -748,7 +748,7 @@ int m5io_hub_ir_start_reace(struct m5io_hub *hub);
  * 应答：FUNC=M5IO_HUB_IR_FUN ARG=status LEN=0
  * DATA：无；停止后 CH=M5IO_HUB_IR_CH 仍可上行 MCU 已排队的帧，主机仍要回 ACK。
  */
-int m5io_hub_ir_stop_reace(struct m5io_hub *hub);
+int m5io_hub_ir_stop_receive(struct m5io_hub *hub);
 
 /**
  * m5io_hub_ir_send_data - 发送一个红外逻辑消息

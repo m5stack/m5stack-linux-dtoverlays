@@ -178,7 +178,7 @@ static void m5io_hub_ir_rx(void *data, const u8 *buf, unsigned int len)
  * 终止 MARK 结尾。解成逻辑字节后由 MCU 重新加引导码并按当前时序调制。
  */
 /* rc-core 在 lirc_transmit() 的 dev->lock mutex 下调用 tx_ir，可睡眠：
- * 会走 core 的 stop_reace/send_data/start_reace（含 WINDOW_ACK 等待）。 */
+ * 会走 core 的 stop_receive/send_data/start_receive（含 WINDOW_ACK 等待）。 */
 static int m5io_hub_ir_tx(struct rc_dev *rc, unsigned int *txbuf,
                           unsigned int count)
 {
@@ -221,7 +221,7 @@ static int m5io_hub_ir_tx(struct rc_dev *rc, unsigned int *txbuf,
    * 期间一直开着 RX，所以这里临时关一次、发完再恢复。
    */
   if (ir->rx_running) {
-    ret = m5io_hub_ir_stop_reace(ir->hub);
+    ret = m5io_hub_ir_stop_receive(ir->hub);
     if (!ret)
       ir->rx_running = false;
   }
@@ -229,7 +229,7 @@ static int m5io_hub_ir_tx(struct rc_dev *rc, unsigned int *txbuf,
     ret = m5io_hub_ir_send_data(ir->hub, data, bytes);
 
   if (!ir->rx_running && ir->rx_registered) {
-    int restart = m5io_hub_ir_start_reace(ir->hub);
+    int restart = m5io_hub_ir_start_receive(ir->hub);
 
     if (restart) {
       dev_warn_ratelimited(&rc->dev,
@@ -268,7 +268,7 @@ static int m5io_hub_ir_set_carrier(struct rc_dev *rc, u32 carrier)
   }
 
   /* 重配必须让红外空闲：关 RX -> CONFIG -> 开 RX。 */
-  ret = m5io_hub_ir_stop_reace(ir->hub);
+  ret = m5io_hub_ir_stop_receive(ir->hub);
   if (ret) {
     mutex_unlock(&ir->lock);
     return ret;
@@ -279,7 +279,7 @@ static int m5io_hub_ir_set_carrier(struct rc_dev *rc, u32 carrier)
   if (!ret)
     ir->carrier_hz = carrier;
 
-  restart = m5io_hub_ir_start_reace(ir->hub);
+  restart = m5io_hub_ir_start_receive(ir->hub);
   if (restart) {
     dev_warn_ratelimited(&rc->dev, "failed to re-enable IR receiver: %d\n",
                          restart);
@@ -313,7 +313,7 @@ static int m5io_hub_ir_open(struct rc_dev *rc)
     ir->rx_registered = true;
   }
 
-  ret = m5io_hub_ir_start_reace(ir->hub);
+  ret = m5io_hub_ir_start_receive(ir->hub);
   if (ret) {
     m5io_hub_ir_unregister_rx(ir->hub);
     ir->rx_registered = false;
@@ -334,7 +334,7 @@ static void m5io_hub_ir_close(struct rc_dev *rc)
 
   mutex_lock(&ir->lock);
   if (ir->rx_running) {
-    m5io_hub_ir_stop_reace(ir->hub);
+    m5io_hub_ir_stop_receive(ir->hub);
     ir->rx_running = false;
   }
   if (ir->rx_registered) {
@@ -424,7 +424,7 @@ static void m5io_hub_ir_remove(struct platform_device *pdev)
     return;
   mutex_lock(&ir->lock);
   if (ir->rx_running) {
-    m5io_hub_ir_stop_reace(ir->hub);
+    m5io_hub_ir_stop_receive(ir->hub);
     ir->rx_running = false;
   }
   if (ir->rx_registered) {
