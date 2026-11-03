@@ -2376,23 +2376,23 @@ int m5io_hub_ir_reset(struct m5io_hub *hub)
 }
 EXPORT_SYMBOL_GPL(m5io_hub_ir_reset);
 
-int m5io_hub_ir_start_reace(struct m5io_hub *hub)
+int m5io_hub_ir_start_receive(struct m5io_hub *hub)
 {
     u8 payload[1] = {1};
 
     return m5io_hub_api_token(hub, M5IO_HUB_IR_FUN, M5IO_HUB_IR_receive,
                   payload, sizeof(payload));
 }
-EXPORT_SYMBOL_GPL(m5io_hub_ir_start_reace);
+EXPORT_SYMBOL_GPL(m5io_hub_ir_start_receive);
 
-int m5io_hub_ir_stop_reace(struct m5io_hub *hub)
+int m5io_hub_ir_stop_receive(struct m5io_hub *hub)
 {
     u8 payload[1] = {0};
 
     return m5io_hub_api_token(hub, M5IO_HUB_IR_FUN, M5IO_HUB_IR_receive,
                   payload, sizeof(payload));
 }
-EXPORT_SYMBOL_GPL(m5io_hub_ir_stop_reace);
+EXPORT_SYMBOL_GPL(m5io_hub_ir_stop_receive);
 
 int m5io_hub_ir_send_data(struct m5io_hub *hub, const u8 *data,
               unsigned int len)
