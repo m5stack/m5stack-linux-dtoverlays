@@ -9,12 +9,31 @@ CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-gnu-}"
 CC="${CC:-$ROOT_DIR/.artifacts/aarch64-gcc13-kbuild-wrapper}"
 ADB_SERIAL="${ADB_SERIAL:-3023797681}"
 REBOOT=0
+# Device tree installation is opt-in (--dtb / INSTALL_DTB=1). When disabled this
+# script only builds and installs kernel modules, and never touches /boot.
+INSTALL_DTB="${INSTALL_DTB:-0}"
 
 CARDPUTER_DIR="$ROOT_DIR/modules/CardputerZeroQ"
 JD9852_DIR="$ROOT_DIR/modules/jd9852a"
 TCA8418_DIR="$ROOT_DIR/modules/tca8418-1.0"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/.artifacts/cardputerzeroq-deploy-$STAMP}"
+
+# Keep this list in sync with MODULES in modules/CardputerZeroQ/Makefile.
+M5IO_MODULES=(
+	m5io-hub-core
+	m5io-hub-gpio
+	m5hub-gpio-leds
+	m5io-hub-i2c
+	m5io-hub-uart
+	m5io-hub-spi
+	m5io-hub-backlight
+	m5io-hub-ir
+)
+EXTRA_MODULES=(panel-elida-jd9852a tca8418_keypad_m5stack)
+ALL_MODULES=("${M5IO_MODULES[@]}" "${EXTRA_MODULES[@]}")
+# Expanded into the remote script's module loop (unquoted heredoc below).
+REMOTE_MODULES="${ALL_MODULES[*]}"
 
 BASE_DTB_NAME=qrb2210-arduino-imola-base.dtb
 VIDEO_DTBO_NAME=qrb2210-arduino-imola-video_sound-usbc.dtbo
@@ -24,16 +43,21 @@ usage() {
 	cat <<EOF
 Usage: scripts/rebuild-deploy-cardputerzeroq.sh [options]
 
-Build the CardputerZeroQ, JD9852 and TCA8418 modules, build a complete DTB,
-upload the artifacts to an Arduino Uno Q, and refresh its initramfs.
+Build the CardputerZeroQ, JD9852 and TCA8418 modules, upload them to an
+Arduino Uno Q, and (optionally) merge and install the device tree.
 
 Options:
   --serial SERIAL  ADB serial (default: $ADB_SERIAL)
+  --dtb            Also build, merge and install the device tree
+                   (INSTALL_DTB=1). Off by default: /boot is left untouched.
   --reboot         Reboot the device after installation
   --help           Show this help
 
 The device sudo password is read interactively. Set DEVICE_PASSWORD to avoid
 the prompt in an already protected shell.
+
+Environment:
+  INSTALL_DTB=1    Same as --dtb.
 EOF
 }
 
@@ -49,6 +73,10 @@ while (($#)); do
 			ADB_SERIAL="$2"
 			shift 2
 			;;
+		--dtb)
+			INSTALL_DTB=1
+			shift
+			;;
 		--reboot)
 			REBOOT=1
 			shift
@@ -63,12 +91,16 @@ while (($#)); do
 	esac
 done
 
-for command in adb make dtc fdtoverlay fdtget; do
+for command in adb make; do
 	command -v "$command" >/dev/null || die "missing host command: $command"
 done
+if ((INSTALL_DTB)); then
+	for command in dtc fdtoverlay fdtget; do
+		command -v "$command" >/dev/null || die "missing host command: $command"
+	done
+fi
 [[ -f "$KERNELDIR/Makefile" ]] || die "kernel source not found: $KERNELDIR"
 [[ -x "$CC" ]] || die "compiler wrapper not found or not executable: $CC"
-[[ -f "$CARDPUTER_DIR/cardputerzeroq-overlay.dts" ]] || die "CardputerZeroQ DTS not found"
 
 if [[ -z "${DEVICE_PASSWORD:-}" ]]; then
 	read -r -s -p "Device sudo password: " DEVICE_PASSWORD
@@ -102,91 +134,97 @@ echo "[1/5] Building CardputerZeroQ modules"
 make "${KERNEL_ARGS[@]}" M="$CARDPUTER_DIR" \
 	ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" CC="$CC" \
 	KBUILD_MODPOST_WARN=1 modules
-make -C "$CARDPUTER_DIR" "${MODULE_DTB_ARGS[@]}" \
-	ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" DTC=dtc CPP=cpp dtbs
+if ((INSTALL_DTB)); then
+	# The Makefile default target is broken upstream: DTS_TARGETS still lists
+	# three overlays whose .dts files were removed in 7124721 / 4f558e9.
+	[[ -f "$CARDPUTER_DIR/cardputerzeroq-overlay.dts" ]] || die "CardputerZeroQ DTS not found"
+	make -C "$CARDPUTER_DIR" "${MODULE_DTB_ARGS[@]}" \
+		ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" DTC=dtc CPP=cpp \
+		cardputerzeroq-overlay.dtbo
+fi
 
 echo "[2/5] Building JD9852 and TCA8418 modules"
 make "${KERNEL_ARGS[@]}" M="$JD9852_DIR" \
 	ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" CC="$CC" \
 	KBUILD_MODPOST_WARN=1 modules
-make -C "$JD9852_DIR" KERNELDIR="$KERNELDIR" \
-	ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" jd9852a.dtbo
 make "${KERNEL_ARGS[@]}" M="$TCA8418_DIR" \
 	ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" CC="$CC" \
 	KBUILD_MODPOST_WARN=1 modules
 
-echo "[3/5] Building the base DTB and merging the CardputerZeroQ overlay"
-make "${KERNEL_ARGS[@]}" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
-	"qcom/$BASE_DTB_NAME" \
-	"qcom/$VIDEO_DTBO_NAME"
+if ((INSTALL_DTB)); then
+	echo "[3/5] Building the base DTB and merging the CardputerZeroQ overlay"
+	make -C "$JD9852_DIR" "${MODULE_DTB_ARGS[@]}" \
+		ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" jd9852a.dtbo
+	make "${KERNEL_ARGS[@]}" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+		"qcom/$BASE_DTB_NAME" \
+		"qcom/$VIDEO_DTBO_NAME"
 
-BASE_DTB="$KERNEL_TREE/arch/$ARCH/boot/dts/qcom/$BASE_DTB_NAME"
-VIDEO_DTBO="$KERNEL_TREE/arch/$ARCH/boot/dts/qcom/$VIDEO_DTBO_NAME"
-CARDPUTER_DTBO="$CARDPUTER_DIR/cardputerzeroq-overlay.dtbo"
-JD9852_DTBO="$JD9852_DIR/jd9852a.dtbo"
-MERGED_VIDEO="$BUILD_DIR/qrb2210-arduino-imola-video.dtb"
-MERGED_CARDPUTER="$BUILD_DIR/qrb2210-arduino-imola-cardputerzeroq-unfiltered.dtb"
-FINAL_DTB="$BUILD_DIR/$FINAL_DTB_NAME"
+	BASE_DTB="$KERNEL_TREE/arch/$ARCH/boot/dts/qcom/$BASE_DTB_NAME"
+	VIDEO_DTBO="$KERNEL_TREE/arch/$ARCH/boot/dts/qcom/$VIDEO_DTBO_NAME"
+	CARDPUTER_DTBO="$CARDPUTER_DIR/cardputerzeroq-overlay.dtbo"
+	JD9852_DTBO="$JD9852_DIR/jd9852a.dtbo"
+	MERGED_VIDEO="$BUILD_DIR/qrb2210-arduino-imola-video.dtb"
+	MERGED_CARDPUTER="$BUILD_DIR/qrb2210-arduino-imola-cardputerzeroq-unfiltered.dtb"
+	FINAL_DTB="$BUILD_DIR/$FINAL_DTB_NAME"
 
-[[ -f "$BASE_DTB" ]] || die "base DTB was not built: $BASE_DTB"
-[[ -f "$VIDEO_DTBO" ]] || die "video overlay was not built: $VIDEO_DTBO"
-[[ -f "$CARDPUTER_DTBO" ]] || die "CardputerZeroQ overlay was not built: $CARDPUTER_DTBO"
-[[ -f "$JD9852_DTBO" ]] || die "JD9852 overlay was not built: $JD9852_DTBO"
+	[[ -f "$BASE_DTB" ]] || die "base DTB was not built: $BASE_DTB"
+	[[ -f "$VIDEO_DTBO" ]] || die "video overlay was not built: $VIDEO_DTBO"
+	[[ -f "$CARDPUTER_DTBO" ]] || die "CardputerZeroQ overlay was not built: $CARDPUTER_DTBO"
+	[[ -f "$JD9852_DTBO" ]] || die "JD9852 overlay was not built: $JD9852_DTBO"
 
-fdtoverlay -i "$BASE_DTB" -o "$MERGED_VIDEO" "$VIDEO_DTBO"
-fdtoverlay -i "$MERGED_VIDEO" -o "$MERGED_CARDPUTER" "$CARDPUTER_DTBO"
+	fdtoverlay -i "$BASE_DTB" -o "$MERGED_VIDEO" "$VIDEO_DTBO"
+	fdtoverlay -i "$MERGED_VIDEO" -o "$MERGED_CARDPUTER" "$CARDPUTER_DTBO"
 
-# The Cardputer overlay adds the JD9852 panel, while jd9852a.dtbo disables
-# the stock ANX7625 bridge. Both share dsi@5e94000, so the latter must be
-# applied to the final DTB before it is installed.
-fdtoverlay -i "$MERGED_CARDPUTER" -o "$FINAL_DTB" "$JD9852_DTBO"
+	# The Cardputer overlay adds the JD9852 panel, while jd9852a.dtbo disables
+	# the stock ANX7625 bridge. Both share dsi@5e94000, so the latter must be
+	# applied to the final DTB before it is installed.
+	fdtoverlay -i "$MERGED_CARDPUTER" -o "$FINAL_DTB" "$JD9852_DTBO"
 
-strings "$FINAL_DTB" > "$BUILD_DIR/final-dtb.strings"
-if ! grep -Fq 'elida,jd9852' "$BUILD_DIR/final-dtb.strings"; then
-	die "merged DTB does not contain the JD9852 panel node"
-fi
-if ! grep -Fq 'm5stack,m5io-hub' "$BUILD_DIR/final-dtb.strings"; then
-	die "merged DTB does not contain the M5IO-HUB node"
-fi
-dtc -I dtb -O dts -o "$BUILD_DIR/final-dtb.dts" "$FINAL_DTB"
-ANX7625_PATH='/soc@0/geniqup@4ac0000/i2c@4a84000/encoder@58'
-if [[ "$(fdtget "$FINAL_DTB" "$ANX7625_PATH" status 2>/dev/null || true)" != "disabled" ]]; then
-	die "merged DTB leaves the ANX7625 bridge enabled; it conflicts with JD9852 on dsi@5e94000"
-fi
-awk '
-/i2c@4a80000[[:space:]]*\{/ { in_i2c = 1 }
-in_i2c { print }
-in_i2c && /};/ { exit }
-' "$BUILD_DIR/final-dtb.dts" > "$BUILD_DIR/qup0-i2c.dts"
-if ! grep -Fq 'status = "disabled";' "$BUILD_DIR/qup0-i2c.dts"; then
-	die "merged DTB leaves physical QUP0 I2C enabled"
+	strings "$FINAL_DTB" > "$BUILD_DIR/final-dtb.strings"
+	if ! grep -Fq 'elida,jd9852' "$BUILD_DIR/final-dtb.strings"; then
+		die "merged DTB does not contain the JD9852 panel node"
+	fi
+	if ! grep -Fq 'm5stack,m5io-hub' "$BUILD_DIR/final-dtb.strings"; then
+		die "merged DTB does not contain the M5IO-HUB node"
+	fi
+	dtc -I dtb -O dts -o "$BUILD_DIR/final-dtb.dts" "$FINAL_DTB"
+	ANX7625_PATH='/soc@0/geniqup@4ac0000/i2c@4a84000/encoder@58'
+	if [[ "$(fdtget "$FINAL_DTB" "$ANX7625_PATH" status 2>/dev/null || true)" != "disabled" ]]; then
+		die "merged DTB leaves the ANX7625 bridge enabled; it conflicts with JD9852 on dsi@5e94000"
+	fi
+	awk '
+	/i2c@4a80000[[:space:]]*\{/ { in_i2c = 1 }
+	in_i2c { print }
+	in_i2c && /};/ { exit }
+	' "$BUILD_DIR/final-dtb.dts" > "$BUILD_DIR/qup0-i2c.dts"
+	if ! grep -Fq 'status = "disabled";' "$BUILD_DIR/qup0-i2c.dts"; then
+		die "merged DTB leaves physical QUP0 I2C enabled"
+	fi
+else
+	echo "[3/5] Skipping DTB build (--dtb not given)"
 fi
 
 cp "$JD9852_DIR/panel-elida-jd9852a.ko" "$BUILD_DIR/"
-for module in m5io-hub-core m5io-hub-gpio m5hub-gpio-leds m5io-hub-i2c m5io-hub-uart; do
+for module in "${M5IO_MODULES[@]}"; do
 	cp "$CARDPUTER_DIR/$module.ko" "$BUILD_DIR/"
 done
 cp "$TCA8418_DIR/tca8418_keypad_m5stack.ko" "$BUILD_DIR/"
 cp "$CARDPUTER_DIR/99-cardputerzeroq-keyboard.rules" "$BUILD_DIR/"
 cp "$TCA8418_DIR/tca8418_keypad_m5stack_keymap.map" "$BUILD_DIR/"
 
-echo "[4/5] Uploading modules and DTB to ADB device $ADB_SERIAL"
+echo "[4/5] Uploading modules to ADB device $ADB_SERIAL"
 
 REMOTE_TMP="/tmp/cardputerzeroq-deploy-$$"
 adb -s "$ADB_SERIAL" shell "mkdir -p '$REMOTE_TMP'"
-for artifact in \
-	panel-elida-jd9852a.ko \
-	m5io-hub-core.ko \
-	m5io-hub-gpio.ko \
-	m5hub-gpio-leds.ko \
-	m5io-hub-i2c.ko \
-	m5io-hub-uart.ko \
-	tca8418_keypad_m5stack.ko \
-	99-cardputerzeroq-keyboard.rules \
-	tca8418_keypad_m5stack_keymap.map; do
+for module in "${ALL_MODULES[@]}"; do
+	adb -s "$ADB_SERIAL" push "$BUILD_DIR/$module.ko" "$REMOTE_TMP/$module.ko" >/dev/null
+done
+for artifact in 99-cardputerzeroq-keyboard.rules tca8418_keypad_m5stack_keymap.map; do
 	adb -s "$ADB_SERIAL" push "$BUILD_DIR/$artifact" "$REMOTE_TMP/$artifact" >/dev/null
 done
-adb -s "$ADB_SERIAL" push "$FINAL_DTB" "$REMOTE_TMP/$FINAL_DTB_NAME" >/dev/null
+if ((INSTALL_DTB)); then
+	adb -s "$ADB_SERIAL" push "$FINAL_DTB" "$REMOTE_TMP/$FINAL_DTB_NAME" >/dev/null
+fi
 
 remote_root_script() {
 	{
@@ -200,14 +238,7 @@ set -eu
 KVER=\$(uname -r)
 MODULE_DIR=/usr/lib/modules/\$KVER/extra
 install -d "\$MODULE_DIR" /etc/udev/rules.d /usr/share/keymaps
-for module in \
-    panel-elida-jd9852a \
-    m5io-hub-core \
-    m5io-hub-gpio \
-    m5hub-gpio-leds \
-    m5io-hub-i2c \
-    m5io-hub-uart \
-    tca8418_keypad_m5stack; do
+for module in $REMOTE_MODULES; do
     install -m 0644 "$REMOTE_TMP/\$module.ko" "\$MODULE_DIR/\$module.ko"
 done
 install -m 0644 "$REMOTE_TMP/99-cardputerzeroq-keyboard.rules" \
@@ -215,40 +246,59 @@ install -m 0644 "$REMOTE_TMP/99-cardputerzeroq-keyboard.rules" \
 install -m 0644 "$REMOTE_TMP/tca8418_keypad_m5stack_keymap.map" \
     /usr/share/keymaps/tca8418_keypad_m5stack_keymap.map
 
-DTB_PATH=/boot/efi/dtb/qcom/qrb2210-arduino-imola.dtb
-DTB_ALIAS=/boot/efi/dtb/qcom/qrb2210-arduino-imola-jd9852.dtb
-if [ -f "\$DTB_PATH" ]; then
-    cp -p "\$DTB_PATH" "\$DTB_PATH.before-cardputerzeroq-\$(date +%Y%m%d-%H%M%S)"
+if [ "$INSTALL_DTB" = "1" ]; then
+    DTB_PATH=/boot/efi/dtb/qcom/qrb2210-arduino-imola.dtb
+    DTB_ALIAS=/boot/efi/dtb/qcom/qrb2210-arduino-imola-jd9852.dtb
+    if [ -f "\$DTB_PATH" ]; then
+        cp -p "\$DTB_PATH" "\$DTB_PATH.before-cardputerzeroq-\$(date +%Y%m%d-%H%M%S)"
+    fi
+    install -m 0644 "$REMOTE_TMP/$FINAL_DTB_NAME" "\$DTB_PATH"
+    install -m 0644 "$REMOTE_TMP/$FINAL_DTB_NAME" "\$DTB_ALIAS"
 fi
-install -m 0644 "$REMOTE_TMP/$FINAL_DTB_NAME" "\$DTB_PATH"
-install -m 0644 "$REMOTE_TMP/$FINAL_DTB_NAME" "\$DTB_ALIAS"
 
 depmod -a "\$KVER"
-update-initramfs -u -k "\$KVER"
-MACHINE_ID=\$(cat /etc/machine-id)
-EFI_INITRD=/boot/efi/\$MACHINE_ID/\$KVER/initrd.img-\$KVER
-if [ -f /boot/initrd.img-\$KVER ] && [ -d "\$(dirname "\$EFI_INITRD")" ]; then
-    install -m 0755 /boot/initrd.img-\$KVER "\$EFI_INITRD"
+if [ "$INSTALL_DTB" = "1" ]; then
+    update-initramfs -u -k "\$KVER"
+    MACHINE_ID=\$(cat /etc/machine-id)
+    EFI_INITRD=/boot/efi/\$MACHINE_ID/\$KVER/initrd.img-\$KVER
+    if [ -f /boot/initrd.img-\$KVER ] && [ -d "\$(dirname "\$EFI_INITRD")" ]; then
+        install -m 0755 /boot/initrd.img-\$KVER "\$EFI_INITRD"
+    fi
 fi
 sync
-sha256sum "\$DTB_PATH" "\$MODULE_DIR/panel-elida-jd9852a.ko"
+if [ "$INSTALL_DTB" = "1" ]; then
+    sha256sum "\$DTB_PATH" "\$MODULE_DIR/panel-elida-jd9852a.ko"
+else
+    sha256sum "\$MODULE_DIR/panel-elida-jd9852a.ko"
+fi
 REMOTE
 
 adb -s "$ADB_SERIAL" shell "rm -rf '$REMOTE_TMP'"
 
 echo "Artifacts saved in: $BUILD_DIR"
-sha256sum "$FINAL_DTB" "$BUILD_DIR/panel-elida-jd9852a.ko"
+if ((INSTALL_DTB)); then
+	sha256sum "$FINAL_DTB" "$BUILD_DIR/panel-elida-jd9852a.ko"
+else
+	sha256sum "$BUILD_DIR/panel-elida-jd9852a.ko"
+fi
 
 if ((REBOOT)); then
 	echo "[5/5] Rebooting device"
 	printf '%s\n' "$DEVICE_PASSWORD" | \
 		adb -s "$ADB_SERIAL" shell 'sudo -S -p "" systemctl reboot' || true
-	cat <<'EOF'
-Device reboot requested. After ADB returns, verify:
-  cat /sys/class/drm/*DSI*/modes
-  dmesg | grep -E 'DSI config|jd9852|vblank|FIFO|timeout'
-EOF
+	echo "Device reboot requested. After ADB returns, verify:"
+	echo "  lsmod | grep -E 'm5io|m5hub|tca8418|jd9852'"
+	echo "  dmesg | grep -iE 'm5io|m5hub|backlight|defer'"
+	if ((INSTALL_DTB)); then
+		echo "  cat /sys/class/drm/*DSI*/modes"
+		echo "  dmesg | grep -E 'DSI config|jd9852|vblank|FIFO|timeout'"
+	fi
 else
-	echo "[5/5] Upload complete; reboot was not requested"
-	echo "Run again with --reboot to activate the new DTB and modules."
+	if ((INSTALL_DTB)); then
+		echo "[5/5] Upload complete; reboot was not requested"
+		echo "Run again with --reboot to activate the new DTB and modules."
+	else
+		echo "[5/5] Upload complete; reboot was not requested"
+		echo "Run again with --reboot to activate the new modules."
+	fi
 fi

@@ -3,7 +3,8 @@
 
 The kernel driver performs the complete synchronous IAP transaction.  This
 script only keeps the image buffer alive, submits the ioctl, and decodes the
-result returned by the driver.
+result returned by the driver.  With the default options the driver first
+issues the new firmware's FUNC=0/ARG=3 MCU_RESET command; Linux is not rebooted.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ OTA_START_ADDRESS = 0x08002800
 OTA_END_ADDRESS = 0x08020000
 OTA_PAGE_SIZE = 0x0800
 OTA_IMAGE_SIZE = OTA_END_ADDRESS - OTA_START_ADDRESS
-OTA_PAGE_COUNT = OTA_IMAGE_SIZE // OTA_PAGE_SIZE
+OTA_PAGE_COUNT = (0x0801E000 - OTA_START_ADDRESS) // OTA_PAGE_SIZE
 OTA_APP_REGION_SIZE = 0x0801E000 - OTA_START_ADDRESS
 OTA_APP_PAYLOAD_SIZE = OTA_APP_REGION_SIZE - 4
 OTA_USER_DATA_SIZE = OTA_END_ADDRESS - 0x0801E000
@@ -89,16 +90,22 @@ def parse_args() -> argparse.Namespace:
         default=2000,
         help="timeout for each MCU IAP command, 100..30000 ms (default: 2000)",
     )
+    parser.add_argument(
+        "--wait-for-reset", action="store_true",
+        help=("recovery only: wait up to 60 s for an external MCU reset; "
+              "normal OTA uses FUNC=0/ARG=3 MCU_RESET"),
+    )
     return parser.parse_args()
 
 
 def package_image(source: bytes) -> bytearray:
     """Turn a raw/APP image into the fixed-size image expected by the ioctl."""
-    if len(source) == OTA_IMAGE_SIZE:
-        return bytearray(source)
-
-    if len(source) == OTA_APP_REGION_SIZE:
-        return bytearray(source) + b"\xff" * OTA_USER_DATA_SIZE
+    if len(source) in (OTA_IMAGE_SIZE, OTA_APP_REGION_SIZE):
+        packed = bytearray(source[:OTA_APP_REGION_SIZE])
+        expected, = struct.unpack_from("<I", packed, OTA_APP_PAYLOAD_SIZE)
+        if binascii.crc32(packed[:OTA_APP_PAYLOAD_SIZE]) & 0xFFFFFFFF != expected:
+            raise ValueError("packed APP CRC32 mismatch")
+        return packed
 
     if len(source) > OTA_APP_PAYLOAD_SIZE:
         raise ValueError(
@@ -120,10 +127,10 @@ def package_image(source: bytes) -> bytearray:
     payload = bytearray(source)
     payload.extend(b"\xff" * (OTA_APP_PAYLOAD_SIZE - len(payload)))
     crc = binascii.crc32(payload) & 0xFFFFFFFF
-    return payload + struct.pack("<I", crc) + b"\xff" * OTA_USER_DATA_SIZE
+    return payload + struct.pack("<I", crc)
 
 
-def make_request(image: bytearray, timeout_ms: int) -> bytearray:
+def make_request(image: bytearray, timeout_ms: int, wait_for_reset: bool = False) -> bytearray:
     image_address = ctypes.addressof(ctypes.c_ubyte.from_buffer(image))
     return bytearray(
         struct.pack(
@@ -136,7 +143,7 @@ def make_request(image: bytearray, timeout_ms: int) -> bytearray:
             0,
             0,
             0,
-            0,
+            int(wait_for_reset),
         )
     )
 
@@ -178,10 +185,13 @@ def main() -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    request = make_request(image, args.timeout_ms)
+    request = make_request(image, args.timeout_ms, args.wait_for_reset)
     print(
-        f"Starting OTA: {args.image} ({len(image)} bytes, {OTA_PAGE_COUNT} pages)"
+        f"Starting OTA: {args.image} ({len(image)} bytes, {OTA_PAGE_COUNT} APP pages; user data preserved)",
+        flush=True,
     )
+    if args.wait_for_reset:
+        print("Recovery mode: waiting for external MCU reset (60 s). Linux is not restarted.", flush=True)
     try:
         fd = os.open(args.device, os.O_RDWR | os.O_CLOEXEC)
     except OSError as exc:

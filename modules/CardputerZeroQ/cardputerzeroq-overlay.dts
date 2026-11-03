@@ -76,6 +76,26 @@
                     interrupt-controller;
                     #interrupt-cells = <2>;
                     status = "okay";
+
+                    /* PD0_SD_EN (M5IO-HUB logic index 10) gates TF_3V3_L3
+                     * through U29 and is pulled low by R116, so the MicroSD
+                     * slot stays unpowered until Linux drives it high.  It
+                     * also feeds VCCB of the TF_SPI2_* level shifters, i.e.
+                     * the card's data lines are dead as well.
+                     *
+                     * mmc-spi-slot has no regulator/setpower hook (see
+                     * mmc_spi_probe(): "no poweroff"), so a GPIO regulator
+                     * would never be consumed by the host driver.  A hog
+                     * drives the line during gpiochip registration, which
+                     * happens before the deferred mmc_spi probe and hence
+                     * before the first card detect scan.
+                     */
+                    sd_en_hog: sd-en-hog {
+                        gpio-hog;
+                        gpios = <10 GPIO_ACTIVE_HIGH>;
+                        output-high;
+                        line-name = "SD_EN";
+                    };
                 };
 
                 m5io_hub_backlight: backlight {
@@ -358,15 +378,25 @@
                 };
             };
 
+            /* MicroSD slot.  The card is wired to the same QUP0 (SE0) bus as
+             * the M5IO-HUB bridge: SCK/MOSI/MISO are shared, the hub sits on
+             * native CS0 and the card on CS1 = SOC_SPI_NSS1 (SoC GPIO82,
+             * level shifted to TF_SPI2_NSS1), driven as a GPIO chip select.
+             *
+             * Card detect is PC13_SD_DET on the G030, i.e. M5IO-HUB logic
+             * index 6 (R143 pulls it up, the socket switch shorts it to GND
+             * when a card is inserted -> GPIO_ACTIVE_LOW).  Slot power
+             * (PD0_SD_EN, index 10) is hogged high in the gpio node above.
+             */
             mmc-slot@1 {
                 compatible = "mmc-spi-slot";
                 reg = <1>;
-                spi-max-frequency = <20000000>;
+                spi-max-frequency = <25000000>;
                 voltage-ranges = <3300 3300>;
                 bus-width = <1>;
                 disable-wp;
                 cd-gpios = <&m5io_hub_gpio 6 GPIO_ACTIVE_LOW>;
-                status = "disabled";
+                status = "okay";
             };
         };
     };

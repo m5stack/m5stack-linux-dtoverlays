@@ -201,3 +201,4 @@ module_platform_driver(m5io_hub_backlight_driver);
 MODULE_AUTHOR("M5Stack");
 MODULE_DESCRIPTION("M5IO-HUB LCD backlight driver");
 MODULE_LICENSE("GPL");
+
