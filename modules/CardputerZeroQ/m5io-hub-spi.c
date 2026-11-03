@@ -14,6 +14,7 @@
  * SPI 总线的编号来自 DT（缺省 bus 0），多路总线各自一个控制器节点。
  */
 
+#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -79,10 +80,19 @@ static int m5io_hub_spi_validate_groups(struct spi_message *msg)
   return 0;
 }
 
+/*
+ * SPI 核心保证 transfer_one_message 在睡眠上下文执行：spi_sync 文档写明
+ * “Context: can sleep”，队列空时它在调用者上下文直接泵消息，否则交给
+ * spi kworker 执行；spi_async 只是入队。core API 会睡眠（mutex/kzalloc/
+ * wait），所以这里必须直接调用，不能再套 workqueue —— SPI 核心要求回调
+ * 同步完成消息并调 spi_finalize_current_message()。
+ */
 static int m5io_hub_spi_transfer_message(struct spi_controller *ctlr,
                                         struct spi_message *msg)
 {
   struct m5io_hub_spi *ms = spi_controller_get_devdata(ctlr);
+
+  might_sleep();
   int ret, flush_ret;
 
   msg->actual_length = 0;

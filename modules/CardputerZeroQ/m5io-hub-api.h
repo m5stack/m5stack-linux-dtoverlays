@@ -48,9 +48,9 @@ struct spi_message;
  *    字节1 拆为两段：
  *      SEQ(bits5:0)  通道内独立序号，每个通道各自 0..63 循环递增，
  *                    通道之间互不相关；接收端按 SEQ 顺序拼接分片。
- *      STA(bits7:6)  本帧在同一条消息中的位置：
- *                    0 = 传输中（中间包）
- *                    1 = 开始传输（首包）
+ *      STA(bits7:6) 本帧在同一条消息中的位置：
+ *                    0 = 传输中（传输包）
+ *                    1 = 引导帧（表示从机后面还有多少size的数据，供soc的spi收发状态机使用）
  *                    2 = 传输完成（最后一个包）
  *                    3 = 开始且结束（单包消息）
  *
@@ -76,7 +76,8 @@ struct spi_message;
 
 /* DATA 帧字节 1 的位域：STA(bits7:6) | SEQ(bits5:0)。
  * SEQ 为通道内独立序号，每通道 0..63 循环递增，通道之间互不相关；
- * STA 标记本帧在同一条消息中的位置：0=中间包，1=首包，2=末包，3=开始且结束（单包）。
+ * STA 标记本帧在同一条消息中的位置：0=传输包，1=从机引导帧，2=传输完成（末包），
+ * 3=开始且结束（单包消息）。不再有“首包”标记：多帧消息的首个数据帧就是 0。
  * 组帧：byte1 = (sta << M5IO_HUB_DATA_STA_SHIFT) | (seq & M5IO_HUB_DATA_SEQ_MASK)
  */
 #define M5IO_HUB_DATA_SEQ_MASK   0x3fU
@@ -84,11 +85,26 @@ struct spi_message;
 #define M5IO_HUB_DATA_STA_SHIFT  6U
 
 enum {
-    M5IO_HUB_DATA_STA_MID       = 0,
-    M5IO_HUB_DATA_STA_START     = 1,
-    M5IO_HUB_DATA_STA_END       = 2,
-    M5IO_HUB_DATA_STA_START_END = 3
+    M5IO_HUB_DATA_STA_MID       = 0, /* 传输中（传输包） */
+    M5IO_HUB_DATA_STA_GUIDE     = 1, /* 从机引导帧，见下方定义 */
+    M5IO_HUB_DATA_STA_END       = 2, /* 传输完成（最后一个包） */
+    M5IO_HUB_DATA_STA_START_END = 3  /* 开始且结束（单包消息） */
 };
+
+/* 从机引导帧（slave guide frame）：MCU -> SoC 方向的一种 DATA 帧，STA=1。
+ *
+ * 它出现在同一通道的从机数据帧之前，告诉 SoC“后面还有多少字节的用户数据”：
+ *   - CHN：与后续数据帧相同，仍是 DATA 通道号；
+ *   - SEQ：仍按该通道的序号递增，不因为是引导帧而重置；
+ *   - LEN=2，payload[2]={u16 size(LE)}：后续 DATA 帧中用户数据的总字节数
+ *     （不含帧头、LEN、CRC）；size=0 表示后面没有用户数据；
+ *   - 引导帧本身不携带用户数据，但和其它 MCU->SoC DATA 帧一样必须回
+ *     WINDOW_ACK，否则会占满 MCU 的 PID 窗口。
+ * SoC 的 SPI 收发状态机收到引导帧后按 size 预置本次 MISO 读取长度，再按
+ * SEQ 顺序拼接后面的数据帧。SoC -> MCU 方向没有引导帧：请求长度由 TOKEN
+ * 中的 len 字段决定；该方向的多帧消息没有首包标记，末帧用 STA=2，单包用 STA=3。
+ */
+#define M5IO_HUB_DATA_GUIDE_SIZE_LEN 2U
 
 typedef void (*m5io_hub_gpio_irq_handler_t)(void *p, unsigned int pin);
 typedef void (*m5io_hub_chn_data_handler_t)(void *p, const u8 *buf, unsigned int len);
@@ -443,7 +459,7 @@ int m5io_hub_uart_reset(struct m5io_hub *hub, u8 bus);
  * 请求：DATA 帧 CH=M5IO_HUB_UART_CH1（bus=1）/M5IO_HUB_UART_CH2（bus=2），payload[len]={u8 data[len]}，无前缀
  * 应答：WINDOW_ACK（FUNC=M5IO_HUB_PROTOCOL_FUN/ARG=M5IO_HUB_PROTOCOL_dataAck/LEN=6，payload[6]={u8 chn, u8 pid, u16 op_id(LE), u8 kind, u8 status}）
  * DATA：纯字节流；超过 255 B 必须拆成多帧，SEQ 按通道递增（6 bit 回绕），
- *       STA 标记单包/首包/中间包/末包，接收端按 SEQ 顺序拼回。
+ *       STA 标记 0=传输包、2=末包、3=单包；接收端按 SEQ 顺序拼回。
  */
 int m5io_hub_uart_send_data(struct m5io_hub *hub, u8 bus, const u8 *data, unsigned int len);
 

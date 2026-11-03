@@ -23,6 +23,7 @@
  * advertise LIRC_SET_SEND_DUTY_CYCLE。
  */
 
+#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -132,6 +133,11 @@ static void m5io_hub_ir_store(struct rc_dev *rc, unsigned int duration_us,
  * RX：MCU 已经完成引导码/终止 MARK 的识别并去掉它们，只上报逻辑字节。
  * 这里按同样的 NEC 时序把字节还原成完整波形，交给 rc-core 的软件解码器。
  */
+/*
+ * RX 回调由 core 的收帧路径调用（可能是 IRQ/线程上下文）：这里只做
+ * ir_raw_event_store()/ir_raw_event_handle()，rc-core 明确允许在中断上下文
+ * 调用，不能调会睡眠的 m5io_hub_ir_* API。
+ */
 static void m5io_hub_ir_rx(void *data, const u8 *buf, unsigned int len)
 {
   struct m5io_hub_ir *ir = data;
@@ -171,9 +177,12 @@ static void m5io_hub_ir_rx(void *data, const u8 *buf, unsigned int len)
  * TX：rc-core 交来的是 LIRC pulse 模式的时长数组，奇数个元素、MARK 开头、
  * 终止 MARK 结尾。解成逻辑字节后由 MCU 重新加引导码并按当前时序调制。
  */
+/* rc-core 在 lirc_transmit() 的 dev->lock mutex 下调用 tx_ir，可睡眠：
+ * 会走 core 的 stop_reace/send_data/start_reace（含 WINDOW_ACK 等待）。 */
 static int m5io_hub_ir_tx(struct rc_dev *rc, unsigned int *txbuf,
                           unsigned int count)
 {
+  might_sleep();
   struct m5io_hub_ir *ir = rc->priv;
   u8 data[M5IO_IR_MAX_BYTES] = {};
   unsigned int bits, bytes, index;
@@ -239,8 +248,10 @@ static int m5io_hub_ir_tx(struct rc_dev *rc, unsigned int *txbuf,
   return ret ? ret : (int)count;
 }
 
+/* 同样在 lirc ioctl/write 持有 dev->lock mutex 时调用。 */
 static int m5io_hub_ir_set_carrier(struct rc_dev *rc, u32 carrier)
 {
+  might_sleep();
   struct m5io_hub_ir *ir = rc->priv;
   int ret, restart;
 
@@ -282,8 +293,10 @@ static int m5io_hub_ir_set_carrier(struct rc_dev *rc, u32 carrier)
   return ret;
 }
 
+/* rc_open()/rc_close() 持 rdev->lock mutex 调用这两个回调，可睡眠。 */
 static int m5io_hub_ir_open(struct rc_dev *rc)
 {
+  might_sleep();
   struct m5io_hub_ir *ir = rc->priv;
   int ret;
 
@@ -316,6 +329,7 @@ out_unlock:
 
 static void m5io_hub_ir_close(struct rc_dev *rc)
 {
+  might_sleep();
   struct m5io_hub_ir *ir = rc->priv;
 
   mutex_lock(&ir->lock);

@@ -13,7 +13,9 @@
  *     请求，由 tx_work 在进程上下文转发；只有真正停过才补 START，正常写路径
  *     不额外多发 TOKEN；
  *   - 停止接收用 m5io_hub_uart_stop_rx()，同样由 tx_work 在进程上下文转发
- *     （uart_ops.stop_rx 也是持 port->lock 的原子上下文）。
+ *     （uart_ops.stop_rx 也是持 port->lock 的原子上下文）；
+ *   - tx_empty 的回调契约是“不可睡眠”，不能直接查 core（core 全程可能睡眠），
+ *     由 tx_empty_work 异步查询 MCU 并缓存结果，回调只读缓存。
  * TX 放在 work item 里做，因为配置与发送都可能睡眠，不能占用 uart_port
  * 的 spinlock；RX 回调在 core 的工作队列上下文里直接送 tty flip buffer。
  * API 里的 bus 就是 USART1/2（1/2）。RX 的“已配置/已使能”门控在 core
@@ -45,6 +47,9 @@
 /* MCU 在 RX 还有排队数据时会用 BUSY 拒绝 CONFIG，稍后重试即可。 */
 #define M5IO_HUB_UART_CFG_BUSY_TRIES 6U
 #define M5IO_HUB_UART_CFG_BUSY_DELAY_US 20000U
+/* tx_empty 缓存：有人查询后的刷新窗口，以及窗口内的轮询间隔。 */
+#define M5IO_HUB_UART_TX_EMPTY_WINDOW_MS 2000U
+#define M5IO_HUB_UART_TX_EMPTY_POLL_MS 10U
 
 struct m5io_hub_uart;
 
@@ -70,6 +75,11 @@ struct m5io_hub_uart_port {
   atomic_t rx_stop_pending;
   atomic_t mcu_rx_stopped;  /* 1 = MCU 已收到 RX 停止命令 */
   atomic_t rx_enabled;
+  /* tx_empty 的异步缓存：回调是原子上下文，不能睡眠查 MCU。 */
+  struct delayed_work tx_empty_work;
+  atomic_t tx_empty_valid; /* 1 = 缓存可信 */
+  atomic_t tx_empty;       /* 1 = MCU 发送窗口为空 */
+  unsigned long tx_empty_deadline; /* 仍有人查询的时间窗 */
   /* uart_flush_buffer()（TCFLSH）的代号：tx_work 用它判断 peek 的数据是否作废。 */
   unsigned int xmit_gen;
   u8 bus; /* API 端口号：1=USART1，2=USART2 */
@@ -101,10 +111,40 @@ static struct m5io_hub_uart_port *m5io_hub_uart_from_port(struct uart_port *port
   return container_of(port, struct m5io_hub_uart_port, port);
 }
 
+/*
+ * uart_ops.tx_empty 的契约是“不可睡眠”（调用方可能持有 port->lock），而
+ * core 的所有 API 都会睡眠（mutex/kzalloc/wait_for_completion），所以这里
+ * 只能在 work 里查 MCU，回调本身只读缓存。
+ */
+static void m5io_hub_uart_tx_empty_work(struct work_struct *work)
+{
+  struct m5io_hub_uart_port *up = container_of(
+      to_delayed_work(work), struct m5io_hub_uart_port, tx_empty_work);
+  int ret;
+
+  if (!READ_ONCE(up->configured) || READ_ONCE(up->io_failed))
+    return;
+
+  ret = m5io_hub_uart_tx_empty(up->mu->hub, up->bus);
+  if (ret < 0) {
+    atomic_set(&up->tx_empty_valid, 0);
+    dev_dbg_ratelimited(up->port.dev, "UART%u tx_empty query failed: %d\n",
+                        up->bus, ret);
+  } else {
+    atomic_set(&up->tx_empty, ret ? 1 : 0);
+    atomic_set(&up->tx_empty_valid, 1);
+  }
+
+  /* 只有还有人盯着 tx_empty 时才继续刷新，避免关掉端口后后台轮询。 */
+  if ((ret < 0 || !atomic_read(&up->tx_empty)) &&
+      time_before(jiffies, READ_ONCE(up->tx_empty_deadline)))
+    mod_delayed_work(system_wq, &up->tx_empty_work,
+                     msecs_to_jiffies(M5IO_HUB_UART_TX_EMPTY_POLL_MS));
+}
+
 static unsigned int m5io_hub_uart_op_tx_empty(struct uart_port *port)
 {
   struct m5io_hub_uart_port *up = m5io_hub_uart_from_port(port);
-  int ret;
 
   /* 驱动里还有没提交/正在提交的块：肯定不空，也不必问 MCU。 */
   if (atomic_read(&up->tx_inflight) || atomic_read(&up->tx_pending))
@@ -115,19 +155,17 @@ static unsigned int m5io_hub_uart_op_tx_empty(struct uart_port *port)
   if (!READ_ONCE(up->configured))
     return TIOCSER_TEMT;
 
+  if (atomic_read(&up->tx_empty_valid) && atomic_read(&up->tx_empty))
+    return TIOCSER_TEMT;
+
   /*
-   * MCU 侧可能还有它自己 TX FIFO 里的字节，只有它能权威回答是否排空。
-   * uart_ops 的 tx_empty 文档标注“must not sleep”，但内核里仅有的三个调用
-   * 点（uart_wait_until_sent、TIOCSERGETLSR、suspend drain）都在进程上下文
-   * 且不持有 port->lock，所以这里做一次同步查询是安全的。
+   * 原子上下文不能睡眠：延长刷新窗口并踢一次异步查询，本次先保守返回 0
+   * （发送未完成）。uart_wait_until_sent 等调用点会反复查询，缓存随即更新。
    */
-  ret = m5io_hub_uart_tx_empty(up->mu->hub, up->bus);
-  if (ret < 0) {
-    dev_dbg_ratelimited(port->dev, "UART%u tx_empty query failed: %d\n",
-                        up->bus, ret);
-    return 0;
-  }
-  return ret ? TIOCSER_TEMT : 0;
+  WRITE_ONCE(up->tx_empty_deadline,
+             jiffies + msecs_to_jiffies(M5IO_HUB_UART_TX_EMPTY_WINDOW_MS));
+  mod_delayed_work(system_wq, &up->tx_empty_work, 0);
+  return 0;
 }
 
 static unsigned int m5io_hub_uart_get_mctrl(struct uart_port *port)
@@ -197,6 +235,7 @@ static void m5io_hub_uart_mark_unknown(struct m5io_hub_uart_port *up)
   atomic_set(&up->mcu_tx_stopped, 0);
   atomic_set(&up->rx_stop_pending, 0);
   atomic_set(&up->mcu_rx_stopped, 0);
+  atomic_set(&up->tx_empty_valid, 0);
 }
 
 static void m5io_hub_uart_tx_work(struct work_struct *work)
@@ -279,6 +318,8 @@ static void m5io_hub_uart_tx_work(struct work_struct *work)
     atomic_set(&up->tx_inflight, 1);
     spin_unlock_irqrestore(&port->lock, flags);
 
+    /* 新字节进 MCU FIFO，之前“已排空”的缓存不再可信。 */
+    atomic_set(&up->tx_empty_valid, 0);
     ret = m5io_hub_uart_send_data(up->mu->hub, up->bus, up->tx_buf, count);
 
     atomic_set(&up->tx_inflight, 0);
@@ -372,6 +413,8 @@ static void m5io_hub_uart_flush_buffer(struct uart_port *port)
    */
   up->xmit_gen++;
   atomic_set(&up->tx_pending, 0);
+  /* MCU 侧可能还在发 TCFLSH 前收下的字节，让下次 tx_empty 重新问一次。 */
+  atomic_set(&up->tx_empty_valid, 0);
 }
 
 static void m5io_hub_uart_enable_ms(struct uart_port *port) {}
@@ -415,7 +458,9 @@ static void m5io_hub_uart_shutdown(struct uart_port *port)
   atomic_set(&up->tx_cmd_pending, M5IO_HUB_UART_TX_CMD_NONE);
   atomic_set(&up->tx_hold, 0);
   atomic_set(&up->mcu_tx_stopped, 0);
+  atomic_set(&up->tx_empty_valid, 0);
   cancel_delayed_work_sync(&up->tx_work);
+  cancel_delayed_work_sync(&up->tx_empty_work);
 
   mutex_lock(&up->config_lock);
   /*
@@ -487,6 +532,7 @@ static int m5io_hub_uart_configure(struct m5io_hub_uart_port *up,
   /* CONFIG 会重新打开该端口，之前 stop_rx 留下的 MCU 状态已失效。 */
   atomic_set(&up->mcu_rx_stopped, 0);
   atomic_set(&up->rx_stop_pending, 0);
+  atomic_set(&up->tx_empty_valid, 0);
   atomic_set(&up->rx_enabled,
              up->rx_registered && (termios->c_cflag & CREAD) != 0);
   atomic_set(&up->tx_enabled, 1);
@@ -612,6 +658,10 @@ static int m5io_hub_uart_register_port(struct platform_device *pdev,
   spin_lock_init(&port->lock);
   mutex_init(&up->config_lock);
   INIT_DELAYED_WORK(&up->tx_work, m5io_hub_uart_tx_work);
+  INIT_DELAYED_WORK(&up->tx_empty_work, m5io_hub_uart_tx_empty_work);
+  atomic_set(&up->tx_empty_valid, 0);
+  atomic_set(&up->tx_empty, 0);
+  WRITE_ONCE(up->tx_empty_deadline, 0);
   atomic_set(&up->tx_enabled, 0);
   atomic_set(&up->tx_inflight, 0);
   atomic_set(&up->tx_pending, 0);
@@ -697,6 +747,7 @@ err_unregister:
     if (!up->registered)
       continue;
     cancel_delayed_work_sync(&up->tx_work);
+    cancel_delayed_work_sync(&up->tx_empty_work);
     uart_remove_one_port(&m5io_hub_uart_driver, &up->port);
   }
   return ret;
@@ -715,6 +766,7 @@ static void m5io_hub_uart_remove(struct platform_device *pdev)
     if (!up->registered)
       continue;
     cancel_delayed_work_sync(&up->tx_work);
+    cancel_delayed_work_sync(&up->tx_empty_work);
     uart_remove_one_port(&m5io_hub_uart_driver, &up->port);
     if (up->rx_registered) {
       m5io_hub_uart_unregister_rx(mu->hub, up->bus);

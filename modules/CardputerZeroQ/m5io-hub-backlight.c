@@ -48,9 +48,16 @@ static int m5io_hub_backlight_apply(struct m5io_hub_backlight *backlight,
   return 0;
 }
 
+/*
+ * backlight 核心在 bd->update_lock mutex 下调用 update_status（见
+ * backlight.h 的 update_lock 注释），所以这里可以走会睡眠的 core API；
+ * pwm_config 内部是两条 TOKEN + 等待完成。
+ */
 static int m5io_hub_backlight_update_status(struct backlight_device *bl)
 {
   struct m5io_hub_backlight *backlight = bl_get_data(bl);
+
+  might_sleep();
   u8 brightness = backlight_get_brightness(bl);
 
   /* backlight 核心已经用 update_lock 串行化，这里再省掉重复下发。 */

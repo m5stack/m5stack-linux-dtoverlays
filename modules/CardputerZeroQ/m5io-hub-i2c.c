@@ -14,6 +14,7 @@
  */
 
 #include <linux/i2c.h>
+#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -77,6 +78,8 @@ static int m5io_hub_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
                              int num)
 {
   struct m5io_hub_i2c_bus *bus = i2c_get_adapdata(adap);
+
+  might_sleep();
   int ret;
 
   if (!bus || !bus->hub)
@@ -122,8 +125,22 @@ static const struct i2c_adapter_quirks m5io_hub_i2c_quirks = {
     .max_comb_2nd_msg_len = 253,
 };
 
+/*
+ * i2c 核心在“关机晚期、preempt/IRQ 关闭”的原子模式（i2c_in_atomic_xfer_mode）
+ * 会优先调用 xfer_atomic；没有这个回调时它会退回到会睡眠的 master_xfer 并
+ * WARN。本驱动所有传输都要经过 core 的 RPC（mutex/kzalloc/wait 都会睡眠），
+ * 原子上下文里不能执行，所以显式提供 xfer_atomic 直接拒绝，而不是让核心
+ * 把睡眠路径当成原子路径调用。
+ */
+static int m5io_hub_i2c_xfer_atomic(struct i2c_adapter *adap,
+                                    struct i2c_msg *msgs, int num)
+{
+  return -EOPNOTSUPP;
+}
+
 static const struct i2c_algorithm m5io_hub_i2c_algo = {
     .master_xfer = m5io_hub_i2c_xfer,
+    .xfer_atomic = m5io_hub_i2c_xfer_atomic,
     .functionality = m5io_hub_i2c_functionality,
 };
 
