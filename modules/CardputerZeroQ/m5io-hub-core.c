@@ -25,6 +25,7 @@
  */
 
 #include <linux/atomic.h>
+#include <linux/build_bug.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -90,13 +91,21 @@
 #define M5IO_HUB_SM_TIMEOUT_MS     100U /* 超时检查周期 */
 #define M5IO_HUB_SM_POLL_MS        20U  /* 无 HOST_READY 中断时的轮询周期 */
 #define M5IO_HUB_STOP_SM_WAIT_TRIES 200U /* 卸载等待 API 退出: 200 * 10ms = 2s */
-#define M5IO_HUB_RX_STREAM_MAX     M5IO_HUB_DATA_FRAME_MAX
+/*
+ * MISO 上行流解析缓冲:一次读事务最多 M5IO_HUB_IO_BUF_SIZE 字节,叠加一个
+ * 残留半帧也必须能完整装下,否则 rx_feed 会在解析前把前面的字节挤掉。
+ */
+#define M5IO_HUB_RX_STREAM_MAX     4096U
 
 /* 分区号 -> DATA 通道号(见 m5io-hub-api.h 的通道分配)。 */
 #define M5IO_HUB_I2C_CHN(bus)  ((u8)(bus))
 #define M5IO_HUB_SPI_CHN(bus)  ((u8)(M5IO_HUB_SPI_CH1 + (bus)))
 #define M5IO_HUB_UART_CHN(bus) ((u8)(M5IO_HUB_UART_CH1 + (u8)((bus) - 1U)))
 #define M5IO_HUB_IR_CHN        ((u8)M5IO_HUB_IR_CH)
+
+static_assert(M5IO_HUB_RX_STREAM_MAX >=
+              M5IO_HUB_IO_BUF_SIZE + M5IO_HUB_DATA_FRAME_MAX,
+          "rx_stream must hold one full read transaction plus a partial frame");
 
 struct m5io_hub_data_frame_desc {
     u16 offset;     /* 序列化帧在 op->buf 里的偏移 */
@@ -213,14 +222,21 @@ struct m5io_hub {
     unsigned long tid_quarantine_until[M5IO_HUB_TID_NR];
     struct m5io_hub_data_window data_win[M5IO_HUB_CHN_MAX + 1];
     u8 data_pid[M5IO_HUB_CHN_MAX + 1];
-    /* MISO 上行流解析:帧可以跨事务,rx_stream 保存半帧 */
+    /* MISO 上行流解析:帧可以跨事务,rx_stream 保存最多一次读事务+半帧 */
     u8 rx_stream[M5IO_HUB_RX_STREAM_MAX];
     u16 rx_stream_len;
     /* 引导帧 SEQ 独立计数、与通道无关,所以只保留全局最近值。 */
     u8 guide_seq;
     bool guide_seq_valid;
-    /* 引导帧宣告的 MCU 发射缓冲区待读字节数,SPI 状态机用它决定读事务长度 */
-    unsigned int mcu_tx_pending;
+    /*
+     * 引导帧宣告的本批剩余字节数。MCU 上行批次 = [引导帧 5 B][本批帧 N B],
+     * N 就是引导帧里的 u16 size。每解析出一个完整帧(不限类型:DATA 帧、
+     * TOKEN 应答帧、DATA_ACK 帧),就按该帧线上长度从这里扣减;归零表示
+     * 本批结束。批次可以跨 CS 事务,所以它和 rx_stream 一样是持久状态;
+     * SPI 状态机也用它决定读事务长度。
+     */
+    u16 batch_bytes_left;
+    bool batch_active;
 
     /* OTA / 维护态:持有期间其它 API 一律 -EBUSY */
     struct mutex ota_lock;
@@ -580,11 +596,17 @@ static void m5io_hub_queues_abort(struct m5io_hub *hub, int error)
  *   - DATA:每通道一个在飞窗口;逐帧发送,等 MCU 的 WINDOW_ACK 后再发下一
  *     帧;最后收到 kind=COMPLETE 且(无应答数据或应答数据已收齐)才完成。
  * RX:
+ *   - MCU 上行按批次组织:每个批次 = [引导帧 5 B][本批帧 N B],引导帧的
+ *     u16 就是 N(本批帧的线上字节总数,不含引导帧自身)。批内可混排 DATA
+ *     帧、TOKEN 应答帧和 DATA_ACK 帧;每解析出一个完整帧就从 N 的剩余量里
+ *     扣掉它的线上长度,归零表示本批结束。N 既用来决定 MISO 读事务长度,
+ *     也用来校验批次完整性;批次可跨 CS 事务。
+ *   - 引导帧:STA=1、无 payload、独立 SEQ;SEQ 与上次相同视为环形缓冲区
+ *     回绕,忽略其 size(仍回 WINDOW_ACK)。
  *   - TOKEN 应答按 TID 匹配;FUNC=PROTOCOL/ARG=dataAck 是 MCU 对主机 DATA
  *     的确认;FUNC=GPIO/ARG=interruptEvent 是上行中断事件。
- *   - DATA:STA=1 是引导帧(2 B 待读字节数、独立 SEQ,重复 SEQ 视为环形
- *     缓冲区回绕而忽略);STA=2 是消息末帧;MCU->SoC 的每一帧都要回
- *     WINDOW_ACK。引导帧的字节数只用于决定 MISO 交换长度。
+ *   - DATA:STA=2 是消息末帧,决定 WINDOW_ACK 的 kind=1;MCU->SoC 的每一帧
+ *     都要回 WINDOW_ACK。
  *   - 匹配在飞 data op 的应答帧(同 CH/PID)拼进 op->rx,其余交给通道回调。
  * ===================================================================== */
 
@@ -813,26 +835,29 @@ static void m5io_hub_rx_response_data(struct m5io_hub_data_window *win,
 }
 
 static void m5io_hub_rx_guide(struct m5io_hub *hub, u8 chn, u8 pid, u8 seq,
-                  const u8 *payload, u8 len)
+                  u16 count)
 {
-    u16 count = 0;
-
-    if (len >= M5IO_HUB_DATA_GUIDE_LEN)
-        count = (u16)(payload[0] | ((u16)payload[1] << 8));
-
     if (hub->guide_seq_valid && hub->guide_seq == seq) {
         /* 引导帧 SEQ 独立于通道计数;重复说明已绕回 MCU 循环缓冲区头部,忽略计数。 */
         m5io_hub_ack_enqueue(hub, chn, pid, 0, 0);
         return;
     }
 
+    if (hub->batch_active && hub->batch_bytes_left)
+        dev_warn_ratelimited(hub->dev,
+                     "new guide SEQ %u before batch end (%u byte(s) left)\n",
+                     (unsigned int)seq,
+                     (unsigned int)hub->batch_bytes_left);
+
     hub->guide_seq = seq;
     hub->guide_seq_valid = true;
     /*
-     * count 是"后续还要从 MCU 交换多少字节",不是帧数;读取长度和缓冲区
-     * 排空判断都以它为准(数据帧的结束仍由 STA=2 决定)。
+     * count 是本批帧的线上字节总数(不含引导帧自身),不是帧数,也不按通道
+     * 分开统计:同一批里可以混排 DATA 帧、TOKEN 应答帧和 DATA_ACK 帧。
+     * 下一个非重复 SEQ 的引导帧会重新开始一批。
      */
-    hub->mcu_tx_pending = count;
+    hub->batch_bytes_left = count;
+    hub->batch_active = count != 0;
     m5io_hub_ack_enqueue(hub, chn, pid, 0, 0);
 }
 
@@ -853,19 +878,22 @@ static void m5io_hub_rx_data_frame(struct m5io_hub *hub, const u8 *frame,
         return;
 
     if (sta == M5IO_HUB_DATA_STA_GUIDE) {
-        m5io_hub_rx_guide(hub, chn, pid, b1 & M5IO_HUB_DATA_SEQ_MASK, payload,
-                  len);
+        u16 count;
+
+        if (frame_len < M5IO_HUB_DATA_GUIDE_FRAME_LEN)
+            return;
+        /* 引导帧没有 payload:字节2..3 就是 2 B 的 LEN(LE)。 */
+        count = (u16)(frame[2] | ((u16)frame[3] << 8));
+        m5io_hub_rx_guide(hub, chn, pid, b1 & M5IO_HUB_DATA_SEQ_MASK, count);
         return;
     }
     if (sta == 3) /* 保留值 */
         return;
 
-    /* 这一帧已经从 MCU 发射缓冲区读走,按线上字节数扣减待读计数。 */
-    if (hub->mcu_tx_pending > frame_len)
-        hub->mcu_tx_pending -= frame_len;
-    else
-        hub->mcu_tx_pending = 0;
-
+    /*
+     * 本批字节数的扣减在 m5io_hub_rx_frame_handle() 里统一做(不分帧类型),
+     * 这里只管 DATA 帧自己的窗口/通道语义。
+     */
     win = &hub->data_win[chn];
     if (win->op && win->pid == pid) {
         m5io_hub_rx_response_data(win, payload, len, sta);
@@ -977,9 +1005,40 @@ static void m5io_hub_rx_token_frame(struct m5io_hub *hub, const u8 *frame,
     complete(&op->done);
 }
 
+/*
+ * 批次记账:引导帧宣告了紧随其后的整批帧的线上字节总数,每解析出一个完整帧
+ * (DATA 帧按 4+payload、TOKEN 帧按 3+LEN),就从这个剩余量里扣掉该帧长度;
+ * 归零即本批结束。引导帧自身不计入。
+ */
+static void m5io_hub_batch_account(struct m5io_hub *hub, u16 frame_len)
+{
+    if (!hub->batch_active)
+        return;
+    if (frame_len > hub->batch_bytes_left) {
+        dev_warn_ratelimited(hub->dev,
+                     "batch overrun: frame %u B > %u byte(s) left\n",
+                     (unsigned int)frame_len,
+                     (unsigned int)hub->batch_bytes_left);
+        hub->batch_bytes_left = 0;
+        hub->batch_active = false;
+        return;
+    }
+    hub->batch_bytes_left -= frame_len;
+    if (!hub->batch_bytes_left)
+        hub->batch_active = false;
+}
+
 static void m5io_hub_rx_frame_handle(struct m5io_hub *hub, const u8 *frame,
                      u16 frame_len)
 {
+    bool guide = (frame[0] & 1U) &&
+             (((frame[1] >> M5IO_HUB_DATA_STA_SHIFT) & 0x3U) ==
+              M5IO_HUB_DATA_STA_GUIDE);
+
+    /* 引导帧自身的 5 B 不计入它宣告的字节数。 */
+    if (!guide)
+        m5io_hub_batch_account(hub, frame_len);
+
     if (frame[0] & 1U)
         m5io_hub_rx_data_frame(hub, frame, frame_len);
     else
@@ -1001,18 +1060,42 @@ static void m5io_hub_rx_drop(struct m5io_hub *hub, unsigned int n)
 }
 
 /* 返回当前半帧还差多少字节;0 表示没有半帧。 */
+/*
+ * 返回 rx_stream 头部这一帧的线上总长度;0 表示帧头还不够。
+ * TOKEN:3 + LEN(低4位); DATA:4 + byte2 的 LEN。
+ * 特例:STA=1 的从机引导帧没有 payload,它的 LEN 字段是 2 B(低字节在
+ * byte2、高字节在 byte3),所以整帧固定 M5IO_HUB_DATA_GUIDE_FRAME_LEN。
+ */
+static u16 m5io_hub_rx_frame_total(const struct m5io_hub *hub)
+{
+    u8 b0;
+    u8 b1;
+
+    if (hub->rx_stream_len < 2)
+        return 0;
+    b0 = hub->rx_stream[0];
+    b1 = hub->rx_stream[1];
+
+    if (b0 & 1U) {
+        if (((b1 >> M5IO_HUB_DATA_STA_SHIFT) & 0x3U) ==
+            M5IO_HUB_DATA_STA_GUIDE)
+            return M5IO_HUB_DATA_GUIDE_FRAME_LEN;
+        if (hub->rx_stream_len < 3)
+            return 0;
+        return (u16)(4U + hub->rx_stream[2]);
+    }
+    return (u16)(3U + (b1 & 0xfU));
+}
+
 static unsigned int m5io_hub_rx_need(struct m5io_hub *hub)
 {
     u16 total;
 
     if (!hub->rx_stream_len)
         return 0;
-    if (hub->rx_stream_len < 3)
+    total = m5io_hub_rx_frame_total(hub);
+    if (!total)
         return M5IO_HUB_IO_READ_MIN;
-    if (hub->rx_stream[0] & 1U)
-        total = (u16)(4U + hub->rx_stream[2]);
-    else
-        total = (u16)(3U + (hub->rx_stream[1] & 0xfU));
     if (total <= hub->rx_stream_len)
         return M5IO_HUB_IO_READ_MIN;
     return (unsigned int)(total - hub->rx_stream_len);
@@ -1030,12 +1113,9 @@ static void m5io_hub_rx_try_parse(struct m5io_hub *hub, unsigned int *frames)
             m5io_hub_rx_drop(hub, 1);
             continue;
         }
-        if (hub->rx_stream_len < 3)
+        total = m5io_hub_rx_frame_total(hub);
+        if (!total)
             return;
-        if (hub->rx_stream[0] & 1U)
-            total = (u16)(4U + hub->rx_stream[2]);
-        else
-            total = (u16)(3U + (hub->rx_stream[1] & 0xfU));
         if (total > sizeof(hub->rx_stream)) {
             m5io_hub_rx_drop(hub, 1);
             continue;
@@ -1108,11 +1188,14 @@ static int m5io_hub_spi_read_dummy(struct m5io_hub *hub, bool *slave_empty)
     };
     unsigned int frames = 0;
     unsigned int need = m5io_hub_rx_need(hub);
-    unsigned int pending = READ_ONCE(hub->mcu_tx_pending);
-    unsigned int len = ALIGN(max_t(unsigned int,
-                      max_t(unsigned int, need, pending),
-                      M5IO_HUB_IO_READ_MIN),
-                 M5IO_HUB_IO_READ_MIN);
+    unsigned int pending = hub->batch_bytes_left;
+    unsigned int len;
+
+    /* 引导帧宣告的本批剩余字节,作为本次读事务长度的提示。 */
+    len = ALIGN(max_t(unsigned int,
+              max_t(unsigned int, need, pending),
+              M5IO_HUB_IO_READ_MIN),
+            M5IO_HUB_IO_READ_MIN);
     unsigned int i;
     bool all_ff = true;
     int ret;
@@ -1139,8 +1222,10 @@ static int m5io_hub_spi_read_dummy(struct m5io_hub *hub, bool *slave_empty)
         }
     }
     *slave_empty = all_ff && !frames && !hub->rx_stream_len;
-    if (*slave_empty)
-        hub->mcu_tx_pending = 0; /* 缓冲区已排空 */
+    if (*slave_empty) {
+        hub->batch_bytes_left = 0; /* 缓冲区已排空 */
+        hub->batch_active = false;
+    }
     return 0;
 }
 
@@ -1522,7 +1607,10 @@ static void m5io_hub_sm_abort_channel(struct m5io_hub *hub, u8 chn, int error)
     mutex_lock(&hub->spi_lock);
     if (hub->data_win[chn].op)
         m5io_hub_data_win_complete(hub, &hub->data_win[chn], error);
-    /* guide SEQ / 待读字节是 MCU 全局状态,单通道复位不碰。 */
+    /*
+     * guide SEQ 和本批字节数都是 MCU 全局批次状态,单通道复位不能碰,
+     * 否则会把同批里其它通道的帧算错。
+     */
     mutex_unlock(&hub->spi_lock);
 
     mutex_lock(&hub->data_lock);
@@ -1557,7 +1645,8 @@ static void m5io_hub_sm_abort(struct m5io_hub *hub, int error)
     }
     hub->rx_stream_len = 0;
     hub->guide_seq_valid = false;
-    hub->mcu_tx_pending = 0;
+    hub->batch_bytes_left = 0;
+    hub->batch_active = false;
 
     list_splice_init(&hub->ack_queue, &acks);
     hub->ack_count = 0;

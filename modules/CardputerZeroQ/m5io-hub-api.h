@@ -45,12 +45,18 @@ struct spi_message;
  *
  *    每个方向、每个通道同时只有一个在飞窗口；PID 0..3 由发送方分配。
  *
+ *    例外：STA=1 的从机引导帧没有 payload，字节2..3 就是 u16 LEN(LE)，值为
+ *    紧随其后的整批帧的线上字节总数；整帧 = 2 B 头 + 2 B LEN + 1 B CRC = 5 B。
+ *    它是每个 MCU 上行批次的头，详见下方“从机引导帧 / MCU 上行批次”定义。
+ *
  *    字节1 拆为两段：
  *      SEQ(bits5:0)  通道内独立序号，每个通道各自 0..63 循环递增，
  *                    通道之间互不相关；接收端按 SEQ 顺序拼接分片。
  *      STA(bits7:6) 本帧在同一条消息中的位置：
  *                    0 = 传输中（传输包）
- *                    1 = 引导帧（表示从机发射缓冲区还有多少字节待读取，供soc的spi收发状态机决定交换长度）
+ *                    1 = 引导帧（MCU 上行批次头，没有 payload，LEN 字段扩为
+ *                        2 B，值为本批帧的线上字节总数，供 SoC 的 SPI 状态机
+ *                        决定交换长度）
  *                    2 = 传输完成（最后一个包，单包消息也用它）
  *                    3 = 保留（原“开始且结束/单包”标志已删除）
  *
@@ -94,40 +100,52 @@ enum {
     /* 3 保留：原“开始且结束（单包）”标志已删除 */
 };
 
-/* 从机引导帧（slave guide frame）：MCU -> SoC 方向的一种 DATA 帧，STA=1。
+/* 从机引导帧（slave guide frame）/ MCU 上行批次头：MCU -> SoC 方向的一种
+ * 特殊 DATA 帧，STA=1。
  *
- * 用途：MCU 把待发数据缓存到发送队列；SoC 拉 CS 后，MCU 在规定时间内于发送
+ * 用途：MCU 把待发帧缓存在发送队列；SoC 拉 CS 后，MCU 在规定时间内于发送
  * 缓冲区头部创建一个引导帧，然后把发送缓冲区切换到 SPI 的 DMA 发送。引导帧
- * 告诉 SoC：这个引导帧之后，MCU 的发射缓冲区里还有多少字节待读取。SoC 的
- * SPI 收发状态机用它决定接下来还要从 MISO 交换多少个字节（帧数对交换长度
- * 没有意义，数据帧本身仍按 CH/SEQ/STA 解析）。
+ * 宣告紧随其后的整批帧的线上字节总数 size，SoC 的 SPI 收发状态机据此决定本批
+ * 还要从 MISO 交换多少字节；批内各帧本身仍按 TYPE/CH/SEQ/STA 正常解析。
+ * 该批字节读完后这个计数失效，下一批前面 MCU 会再放一个引导帧。
  *
- * 帧格式（普通 DATA 帧，LEN 占位 2 字节，没有用户 payload）：
- *   - STA = 1；
- *   - CHN：与后续数据帧相同的 DATA 通道号；
- *   - SEQ：使用独立的引导帧序号（0..63 循环递增），与通道号、该通道 DATA
- *     帧的 SEQ 都无关，也不占用通道 DATA 的序号；SoC 用它是否重复来判断
- *     是否绕回了 MCU 循环缓冲区的头部；
- *   - LEN = 2（M5IO_HUB_DATA_GUIDE_LEN）；LEN 后紧跟 2 字节
- *     u16 count(LE)：引导帧之后 MCU 发射缓冲区中待读取的字节数（不含引导帧
- *     自身，按缓冲区内容计，包含后续 DATA 帧的帧头/CRC）；这 2 字节是交换
- *     长度信息，不是用户数据 payload；
- *   - 和其它 MCU->SoC DATA 帧一样必须回 WINDOW_ACK，否则会占满 MCU 的
- *     PID 窗口。
+ * MCU 发送缓冲区里的一个上行批次（引导帧与本批帧紧邻、之间不插填充）：
  *
- * 引导帧之后的数据帧按普通 DATA 规则发送：除最后一帧外 STA=0，最后一帧
- * STA=2（单包消息也用 STA=2，不再有单独的“单包”标志）。消息结束只由
- * STA=2 判断，不再依赖引导帧的计数。
+ *   | 引导帧 5 B（LEN=30） | 帧1 | 帧2 | 帧3 |   ← 帧合计 30 B，整批 35 B
+ *
+ *   引导帧自身不计入 LEN；LEN = 其后每个帧的完整线上字节数之和：DATA 帧按
+ *   4 + payload、TOKEN 帧按 3 + LEN 计。批内可以混排 DATA 帧、TOKEN 应答帧
+ *   和 DATA_ACK 帧（上例 3 个 DATA 帧共 30 B，即每帧 10 B）。
+ *
+ * 帧格式（STA=1 的特殊 DATA 帧：没有 payload，LEN 字段本身占 2 字节）：
+ *   - 字节0：TYPE=1 | PID(bits2:1) | CHN(bits7:3)，同普通 DATA 帧；CHN 只是
+ *     本批关联通道的提示，接收方不得用它判断批次内容或边界；
+ *   - 字节1：STA=1 | SEQ(bits5:0)，SEQ 使用独立的引导帧序号（0..63 循环
+ *     递增），与通道号、该通道 DATA 帧的 SEQ 都无关，也不占用通道 DATA 的
+ *     序号；SoC 用它是否重复来判断是否绕回了 MCU 循环缓冲区的头部；
+ *   - 字节2..3：u16 size(LE)，本批帧的线上字节总数（不含引导帧自身）；
+ *   - 字节4：CRC-8/ATM（覆盖字节0..3）。
+ *   整帧固定 5 B（2 B 头 + 2 B size + 1 B CRC），没有用户数据 payload；
+ *   它和其它 MCU->SoC DATA 帧一样必须回 WINDOW_ACK，否则会占满 MCU 的
+ *   PID 窗口。
+ *
+ * 批次结束只由“本批字节数读完”判定：每解析出一个完整帧，就从 size 的剩余量
+ * 里减去该帧的线上字节数；剩余量归零即本批结束。STA=2 只表示这条 DATA 消息
+ * 的末帧（决定 ACK kind=1），与批次边界无关。批次可以跨多个 CS 事务，
+ * 半帧缓存和剩余字节数要一起维护。
  *
  * 环形发送缓冲：MCU 的发送区是循环队列，引导帧写在当前队头。因为引导帧
  * SEQ 是独立计数的，SoC 如果收到一个 SEQ 与之前收到过的引导帧重复的引导帧，
- * 就说明已经绕回 MCU 循环缓冲区的头部，忽略该引导帧即可（不要把它当成新的
- * 计数）。
+ * 就说明已经绕回 MCU 循环缓冲区的头部，忽略该引导帧的 size 即可（仍然回
+ * WINDOW_ACK）。
  *
  * SoC -> MCU 方向没有引导帧：请求长度由 TOKEN 的 len 字段决定；该方向多帧
  * 消息没有首包标记，末帧用 STA=2，单包消息也用 STA=2。
  */
-#define M5IO_HUB_DATA_GUIDE_LEN 2U
+/* 引导帧的 LEN 字段宽度：和普通 DATA 帧的 1 B LEN 不同，这里是 2 B(LE)。 */
+#define M5IO_HUB_DATA_GUIDE_LEN       2U
+/* 引导帧线上总长度：2 B 头 + 2 B LEN + 1 B CRC。 */
+#define M5IO_HUB_DATA_GUIDE_FRAME_LEN (2U + M5IO_HUB_DATA_GUIDE_LEN + 1U)
 
 typedef void (*m5io_hub_gpio_irq_handler_t)(void *p, unsigned int pin);
 typedef void (*m5io_hub_chn_data_handler_t)(void *p, const u8 *buf, unsigned int len);
