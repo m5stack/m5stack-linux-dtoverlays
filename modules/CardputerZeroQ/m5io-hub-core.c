@@ -219,7 +219,8 @@ struct m5io_hub {
     /* 引导帧 SEQ 独立计数、与通道无关,所以只保留全局最近值。 */
     u8 guide_seq;
     bool guide_seq_valid;
-    u16 chn_rx_remaining[M5IO_HUB_CHN_MAX + 1];
+    /* 引导帧宣告的 MCU 发射缓冲区待读字节数,SPI 状态机用它决定读事务长度 */
+    unsigned int mcu_tx_pending;
 
     /* OTA / 维护态:持有期间其它 API 一律 -EBUSY */
     struct mutex ota_lock;
@@ -581,8 +582,9 @@ static void m5io_hub_queues_abort(struct m5io_hub *hub, int error)
  * RX:
  *   - TOKEN 应答按 TID 匹配;FUNC=PROTOCOL/ARG=dataAck 是 MCU 对主机 DATA
  *     的确认;FUNC=GPIO/ARG=interruptEvent 是上行中断事件。
- *   - DATA:STA=1 是引导帧(2 B 包计数、独立 SEQ,重复 SEQ 视为环形缓冲区
- *     回绕而忽略);STA=2 是消息末帧;MCU->SoC 的每一帧都要回 WINDOW_ACK。
+ *   - DATA:STA=1 是引导帧(2 B 待读字节数、独立 SEQ,重复 SEQ 视为环形
+ *     缓冲区回绕而忽略);STA=2 是消息末帧;MCU->SoC 的每一帧都要回
+ *     WINDOW_ACK。引导帧的字节数只用于决定 MISO 交换长度。
  *   - 匹配在飞 data op 的应答帧(同 CH/PID)拼进 op->rx,其余交给通道回调。
  * ===================================================================== */
 
@@ -826,7 +828,11 @@ static void m5io_hub_rx_guide(struct m5io_hub *hub, u8 chn, u8 pid, u8 seq,
 
     hub->guide_seq = seq;
     hub->guide_seq_valid = true;
-    hub->chn_rx_remaining[chn] = count;
+    /*
+     * count 是"后续还要从 MCU 交换多少字节",不是帧数;读取长度和缓冲区
+     * 排空判断都以它为准(数据帧的结束仍由 STA=2 决定)。
+     */
+    hub->mcu_tx_pending = count;
     m5io_hub_ack_enqueue(hub, chn, pid, 0, 0);
 }
 
@@ -841,10 +847,8 @@ static void m5io_hub_rx_data_frame(struct m5io_hub *hub, const u8 *frame,
     const u8 *payload = &frame[3];
     u8 len = frame[2];
     struct m5io_hub_data_window *win;
-    u16 remaining;
     bool final;
 
-    (void)frame_len;
     if (chn < 1 || chn > M5IO_HUB_CHN_MAX)
         return;
 
@@ -856,6 +860,12 @@ static void m5io_hub_rx_data_frame(struct m5io_hub *hub, const u8 *frame,
     if (sta == 3) /* 保留值 */
         return;
 
+    /* 这一帧已经从 MCU 发射缓冲区读走,按线上字节数扣减待读计数。 */
+    if (hub->mcu_tx_pending > frame_len)
+        hub->mcu_tx_pending -= frame_len;
+    else
+        hub->mcu_tx_pending = 0;
+
     win = &hub->data_win[chn];
     if (win->op && win->pid == pid) {
         m5io_hub_rx_response_data(win, payload, len, sta);
@@ -865,12 +875,7 @@ static void m5io_hub_rx_data_frame(struct m5io_hub *hub, const u8 *frame,
     }
 
     m5io_hub_rx_chn_data(hub, chn, payload, len);
-    remaining = hub->chn_rx_remaining[chn];
-    if (remaining) {
-        remaining--;
-        hub->chn_rx_remaining[chn] = remaining;
-    }
-    final = (sta == M5IO_HUB_DATA_STA_END) || (remaining == 0);
+    final = (sta == M5IO_HUB_DATA_STA_END);
     m5io_hub_ack_enqueue(hub, chn, pid, final ? 1 : 0, 0);
 }
 
@@ -1103,7 +1108,10 @@ static int m5io_hub_spi_read_dummy(struct m5io_hub *hub, bool *slave_empty)
     };
     unsigned int frames = 0;
     unsigned int need = m5io_hub_rx_need(hub);
-    unsigned int len = ALIGN(max_t(unsigned int, need, M5IO_HUB_IO_READ_MIN),
+    unsigned int pending = READ_ONCE(hub->mcu_tx_pending);
+    unsigned int len = ALIGN(max_t(unsigned int,
+                      max_t(unsigned int, need, pending),
+                      M5IO_HUB_IO_READ_MIN),
                  M5IO_HUB_IO_READ_MIN);
     unsigned int i;
     bool all_ff = true;
@@ -1131,6 +1139,8 @@ static int m5io_hub_spi_read_dummy(struct m5io_hub *hub, bool *slave_empty)
         }
     }
     *slave_empty = all_ff && !frames && !hub->rx_stream_len;
+    if (*slave_empty)
+        hub->mcu_tx_pending = 0; /* 缓冲区已排空 */
     return 0;
 }
 
@@ -1512,8 +1522,7 @@ static void m5io_hub_sm_abort_channel(struct m5io_hub *hub, u8 chn, int error)
     mutex_lock(&hub->spi_lock);
     if (hub->data_win[chn].op)
         m5io_hub_data_win_complete(hub, &hub->data_win[chn], error);
-    hub->chn_rx_remaining[chn] = 0;
-    /* guide SEQ 是全局独立计数,单通道复位不影响它。 */
+    /* guide SEQ / 待读字节是 MCU 全局状态,单通道复位不碰。 */
     mutex_unlock(&hub->spi_lock);
 
     mutex_lock(&hub->data_lock);
@@ -1545,10 +1554,10 @@ static void m5io_hub_sm_abort(struct m5io_hub *hub, int error)
     for (chn = 1; chn <= M5IO_HUB_CHN_MAX; chn++) {
         if (hub->data_win[chn].op)
             m5io_hub_data_win_complete(hub, &hub->data_win[chn], error);
-        hub->chn_rx_remaining[chn] = 0;
     }
     hub->rx_stream_len = 0;
     hub->guide_seq_valid = false;
+    hub->mcu_tx_pending = 0;
 
     list_splice_init(&hub->ack_queue, &acks);
     hub->ack_count = 0;
