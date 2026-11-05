@@ -12,7 +12,6 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/i2c.h>
-#include <linux/of_gpio.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/firmware.h>
@@ -1361,7 +1360,7 @@ int aw88xx_dev_get_profile_name(struct aw_device *aw_dev, char *name, int index)
 
 	dev_profile_id = prof_info->prof_desc[index].id;
 
-	strlcpy(name, prof_info->prof_name_list[dev_profile_id],
+	strscpy(name, prof_info->prof_name_list[dev_profile_id],
 			strlen(prof_info->prof_name_list[dev_profile_id]) + 1);
 	return 0;
 }

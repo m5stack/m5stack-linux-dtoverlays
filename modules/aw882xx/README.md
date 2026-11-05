@@ -1,6 +1,29 @@
 
 Note that the aw882xx_drv.ko file was compiled on 32-bit systems and can only be loaded on 32-bit systems. This file cannot be loaded using the `sudo depmod - a&&sudo modprobe aw882xx_drv` command. Only the `insmod aw882xx_drv.ko` command can be loaded. Otherwise, an irreversible error will be generated. This makefile only provides an installer, not a launcher. Please use the boot file to load.
 
+## Building from source
+
+The prebuilt `bin/aw882xx_drv.ko` only loads on the kernel and architecture it
+was built for, so rebuild it against the headers of the target kernel:
+
+``` bash
+# on the device, for a 64-bit kernel
+sudo apt install linux-headers-$(uname -r)
+cd modules/aw882xx/src
+make
+
+# cross compiling, e.g. for a 64-bit kernel on an x86 host
+make KDIR=/path/to/raspberrypi/linux ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+
+# clean
+make clean KDIR=/path/to/raspberrypi/linux
+```
+
+`KDIR` defaults to `/lib/modules/$(uname -r)/build`. The driver sources build
+against Linux 4.19 through the current 7.x Raspberry Pi kernels; the ASoC,
+GPIO and i2c API changes in between are handled with version checks in
+`aw882xx.c` / `aw882xx.h`.
+
 Please use the boot script to load the kernel file. Please refer to the following to write the boot script:
 
 # systemd Starts the system and runs rc.local  
