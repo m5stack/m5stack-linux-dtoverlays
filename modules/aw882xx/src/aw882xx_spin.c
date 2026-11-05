@@ -15,7 +15,6 @@
 #include <linux/i2c.h>
 #include <sound/core.h>
 #include <sound/soc.h>
-#include <linux/of_gpio.h>
 #include <linux/device.h>
 #include <linux/firmware.h>
 #include <linux/of.h>

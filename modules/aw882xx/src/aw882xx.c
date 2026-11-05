@@ -20,12 +20,18 @@
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
-#include <linux/of_gpio.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/firmware.h>
 #include <linux/debugfs.h>
 #include <linux/version.h>
+#include <linux/gpio.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 0)
+#include <linux/of_gpio.h>
+#else
+/* gpio_device_find_by_fwnode()/gpio_device_get_desc()/gpio_device_put() */
+#include <linux/gpio/driver.h>
+#endif
 #include <linux/workqueue.h>
 #include <linux/syscalls.h>
 #include <sound/control.h>
@@ -63,12 +69,36 @@ static const char *const aw882xx_spin[] = {"spin_0", "spin_90",
  *
  ******************************************************/
 #ifdef AW_KERNEL_VER_OVER_4_19_1
+/*
+ * snd_soc_kcontrol_component() (removed in 6.19) is a plain alias of
+ * snd_kcontrol_chip(), and snd_soc_(un)register_component() became macros
+ * on newer kernels. None of them can be used as function pointers in those
+ * cases, so hand the ops table small wrappers.
+ */
+static aw_snd_soc_codec_t *aw882xx_kcontrol_component(
+		struct snd_kcontrol *kcontrol)
+{
+	return snd_kcontrol_chip(kcontrol);
+}
+
+static int aw882xx_register_component(struct device *dev,
+		const aw_snd_soc_codec_driver_t *codec_drv,
+		struct snd_soc_dai_driver *dai_drv, int num_dai)
+{
+	return snd_soc_register_component(dev, codec_drv, dai_drv, num_dai);
+}
+
+static void aw882xx_unregister_component(struct device *dev)
+{
+	snd_soc_unregister_component(dev);
+}
+
 static struct aw_componet_codec_ops aw_componet_codec_ops = {
-	.kcontrol_codec = snd_soc_kcontrol_component,
+	.kcontrol_codec = aw882xx_kcontrol_component,
 	.codec_get_drvdata = snd_soc_component_get_drvdata,
 	.add_codec_controls = snd_soc_add_component_controls,
-	.unregister_codec = snd_soc_unregister_component,
-	.register_codec = snd_soc_register_component,
+	.unregister_codec = aw882xx_unregister_component,
+	.register_codec = aw882xx_register_component,
 };
 #else
 static struct aw_componet_codec_ops aw_componet_codec_ops = {
@@ -282,8 +312,16 @@ static int aw882xx_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	/* Supported mode: regular I2S, slave, or PDM */
 	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
 	case SND_SOC_DAIFMT_I2S:
+#ifdef SND_SOC_DAIFMT_CBC_CFC
+		/* codec consumes both bit clock and frame clock
+		 * (the old SND_SOC_DAIFMT_CBS_CFS spelling, dropped in 6.15)
+		 */
+		if ((fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) !=
+			SND_SOC_DAIFMT_CBC_CFC) {
+#else
 		if ((fmt & SND_SOC_DAIFMT_MASTER_MASK) !=
 			SND_SOC_DAIFMT_CBS_CFS) {
+#endif
 			aw_dev_err(codec->dev, "invalid codec master mode");
 			return -EINVAL;
 		}
@@ -475,7 +513,7 @@ static int aw882xx_profile_info(struct snd_kcontrol *kcontrol,
 	count = uinfo->value.enumerated.item;
 	ret = aw88xx_dev_get_profile_name(aw882xx->aw_pa, name, count);
 	if (ret) {
-		strlcpy(uinfo->value.enumerated.name, "null", strlen("null") + 1);
+		strscpy(uinfo->value.enumerated.name, "null", strlen("null") + 1);
 		return 0;
 	}
 
@@ -550,7 +588,7 @@ static int aw882xx_switch_info(struct snd_kcontrol *kcontrol,
 	if (uinfo->value.enumerated.item >= count)
 		uinfo->value.enumerated.item = count - 1;
 
-	strlcpy(uinfo->value.enumerated.name,
+	strscpy(uinfo->value.enumerated.name,
 		aw882xx_switch[uinfo->value.enumerated.item],
 		strlen(aw882xx_switch[uinfo->value.enumerated.item]) + 1);
 
@@ -624,7 +662,7 @@ static int aw882xx_monitor_info(struct snd_kcontrol *kcontrol,
 	if (uinfo->value.enumerated.item >= count)
 		uinfo->value.enumerated.item = count - 1;
 
-	strlcpy(uinfo->value.enumerated.name,
+	strscpy(uinfo->value.enumerated.name,
 		aw882xx_switch[uinfo->value.enumerated.item],
 		strlen(aw882xx_switch[uinfo->value.enumerated.item]) + 1);
 
@@ -1530,6 +1568,47 @@ int aw_componet_codec_register(struct aw882xx *aw882xx)
  * device tree
  *
  *****************************************************/
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+/*
+ * of_get_named_gpio() and <linux/of_gpio.h> were removed in Linux 7.1.
+ * Resolve the legacy "<name>-gpio" property into a legacy GPIO number
+ * so the rest of the driver keeps working unchanged.
+ */
+static int aw882xx_of_get_named_gpio(struct device_node *np,
+		const char *propname, int index)
+{
+	struct of_phandle_args gpiospec;
+	struct gpio_device *gdev;
+	struct gpio_desc *desc;
+	int ret;
+
+	if (!np)
+		return -ENOENT;
+
+	ret = of_parse_phandle_with_args(np, propname, "#gpio-cells",
+			index, &gpiospec);
+	if (ret)
+		return ret;
+
+	gdev = gpio_device_find_by_fwnode(of_fwnode_handle(gpiospec.np));
+	of_node_put(gpiospec.np);
+	if (!gdev)
+		return -EPROBE_DEFER;
+
+	desc = gpio_device_get_desc(gdev, gpiospec.args[0]);
+	if (IS_ERR(desc))
+		ret = PTR_ERR(desc);
+	else
+		ret = desc_to_gpio(desc);
+
+	gpio_device_put(gdev);
+	return ret;
+}
+#else
+#define aw882xx_of_get_named_gpio(np, propname, index) \
+	of_get_named_gpio(np, propname, index)
+#endif
+
 static int aw882xx_parse_gpio_dt(struct aw882xx *aw882xx,
 	struct device_node *np)
 {
@@ -1539,13 +1618,13 @@ static int aw882xx_parse_gpio_dt(struct aw882xx *aw882xx,
 		return -EINVAL;
 	}
 
-	aw882xx->reset_gpio = of_get_named_gpio(np, "reset-gpio", 0);
+	aw882xx->reset_gpio = aw882xx_of_get_named_gpio(np, "reset-gpio", 0);
 	if (aw882xx->reset_gpio < 0) {
 		aw_dev_info(aw882xx->dev, "no reset gpio provided, will not HW reset device");
 	} else {
 		aw_dev_info(aw882xx->dev, "reset gpio provided ok");
 	}
-	aw882xx->irq_gpio = of_get_named_gpio(np, "irq-gpio", 0);
+	aw882xx->irq_gpio = aw882xx_of_get_named_gpio(np, "irq-gpio", 0);
 	if (aw882xx->irq_gpio < 0) {
 		aw_dev_info(aw882xx->dev, "no irq gpio provided.");
 	} else {
@@ -1597,7 +1676,7 @@ static int aw882xx_gpio_request(struct aw882xx *aw882xx)
 
 	if (gpio_is_valid(aw882xx->irq_gpio)) {
 		ret = devm_gpio_request_one(aw882xx->dev, aw882xx->irq_gpio,
-			GPIOF_DIR_IN, "aw882xx_int");
+			GPIOF_IN, "aw882xx_int");
 		if (ret) {
 			aw_dev_err(aw882xx->dev, "int request failed");
 			return ret;
@@ -2220,8 +2299,12 @@ static struct attribute_group aw882xx_attribute_group = {
 	.attrs = aw882xx_attributes,
 };
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+static int aw882xx_i2c_probe(struct i2c_client *i2c)
+#else
 static int aw882xx_i2c_probe(struct i2c_client *i2c,
 				const struct i2c_device_id *id)
+#endif
 {
 	int ret;
 	struct aw882xx *aw882xx = NULL;
@@ -2308,7 +2391,11 @@ err_sysfs:
 	return ret;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+static void aw882xx_i2c_remove(struct i2c_client *i2c)
+#else
 static int aw882xx_i2c_remove(struct i2c_client *i2c)
+#endif
 {
 	struct aw882xx *aw882xx = i2c_get_clientdata(i2c);
 
@@ -2321,10 +2408,12 @@ static int aw882xx_i2c_remove(struct i2c_client *i2c)
 			aw882xx);
 
 	/*free gpio*/
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
 	if (gpio_is_valid(aw882xx->irq_gpio))
 		devm_gpio_free(&i2c->dev, aw882xx->irq_gpio);
 	if (gpio_is_valid(aw882xx->reset_gpio))
 		devm_gpio_free(&i2c->dev, aw882xx->reset_gpio);
+#endif
 
 	/*rm attr node*/
 	sysfs_remove_group(&i2c->dev.kobj, &aw882xx_attribute_group);
@@ -2346,8 +2435,9 @@ static int aw882xx_i2c_remove(struct i2c_client *i2c)
 	}
 	mutex_unlock(&g_aw882xx_lock);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
 	return 0;
-
+#endif
 }
 
 static void aw882xx_i2c_shutdown(struct i2c_client *i2c)
