@@ -2977,9 +2977,13 @@ static inline int bq27xxx_battery_read_fcc(struct bq27xxx_device_info *di,
 #if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
 		{
 			int design_mah = bq27220_fcc_design_mah(di);
-			if (design_mah > 0)
+
+			if (design_mah > 0) {
 				fcc = DIV_ROUND_CLOSEST(fcc * design_mah,
 						BQ27220_FCC_INIT_USE_RECOMMENDED);
+				if (fcc > design_mah)
+					fcc = design_mah;
+			}
 		}
 #endif
 		val->intval = fcc * 1000;
