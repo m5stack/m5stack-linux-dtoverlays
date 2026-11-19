@@ -16,7 +16,6 @@
                 ti,resistor-sense-mohm = <10>;
                 ti,design-voltage-microvolt = <3700000>;
                 ti,design-capacity-nanoamp-hours = /bits/ 64 <1750000000>;
-                ti,use-external-ntc;
             };
         };
     };
