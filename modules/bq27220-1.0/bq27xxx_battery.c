@@ -1929,6 +1929,9 @@ static int bq27220_battery_update_dm_reg(struct bq27xxx_device_info *di,
  *
  * A write needs unseal + CONFIG UPDATE and takes a few seconds, so call it
  * once at boot instead of periodically.
+ *
+ * NOTE: bq27xxx_fcc is currently disabled (see #if 0 below); the raw FCC is
+ * no longer exposed to userspace.
  */
 #if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
 static int bq27220_fcc_design_mah(struct bq27xxx_device_info *di)
@@ -1944,6 +1947,7 @@ static int bq27220_fcc_design_mah(struct bq27xxx_device_info *di)
 }
 #endif
 
+#if 0 /* bq27xxx_fcc disabled: hide the raw gauge FCC value from userspace */
 static ssize_t bq27xxx_fcc_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
@@ -2044,6 +2048,7 @@ out_seal:
 	return ret < 0 ? ret : count;
 }
 static DEVICE_ATTR_RW(bq27xxx_fcc);
+#endif /* 0 */
 
 static int bq27220_battery_update_dm_u8(struct bq27xxx_device_info *di,
 					const char *name, u16 addr,
@@ -3796,17 +3801,20 @@ int bq27xxx_battery_setup(struct bq27xxx_device_info *di)
 			return dev_err_probe(di->dev, ret,
 					     "failed to create bq27xxx_mac\n");
 
+		/* bq27xxx_fcc is disabled for now: do not expose the raw FCC. */
+#if 0
 		ret = device_create_file(di->dev, &dev_attr_bq27xxx_fcc);
 		if (ret) {
 			device_remove_file(di->dev, &dev_attr_bq27xxx_mac);
 			return dev_err_probe(di->dev, ret,
 					     "failed to create bq27xxx_fcc\n");
 		}
+#endif
 
 		ret = device_create_file(&di->bat->dev,
 					 &dev_attr_current_instant);
 		if (ret) {
-			device_remove_file(di->dev, &dev_attr_bq27xxx_fcc);
+			/* device_remove_file(di->dev, &dev_attr_bq27xxx_fcc); */
 			device_remove_file(di->dev, &dev_attr_bq27xxx_mac);
 			return dev_err_probe(di->dev, ret,
 					     "failed to create current_instant\n");
@@ -3817,7 +3825,7 @@ int bq27xxx_battery_setup(struct bq27xxx_device_info *di)
 		if (ret) {
 			device_remove_file(&di->bat->dev,
 					   &dev_attr_current_instant);
-			device_remove_file(di->dev, &dev_attr_bq27xxx_fcc);
+			/* device_remove_file(di->dev, &dev_attr_bq27xxx_fcc); */
 			device_remove_file(di->dev, &dev_attr_bq27xxx_mac);
 			return dev_err_probe(di->dev, ret,
 					     "failed to create voltage_instant\n");
@@ -3857,7 +3865,7 @@ void bq27xxx_battery_teardown(struct bq27xxx_device_info *di)
 
 		device_remove_file(&di->bat->dev, &dev_attr_voltage_instant);
 		device_remove_file(&di->bat->dev, &dev_attr_current_instant);
-		device_remove_file(di->dev, &dev_attr_bq27xxx_fcc);
+		/* device_remove_file(di->dev, &dev_attr_bq27xxx_fcc); */
 		device_remove_file(di->dev, &dev_attr_bq27xxx_mac);
 	}
 
