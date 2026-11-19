@@ -54,6 +54,7 @@
 #include <linux/slab.h>
 #include <linux/of.h>
 #include <linux/math64.h>
+#include <linux/minmax.h>
 #include <linux/property.h>
 #include <linux/string.h>
 #include "bq27xxx_battery.h"
@@ -133,7 +134,7 @@
 #define BQ27220_FCC_INIT_MIN_MAH		250
 /* Capacity mapping is enabled by default; set to 0 only to disable it. */
 #ifndef BQ27220_FCC_INIT_USE_RECOMMENDED
-#define BQ27220_FCC_INIT_USE_RECOMMENDED	1300
+#define BQ27220_FCC_INIT_USE_RECOMMENDED	1350
 #endif
 #if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
 #define BQ27220_FCC_INIT_TARGET_MAH	BQ27220_FCC_INIT_USE_RECOMMENDED
@@ -2494,7 +2495,7 @@ static int bq27220_battery_program_config(struct bq27xxx_device_info *di,
 		int fcc_target_mah = capacity_mah;
 
 #if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
-		fcc_target_mah = BQ27220_FCC_INIT_TARGET_MAH;
+		fcc_target_mah = min(BQ27220_FCC_INIT_TARGET_MAH, capacity_mah);
 #endif
 
 		/*
@@ -2977,10 +2978,12 @@ static inline int bq27xxx_battery_read_fcc(struct bq27xxx_device_info *di,
 #if BQ27220_FCC_INIT_USE_RECOMMENDED > 0
 		{
 			int design_mah = bq27220_fcc_design_mah(di);
+			int base_mah;
 
 			if (design_mah > 0) {
-				fcc = DIV_ROUND_CLOSEST(fcc * design_mah,
-						BQ27220_FCC_INIT_USE_RECOMMENDED);
+				base_mah = min(BQ27220_FCC_INIT_USE_RECOMMENDED,
+					       design_mah);
+				fcc = DIV_ROUND_CLOSEST(fcc * design_mah, base_mah);
 				if (fcc > design_mah)
 					fcc = design_mah;
 			}

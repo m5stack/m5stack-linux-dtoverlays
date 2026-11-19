@@ -14,7 +14,7 @@ TRM 的两处写入示例（§6.1 p65 写 Design Capacity、§4.6 p51 写 Hibern
     python3 bq27220_profile.py --profile v3       # 打印 v3 的值
     python3 bq27220_profile.py --read             # 读回器件当前值
     python3 bq27220_profile.py --write            # 写入（unseal -> full access -> CFGUPDATE -> 写 -> seal）
-    python3 bq27220_profile.py --write --seed-fcc # 新器件/首次配置：同时把 FCC 种成设计容量
+    python3 bq27220_profile.py --write --seed-fcc # 新器件/首次配置：FCC 种成 min(1350, 设计容量)
     python3 bq27220_profile.py --write --edv fixed  # 关闭 CEDV 补偿并使用固定 EDV
 
 不要写 0x92A1（"Design Energy"）：该参数在 SLUUBD4A 中不存在，详见审计报告。
@@ -257,6 +257,11 @@ PROFILES: dict[str, dict[str, int]] = {
     },
 }
 
+# 与内核驱动 BQ27220_FCC_INIT_USE_RECOMMENDED 保持一致：出厂 FCC 下限。
+# --seed-fcc 实际写入 min(该值, 设计容量)：v5(1750) 种 1350，v3(1200) 种 1200，
+# 避免把 FCC 种到设计容量之上。内核驱动用同一个 min() 做 seed 和显示映射。
+FCC_INIT_RECOMMENDED_MAH = 1350
+
 # EDV 门限的两种方案
 EDV_MODEL = {  # 推荐：打开 CEDV 补偿，让器件用 EMF/C0/R0/T0/R1/TC/C1 自己算 EDV1/EDV2
     # Keep this in sync with the kernel profile. It enables EDV compensation,
@@ -300,8 +305,10 @@ def build_values(profile: str, edv: str = "model", seed_fcc: bool = False,
     if seed_fcc:
         # The device programming procedure requires FCC before Design
         # Capacity. Insert it at the front rather than appending it after the
-        # profile fields assembled above.
-        values = {"Full Charge Capacity": values["Design Capacity"], **values}
+        # profile fields assembled above.  Seed the factory lower bound
+        # (min with design capacity) to match the kernel driver.
+        fcc_seed = min(FCC_INIT_RECOMMENDED_MAH, values["Design Capacity"])
+        values = {"Full Charge Capacity": fcc_seed, **values}
     if not with_calib:
         for name in CALIB_OFFSETS:
             values.pop(name, None)
@@ -384,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--edv", choices=["model", "fixed"], default="model",
                     help="model=CEDV 补偿开启(推荐)；fixed=关闭补偿并使用固定 EDV 门限")
     ap.add_argument("--seed-fcc", action="store_true",
-                    help="把 Learned FCC 写成设计容量（新器件/首次配置时用一次）")
+                    help="把 Learned FCC 写成 min(1350, 设计容量)（与内核驱动一致）")
     ap.add_argument("--with-calib", action="store_true",
                     help="同时写入校准偏移量（默认跳过，避免清掉已标定值）")
     ap.add_argument("--write", action="store_true", help="真正写入器件")

@@ -119,9 +119,13 @@ DATA_FIELDS = {
     "Fixed EDV 2": (0x92BA, "i2", "mV", 0),
 }
 
+# Fallback values for a direct init_device(dev) call; the CLI always passes the
+# per-profile values from bq27220_profile.py (use --profile v3 for the 1200 mAh
+# board).  Full Charge Capacity is the factory lower bound (1350), not the design
+# capacity, and must stay <= Design Capacity.
 INIT_VALUES = {
-    "Full Charge Capacity": 1200,
-    "Design Capacity": 1200,
+    "Full Charge Capacity": 1350,
+    "Design Capacity": 1750,
     "Design Voltage": 3700,  # mV; 4.2 V is the usual single-cell charge limit.
     "Chg Inhibit Temp Low": 0,      # 0.0C
     # This is the battery temperature threshold, configured here for 55 °C.
@@ -138,7 +142,7 @@ INIT_VALUES = {
     "Fixed EDV 1": 3400,
     "Fixed EDV 2": 3500,
     "Battery Low %": 700,
-    "Near Full": 120,
+    "Near Full": 175,
 }
 
 
@@ -720,7 +724,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="write a complete v3/v5 battery profile to BQ27220 RAM data memory",
     )
     init_p.add_argument("--profile", choices=("v3", "v5"), required=True,
-                        help="hardware battery profile (required; prevents an implicit 1200 mAh write)")
+                        help="hardware battery profile (required; prevents an implicit wrong-capacity write)")
     init_p.add_argument("--edv", choices=("model", "fixed"), default="model",
                         help="model=CEDV compensation; fixed=static EDV thresholds")
     init_p.add_argument("--seed-fcc", action="store_true",
