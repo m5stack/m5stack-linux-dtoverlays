@@ -653,6 +653,7 @@ MODULE_DEVICE_TABLE(of, panel_mipi_dbi_spi_of_match);
 static const struct spi_device_id panel_mipi_dbi_spi_id[] = {
     { "panel-mipi-dbi-spi", 0 },
     { "panel-mipi-dbi-m5stack", 0 },
+    { "st7789v_lcd", 0 },
     { },
 };
 MODULE_DEVICE_TABLE(spi, panel_mipi_dbi_spi_id);
