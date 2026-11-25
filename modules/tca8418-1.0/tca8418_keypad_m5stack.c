@@ -461,12 +461,27 @@ static void tca8418_dispatch_other_key_release(
 {
 	int i;
 
+	/* Ends ONESHOT, and WAIT_ACTIVE_LEAVE once a key went through the layer. */
 	for (i = 0; i < 3; i++) {
-		if (keypad_data->_key[i]->fsm.state != ST_ONESHOT)
+		tca8418_t *fsm = &keypad_data->_key[i]->fsm;
+		State before = fsm->state;
+
+		if (before != ST_ONESHOT && before != ST_WAIT_ACTIVE_LEAVE)
 			continue;
-		tca8418_dispatch(&keypad_data->_key[i]->fsm,
-					 EV_OTHER_KEY_RELE);
+		tca8418_dispatch(fsm, EV_OTHER_KEY_RELE);
+		if (fsm->state != before)
+			tca8418_fsm_update_timer(keypad_data, fsm);
 	}
+}
+
+/* An ordinary key went down: modifiers pressed before it count as used. */
+static void tca8418_dispatch_other_key_press(
+		struct tca8418_keypad *keypad_data)
+{
+	int i;
+
+	for (i = 0; i < 3; i++)
+		tca8418_dispatch(&keypad_data->_key[i]->fsm, EV_OTHER_KEY_PRES);
 }
 
 static void tca8418_process_ordinary_key(struct tca8418_keypad *keypad_data,
@@ -492,6 +507,7 @@ static void tca8418_process_ordinary_key(struct tca8418_keypad *keypad_data,
 
 		record->keycode = keycode;
 		record->pressed = true;
+		tca8418_dispatch_other_key_press(keypad_data);
 	} else {
 		if (!record->pressed)
 			return;
