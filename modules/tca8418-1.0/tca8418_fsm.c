@@ -20,6 +20,7 @@ typedef enum {
     EV_KEY_RELE,
     EV_OTHER_KEY_RELE,
     EV_TIMEOUT_300,
+    EV_OTHER_KEY_PRES,
     EV_COUNT
 } Event;
 
@@ -29,6 +30,7 @@ typedef struct {
     State state;       // Current state
     /* Per-device timer counters or private data can be added here later. */
 	int layer_active;
+	int used;          // an ordinary key was pressed after this modifier's press (so it went through the layer)
 	void *ctx;
 } tca8418_t;
 
@@ -47,6 +49,7 @@ static void state_entry(tca8418_t *me, State s)
 {
     switch (s) {
     case ST_ACTIVE:
+        me->used = 0;
         enable_layer(me);
         emit_key_pres_status(me);
         led_ON(me);
@@ -62,19 +65,38 @@ static void state_entry(tca8418_t *me, State s)
     }
 }
 
+static void leave_layer(tca8418_t *me)
+{
+    disable_layer(me);
+    emit_key_release_status(me);
+    led_OFF(me);
+}
+
 static void state_exit(tca8418_t *me, State s)
 {
     switch (s) {
     case ST_ONESHOT:
     case ST_HOLD:
     case ST_LOCKED_LEAVE:
-        disable_layer(me);
-        emit_key_release_status(me);
-        led_OFF(me);
+        leave_layer(me);
         break;
     default:
         break;
     }
+}
+
+/*
+ * A key pressed while the modifier was held, or within the 300ms after its
+ * release, went through the layer and used it up: go idle instead of arming a
+ * one-shot for the next key (the "Sym stays on" bug). Keys already down before
+ * the modifier was pressed do not count (used is only set by EV_OTHER_KEY_PRES).
+ * ACTIVE and WAIT_ACTIVE_LEAVE have no exit actions, so leaving them this way
+ * skips nothing.
+ */
+static void consume_layer(tca8418_t *me)
+{
+    leave_layer(me);
+    me->state = ST_IDLE;
 }
 
 /* ================== State transition ================== */
@@ -102,7 +124,12 @@ static void tca8418_dispatch(tca8418_t * const me, Event e)
 
     case ST_ACTIVE:
         if (e == EV_KEY_RELE) {
-            transition(me, ST_WAIT_ACTIVE_LEAVE);
+            if (me->used)
+                consume_layer(me);
+            else
+                transition(me, ST_WAIT_ACTIVE_LEAVE);
+        } else if (e == EV_OTHER_KEY_PRES) {
+            me->used = 1;
         } else if (e == EV_TIMEOUT_300) {
             transition(me, ST_HOLD);
         }
@@ -111,6 +138,10 @@ static void tca8418_dispatch(tca8418_t * const me, Event e)
     case ST_WAIT_ACTIVE_LEAVE:
         if (e == EV_TIMEOUT_300) {
             transition(me, ST_ONESHOT);
+        } else if (e == EV_OTHER_KEY_PRES) {
+            me->used = 1;
+        } else if (e == EV_OTHER_KEY_RELE && me->used) {
+            consume_layer(me);
         } else if (e == EV_KEY_PRES) {
             transition(me, ST_LOCKED);
         }
