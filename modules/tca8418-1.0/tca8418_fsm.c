@@ -137,7 +137,10 @@ static void tca8418_dispatch(tca8418_t * const me, Event e)
 
     case ST_WAIT_ACTIVE_LEAVE:
         if (e == EV_TIMEOUT_300) {
-            transition(me, ST_ONESHOT);
+            if (me->used)
+                consume_layer(me);
+            else
+                transition(me, ST_ONESHOT);
         } else if (e == EV_OTHER_KEY_PRES) {
             me->used = 1;
         } else if (e == EV_OTHER_KEY_RELE && me->used) {
