@@ -57,6 +57,9 @@
 #define POWERFAIL_BACKSTOP_MS       4000    /* before the cut */
 #define POWERFAIL_RECHECK_MS        100
 #define POWERFAIL_READY_POLL_MS     500
+#define POWERFAIL_REMOUNT_WAIT_MS   1500
+#define POWERFAIL_STUCK_POLL_MS     200
+#define POWERFAIL_GPIO_RETRIES      10      /* ~1 s of failed irq-gpios reads */
 
 struct powerfail_suo_data {
     struct device *dev;
@@ -70,6 +73,8 @@ struct powerfail_suo_data {
     atomic_t triggered;
     atomic_t slider_off;        /* orderly poweroff requested by the slider */
     bool waiting_logged;
+    bool backstop_done;         /* SysRq S + U ran; now watching the slider */
+    unsigned int gpio_errors;
     unsigned long seen_on;      /* last time the M5IOE1 was not counting down */
     struct delayed_work check;
     struct delayed_work backstop;
@@ -122,11 +127,32 @@ static void powerfail_backstop_work(struct work_struct *work)
         container_of(to_delayed_work(work), struct powerfail_suo_data,
                      backstop);
 
-    dev_emerg(data->dev,
-              "poweroff still running near the power cut: SysRq S + U\n");
-    handle_sysrq('s');
-    msleep(1000);
-    handle_sysrq('u');
+    if (!data->backstop_done) {
+        dev_emerg(data->dev,
+                  "poweroff still running near the power cut: SysRq S + U\n");
+        handle_sysrq('s');
+        msleep(1000);
+        handle_sysrq('u');
+        data->backstop_done = true;
+        /* SysRq U only queues the remount; let it finish first. */
+        schedule_delayed_work(&data->backstop,
+                              msecs_to_jiffies(POWERFAIL_REMOUNT_WAIT_MS));
+        return;
+    }
+
+    /*
+     * The poweroff is stuck and the filesystems are read-only. If the
+     * slider is switched back on, the power is never cut and the board
+     * would stay half shut down: restart. Otherwise the cut comes at the
+     * end of the hold. .shutdown cancels this if the poweroff finishes.
+     */
+    if (gpiod_get_raw_value_cansleep(data->gpiod) > 0) {
+        dev_emerg(data->dev,
+                  "power switch back on, poweroff stuck: restarting\n");
+        emergency_restart();
+    }
+    schedule_delayed_work(&data->backstop,
+                          msecs_to_jiffies(POWERFAIL_STUCK_POLL_MS));
 }
 
 /*
@@ -154,6 +180,7 @@ static void powerfail_ready_work(struct work_struct *work)
 static void powerfail_rearm(struct powerfail_suo_data *data)
 {
     data->waiting_logged = false;
+    data->gpio_errors = 0;
     atomic_set(&data->triggered, 0);
     enable_irq(data->irq);
 }
@@ -228,11 +255,18 @@ static void powerfail_suo_work(struct work_struct *work)
     val = gpiod_get_raw_value_cansleep(data->gpiod);
     if (val < 0) {
         dev_err(data->dev, "failed to read powerfail gpio: %d\n", val);
-        if (data->ioe)
-            powerfail_recheck(data, "gpio unreadable");
-        else
+        if (!data->ioe) {
             powerfail_rearm(data);
-        return;
+            return;
+        }
+        if (++data->gpio_errors <= POWERFAIL_GPIO_RETRIES) {
+            powerfail_recheck(data, "gpio unreadable");
+            return;
+        }
+        /* Still unreadable: decide from the M5IOE1 alone. */
+        val = 0;
+    } else {
+        data->gpio_errors = 0;
     }
 
     if (val > 0) {
