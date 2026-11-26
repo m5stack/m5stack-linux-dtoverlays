@@ -293,6 +293,9 @@
                 irq-gpios = <&gpio 6 0>; /* Interrupt IO, falling-edge trigger */
                 backlight = <&backlight_pwm>;
                 disabled-gpios = <&m5ioe1 11 1>;
+                /* Holds system power after the slider goes off (OFF_TIME). */
+                m5stack,power-controller = <&m5ioe1>;
+                m5stack,power-hold-ms = <20000>; /* upper bound for an orderly poweroff */
             };
 
             es8390_mclk: es8390_mclk {
